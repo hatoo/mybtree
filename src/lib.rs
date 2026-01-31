@@ -28,6 +28,19 @@ pub struct Pager {
     pub file: std::fs::File,
 }
 
+fn from_page(buffer: &AlignedVec<16>) -> &[u8] {
+    let len =
+        u16::from_le_bytes([buffer[PAGE_CONTENT_SIZE], buffer[PAGE_CONTENT_SIZE + 1]]) as usize;
+    &buffer[..len]
+}
+
+fn to_page(buffer: &mut AlignedVec<16>) {
+    assert!(buffer.len() <= PAGE_CONTENT_SIZE);
+    let len = buffer.len() as u16;
+    buffer.resize(PAGE_SIZE, 0);
+    buffer[PAGE_CONTENT_SIZE..PAGE_SIZE].copy_from_slice(&len.to_le_bytes());
+}
+
 impl Pager {
     pub fn new(file: std::fs::File) -> Self {
         Pager { file }
@@ -38,29 +51,25 @@ impl Pager {
         page_num: u64,
         f: impl FnOnce(&rkyv::Archived<Node>) -> T,
     ) -> Result<T, Error> {
-        let mut buffer = AlignedVec::<PAGE_SIZE>::with_capacity(PAGE_SIZE);
+        let mut buffer = AlignedVec::<16>::with_capacity(PAGE_SIZE);
         buffer.resize(PAGE_SIZE, 0);
         self.file
             .seek(std::io::SeekFrom::Start(page_num * PAGE_SIZE as u64))
             .unwrap();
         self.file.read_exact(&mut buffer).unwrap();
-        let len =
-            u16::from_le_bytes([buffer[PAGE_CONTENT_SIZE], buffer[PAGE_CONTENT_SIZE + 1]]) as usize;
-        let buffer = &buffer[..len];
+        let buffer = from_page(&buffer);
         let archived = rkyv::api::high::access::<rkyv::Archived<Node>, Error>(&buffer)?;
         Ok(f(archived))
     }
 
     pub fn owned_node(&mut self, page_num: u64) -> Result<Node, Error> {
-        let mut buffer = AlignedVec::<PAGE_SIZE>::with_capacity(PAGE_SIZE);
+        let mut buffer = AlignedVec::<16>::with_capacity(PAGE_SIZE);
         buffer.resize(PAGE_SIZE, 0);
         self.file
             .seek(std::io::SeekFrom::Start(page_num * PAGE_SIZE as u64))
             .unwrap();
         self.file.read_exact(&mut buffer).unwrap();
-        let len =
-            u16::from_le_bytes([buffer[PAGE_CONTENT_SIZE], buffer[PAGE_CONTENT_SIZE + 1]]) as usize;
-        let buffer = &buffer[..len];
+        let buffer = from_page(&buffer);
         let archived = rkyv::access::<ArchivedNode, Error>(&buffer)?;
         let node: Node = deserialize(archived)?;
         Ok(node)
@@ -68,10 +77,7 @@ impl Pager {
 
     pub fn write_node(&mut self, page_num: u64, node: &Node) -> Result<(), Error> {
         let mut bytes = rkyv::to_bytes(node)?;
-        assert!(bytes.len() <= PAGE_CONTENT_SIZE);
-        let len = bytes.len() as u16;
-        bytes.resize(PAGE_SIZE, 0);
-        bytes[PAGE_CONTENT_SIZE..PAGE_SIZE].copy_from_slice(&len.to_le_bytes());
+        to_page(&mut bytes);
 
         self.file
             .seek(std::io::SeekFrom::Start(page_num * PAGE_SIZE as u64))
