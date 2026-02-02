@@ -1,3 +1,4 @@
+use core::panic;
 use std::io::{Read, Seek, Write};
 
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error, util::AlignedVec};
@@ -10,13 +11,11 @@ pub const PAGE_CONTENT_SIZE: usize = PAGE_SIZE - 2;
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct Leaf {
-    pub parent: Option<NodePtr>,
     pub kv: Vec<(Key, Vec<u8>)>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct Internal {
-    pub parent: Option<NodePtr>,
     pub kv: Vec<(Key, NodePtr)>,
 }
 
@@ -117,17 +116,15 @@ impl Btree {
         self.pager.next_page_num = 1;
         self.pager.file.set_len(PAGE_SIZE as u64).unwrap();
 
-        let root_leaf = Leaf {
-            parent: None,
-            kv: vec![],
-        };
+        let root_leaf = Leaf { kv: vec![] };
         self.pager
             .write_node(ROOT_PAGE_NUM, &Node::Leaf(root_leaf))?;
         Ok(())
     }
 
-    pub fn alloc_leaf(&mut self, key: Key) -> Result<NodePtr, Error> {
+    pub fn path_to_leaf(&mut self, key: Key) -> Result<Vec<NodePtr>, Error> {
         let mut current = ROOT_PAGE_NUM;
+        let mut path = vec![];
 
         enum NextNode {
             Leaf(NodePtr),
@@ -156,8 +153,12 @@ impl Btree {
                 })?;
 
             match next {
-                NextNode::Leaf(leaf_page) => return Ok(leaf_page),
+                NextNode::Leaf(leaf_page) => {
+                    path.push(leaf_page);
+                    return Ok(path);
+                }
                 NextNode::Next(next_page) => {
+                    path.push(current);
                     current = next_page;
                 }
                 NextNode::NeedAlloc => {
@@ -167,22 +168,21 @@ impl Btree {
 
                     if internal.kv.is_empty() {
                         let new_leaf_page = self.pager.next_page_num();
-                        let new_leaf = Leaf {
-                            parent: Some(current),
-                            kv: vec![],
-                        };
+                        let new_leaf = Leaf { kv: vec![] };
                         self.pager
                             .write_node(new_leaf_page, &Node::Leaf(new_leaf))?;
 
                         internal.kv.push((key, new_leaf_page));
                         self.pager.write_node(current, &Node::Internal(internal))?;
 
-                        return Ok(new_leaf_page);
+                        path.push(current);
+                        return Ok(path);
                     } else {
                         let last = internal.kv.last_mut().unwrap();
                         last.0 = key;
                         let next = last.1;
                         self.pager.write_node(current, &Node::Internal(internal))?;
+                        path.push(current);
                         current = next;
                     }
                 }
@@ -191,28 +191,33 @@ impl Btree {
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<(), Error> {
-        let leaf_page = self.alloc_leaf(key)?;
+        let path = self.path_to_leaf(key)?;
 
-        let Node::Leaf(mut leaf) = self.pager.owned_node(leaf_page)? else {
+        let leaf_page = *path.last().unwrap();
+        let leaf_node = self.pager.owned_node(leaf_page)?;
+        if let Node::Leaf(mut leaf) = leaf_node {
+            match leaf.kv.binary_search_by_key(&key, |t| t.0) {
+                Ok(_) => {
+                    panic!("Duplicate key in leaf node");
+                }
+                Err(index) => {
+                    leaf.kv.insert(index, (key, value));
+                }
+            }
+
+            self.split_insert(&path, &Node::Leaf(leaf))?;
+        } else {
             panic!("Expected leaf node");
-        };
-
-        match leaf.kv.binary_search_by_key(&key, |t| t.0) {
-            Ok(index) => {
-                leaf.kv[index].1 = value;
-            }
-            Err(index) => {
-                leaf.kv.insert(index, (key, value));
-            }
         }
-
-        self.split_insert(leaf_page, &Node::Leaf(leaf))?;
 
         Ok(())
     }
 
-    pub fn split_insert(&mut self, page: NodePtr, insert: &Node) -> Result<(), Error> {
+    pub fn split_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(insert)?;
+
+        let page = *path.last().unwrap();
+        let parents = &path[..path.len() - 1];
 
         if buffer.len() <= PAGE_CONTENT_SIZE {
             self.pager.write_buffer(page, buffer)?;
@@ -222,113 +227,107 @@ impl Btree {
         match insert {
             Node::Leaf(leaf) => {
                 let mid = leaf.kv.len() / 2;
-                assert!(mid > 0);
+                let left_leaf = Leaf {
+                    kv: leaf.kv[..mid].to_vec(),
+                };
+                let right_leaf = Leaf {
+                    kv: leaf.kv[mid..].to_vec(),
+                };
 
-                if let Some(parent) = leaf.parent {
-                    let left_leaf = Leaf {
-                        parent: leaf.parent,
-                        kv: leaf.kv[..mid].to_vec(),
-                    };
-                    let right_leaf = Leaf {
-                        parent: leaf.parent,
-                        kv: leaf.kv[mid..].to_vec(),
-                    };
-                    let left_key = left_leaf.kv.last().unwrap().0;
-                    let right_key = right_leaf.kv.last().unwrap().0;
-                    let left_page = self.pager.next_page_num();
-                    let parent_node = self.pager.owned_node(parent)?;
+                let left_key = left_leaf.kv.last().unwrap().0;
+                let right_key = right_leaf.kv.last().unwrap().0;
+
+                if let Some(&parent_page) = parents.last() {
+                    let parent_node = self.pager.owned_node(parent_page)?;
                     if let Node::Internal(mut internal) = parent_node {
+                        let new_left_page = self.pager.next_page_num();
+
                         match internal.kv.binary_search_by_key(&left_key, |t| t.0) {
                             Ok(_) => {
                                 panic!("Duplicate key in internal node");
                             }
                             Err(index) => {
-                                internal.kv[index].0 = right_key;
-                                debug_assert_eq!(internal.kv[index].1, page);
-                                internal.kv.insert(index, (left_key, left_page));
+                                internal.kv.insert(index, (left_key, new_left_page));
                             }
                         }
 
-                        self.split_insert(parent, &Node::Internal(internal))?;
-                        self.split_insert(left_page, &Node::Leaf(left_leaf))?;
-                        self.split_insert(page, &Node::Leaf(right_leaf))?;
-                        Ok(())
+                        self.split_insert(parents, &Node::Internal(internal))?;
+
+                        // Parent may be split
+                        let left_path = self.path_to_leaf(left_key)?;
+                        let right_path = self.path_to_leaf(right_key)?;
+
+                        self.split_insert(&left_path, &Node::Leaf(left_leaf))?;
+                        self.split_insert(&right_path, &Node::Leaf(right_leaf))?;
                     } else {
                         panic!("Parent is not an internal node");
                     }
                 } else {
-                    let left_leaf = Leaf {
-                        parent: Some(page),
-                        kv: leaf.kv[..mid].to_vec(),
+                    let new_left_page = self.pager.next_page_num();
+                    let new_right_page = self.pager.next_page_num();
+                    let new_root_internal = Internal {
+                        kv: vec![(left_key, new_left_page), (right_key, new_right_page)],
                     };
-                    let right_leaf = Leaf {
-                        parent: Some(page),
-                        kv: leaf.kv[mid..].to_vec(),
-                    };
-                    let left_key = left_leaf.kv.last().unwrap().0;
-                    let right_key = right_leaf.kv.last().unwrap().0;
-                    let left_page = self.pager.next_page_num();
-                    let right_page = self.pager.next_page_num();
-                    let new_internal = Internal {
-                        parent: None,
-                        kv: vec![(left_key, left_page), (right_key, right_page)],
-                    };
+
                     self.pager
-                        .write_node(ROOT_PAGE_NUM, &Node::Internal(new_internal))?;
-                    self.split_insert(left_page, &Node::Leaf(left_leaf))?;
-                    self.split_insert(right_page, &Node::Leaf(right_leaf))?;
-                    Ok(())
+                        .write_node(ROOT_PAGE_NUM, &Node::Internal(new_root_internal))?;
+
+                    self.split_insert(&[ROOT_PAGE_NUM, new_left_page], &Node::Leaf(left_leaf))?;
+                    self.split_insert(&[ROOT_PAGE_NUM, new_right_page], &Node::Leaf(right_leaf))?;
                 }
             }
             Node::Internal(internal) => {
                 let mid = internal.kv.len() / 2;
-
                 let left_internal = Internal {
-                    parent: internal.parent,
                     kv: internal.kv[..mid].to_vec(),
                 };
                 let right_internal = Internal {
-                    parent: internal.parent,
                     kv: internal.kv[mid..].to_vec(),
                 };
 
                 let left_key = left_internal.kv.last().unwrap().0;
                 let right_key = right_internal.kv.last().unwrap().0;
-                let left_page = self.pager.next_page_num();
 
-                if let Some(parent) = internal.parent {
-                    let parent_node = self.pager.owned_node(parent)?;
-                    if let Node::Internal(mut parent_internal) = parent_node {
-                        match parent_internal.kv.binary_search_by_key(&left_key, |t| t.0) {
+                if let Some(&parent_page) = parents.last() {
+                    let parent_node = self.pager.owned_node(parent_page)?;
+                    if let Node::Internal(mut internal) = parent_node {
+                        let new_left_page = self.pager.next_page_num();
+                        match internal.kv.binary_search_by_key(&left_key, |t| t.0) {
                             Ok(_) => {
                                 panic!("Duplicate key in internal node");
                             }
                             Err(index) => {
-                                parent_internal.kv.insert(index, (left_key, left_page));
+                                internal.kv.insert(index, (left_key, new_left_page));
                             }
                         }
 
-                        self.split_insert(parent, &Node::Internal(parent_internal))?;
-                        self.split_insert(left_page, &Node::Internal(left_internal))?;
-                        self.split_insert(page, &Node::Internal(right_internal))?;
-                        Ok(())
+                        // Never fail
+                        self.pager
+                            .write_node(new_left_page, &Node::Internal(left_internal))?;
+                        self.pager
+                            .write_node(page, &Node::Internal(right_internal))?;
+
+                        self.split_insert(parents, &Node::Internal(internal))?;
                     } else {
                         panic!("Parent is not an internal node");
                     }
                 } else {
-                    let right_page = self.pager.next_page_num();
-                    let new_internal = Internal {
-                        parent: None,
-                        kv: vec![(left_key, left_page), (right_key, right_page)],
+                    let new_left_page = self.pager.next_page_num();
+                    let new_right_page = self.pager.next_page_num();
+                    let new_root_internal = Internal {
+                        kv: vec![(left_key, new_left_page), (right_key, new_right_page)],
                     };
+
                     self.pager
-                        .write_node(ROOT_PAGE_NUM, &Node::Internal(new_internal))?;
-                    self.split_insert(left_page, &Node::Internal(left_internal))?;
-                    self.split_insert(right_page, &Node::Internal(right_internal))?;
-                    Ok(())
+                        .write_node(ROOT_PAGE_NUM, &Node::Internal(new_root_internal))?;
+                    self.pager
+                        .write_node(new_left_page, &Node::Internal(left_internal))?;
+                    self.pager
+                        .write_node(new_right_page, &Node::Internal(right_internal))?;
                 }
             }
         }
+        Ok(())
     }
 
     pub fn read<T>(&mut self, key: Key, f: impl FnOnce(Option<&[u8]>) -> T) -> Result<T, Error> {
@@ -382,7 +381,6 @@ mod tests {
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
         let leaf = Leaf {
-            parent: None,
             kv: vec![(0, b"zero".to_vec()), (10, b"ten".to_vec())],
         };
         btree
@@ -390,7 +388,7 @@ mod tests {
             .write_node(ROOT_PAGE_NUM, &Node::Leaf(leaf))
             .unwrap();
 
-        btree.alloc_leaf(0).unwrap();
+        btree.path_to_leaf(0).unwrap();
     }
 
     #[test]
@@ -409,7 +407,6 @@ mod tests {
         let pager = Pager::new(file);
         let mut btree = Btree::new(pager);
         let root_leaf = Leaf {
-            parent: None,
             kv: vec![(0, b"zero".to_vec())],
         };
         btree
@@ -448,6 +445,15 @@ mod tests {
             value[0..8].copy_from_slice(&i.to_le_bytes());
             btree.insert(i, value.to_vec()).unwrap();
             map.insert(i, value.to_vec());
+
+            match btree.pager.owned_node(ROOT_PAGE_NUM).unwrap() {
+                Node::Internal(internal) => {
+                    dbg!(internal);
+                }
+                Node::Leaf(leaf) => {
+                    dbg!(leaf.kv.iter().map(|(k, _)| *k).collect::<Vec<_>>());
+                }
+            }
 
             for j in 0u64..=i {
                 let expected = map.get(&j).unwrap();
