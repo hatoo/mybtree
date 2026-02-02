@@ -126,34 +126,70 @@ impl Btree {
         Ok(())
     }
 
-    pub fn search_leaf(&mut self, key: Key) -> Result<NodePtr, Error> {
+    pub fn alloc_leaf(&mut self, key: Key) -> Result<NodePtr, Error> {
         let mut current = ROOT_PAGE_NUM;
 
+        enum NextNode {
+            Leaf(NodePtr),
+            Next(NodePtr),
+            NeedAlloc,
+        }
+
         loop {
-            if let Some(page) =
-                self.pager
-                    .read_node(current, |archived_node| match archived_node {
-                        ArchivedNode::Leaf(_) => Some(current),
-                        ArchivedNode::Internal(internal) => {
-                            match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                                Ok(index) => {
-                                    current = internal.kv[index].1.to_native();
-                                }
-                                Err(index) => {
-                                    current = internal.kv[index].1.to_native();
+            let next = self
+                .pager
+                .read_node(current, |archived_node| match archived_node {
+                    ArchivedNode::Leaf(_) => NextNode::Leaf(current),
+                    ArchivedNode::Internal(internal) => {
+                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(index) | Err(index) => {
+                                if let Some(next_page) =
+                                    internal.kv.get(index).map(|t| t.1.to_native())
+                                {
+                                    NextNode::Next(next_page)
+                                } else {
+                                    NextNode::NeedAlloc
                                 }
                             }
-                            None
                         }
-                    })?
-            {
-                return Ok(page);
+                    }
+                })?;
+
+            match next {
+                NextNode::Leaf(leaf_page) => return Ok(leaf_page),
+                NextNode::Next(next_page) => {
+                    current = next_page;
+                }
+                NextNode::NeedAlloc => {
+                    let Node::Internal(mut internal) = self.pager.owned_node(current)? else {
+                        panic!("Expected internal node");
+                    };
+
+                    if internal.kv.is_empty() {
+                        let new_leaf_page = self.pager.next_page_num();
+                        let new_leaf = Leaf {
+                            parent: Some(current),
+                            kv: vec![],
+                        };
+                        self.pager
+                            .write_node(new_leaf_page, &Node::Leaf(new_leaf))?;
+
+                        internal.kv.push((key, new_leaf_page));
+                        self.pager.write_node(current, &Node::Internal(internal))?;
+
+                        return Ok(new_leaf_page);
+                    } else {
+                        let last = internal.kv.last_mut().unwrap();
+                        last.0 = key;
+                        current = last.1;
+                    }
+                }
             }
         }
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<(), Error> {
-        let leaf_page = self.search_leaf(key)?;
+        let leaf_page = self.alloc_leaf(key)?;
 
         let Node::Leaf(mut leaf) = self.pager.owned_node(leaf_page)? else {
             panic!("Expected leaf node");
@@ -283,7 +319,7 @@ impl Btree {
     }
 
     pub fn read<T>(&mut self, key: Key, f: impl FnOnce(Option<&[u8]>) -> T) -> Result<T, Error> {
-        let leaf_page = self.search_leaf(key)?;
+        let leaf_page = self.alloc_leaf(key)?;
 
         let Node::Leaf(leaf) = self.pager.owned_node(leaf_page)? else {
             panic!("Expected leaf node");
@@ -314,7 +350,7 @@ mod tests {
             .write_node(ROOT_PAGE_NUM, &Node::Leaf(leaf))
             .unwrap();
 
-        btree.search_leaf(0).unwrap();
+        btree.alloc_leaf(0).unwrap();
     }
 
     #[test]
