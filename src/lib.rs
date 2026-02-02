@@ -224,20 +224,18 @@ impl Btree {
                 let mid = leaf.kv.len() / 2;
                 assert!(mid > 0);
 
-                let left_leaf = Leaf {
-                    parent: leaf.parent,
-                    kv: leaf.kv[..mid].to_vec(),
-                };
-                let right_leaf = Leaf {
-                    parent: leaf.parent,
-                    kv: leaf.kv[mid..].to_vec(),
-                };
-
-                let left_key = left_leaf.kv.last().unwrap().0;
-                let right_key = right_leaf.kv.last().unwrap().0;
-                let left_page = self.pager.next_page_num();
-
                 if let Some(parent) = leaf.parent {
+                    let left_leaf = Leaf {
+                        parent: leaf.parent,
+                        kv: leaf.kv[..mid].to_vec(),
+                    };
+                    let right_leaf = Leaf {
+                        parent: leaf.parent,
+                        kv: leaf.kv[mid..].to_vec(),
+                    };
+                    let left_key = left_leaf.kv.last().unwrap().0;
+                    let right_key = right_leaf.kv.last().unwrap().0;
+                    let left_page = self.pager.next_page_num();
                     let parent_node = self.pager.owned_node(parent)?;
                     if let Node::Internal(mut internal) = parent_node {
                         match internal.kv.binary_search_by_key(&left_key, |t| t.0) {
@@ -246,6 +244,7 @@ impl Btree {
                             }
                             Err(index) => {
                                 internal.kv[index].0 = right_key;
+                                debug_assert_eq!(internal.kv[index].1, page);
                                 internal.kv.insert(index, (left_key, left_page));
                             }
                         }
@@ -258,6 +257,17 @@ impl Btree {
                         panic!("Parent is not an internal node");
                     }
                 } else {
+                    let left_leaf = Leaf {
+                        parent: Some(page),
+                        kv: leaf.kv[..mid].to_vec(),
+                    };
+                    let right_leaf = Leaf {
+                        parent: Some(page),
+                        kv: leaf.kv[mid..].to_vec(),
+                    };
+                    let left_key = left_leaf.kv.last().unwrap().0;
+                    let right_key = right_leaf.kv.last().unwrap().0;
+                    let left_page = self.pager.next_page_num();
                     let right_page = self.pager.next_page_num();
                     let new_internal = Internal {
                         parent: None,
