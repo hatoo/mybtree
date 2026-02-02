@@ -181,7 +181,9 @@ impl Btree {
                     } else {
                         let last = internal.kv.last_mut().unwrap();
                         last.0 = key;
-                        current = last.1;
+                        let next = last.1;
+                        self.pager.write_node(current, &Node::Internal(internal))?;
+                        current = next;
                     }
                 }
             }
@@ -231,8 +233,8 @@ impl Btree {
                     kv: leaf.kv[mid..].to_vec(),
                 };
 
-                let left_key = right_leaf.kv.last().unwrap().0;
-                let right_key = left_leaf.kv.first().unwrap().0;
+                let left_key = left_leaf.kv.last().unwrap().0;
+                let right_key = right_leaf.kv.last().unwrap().0;
                 let left_page = self.pager.next_page_num();
 
                 if let Some(parent) = leaf.parent {
@@ -243,6 +245,7 @@ impl Btree {
                                 panic!("Duplicate key in internal node");
                             }
                             Err(index) => {
+                                internal.kv[index].0 = right_key;
                                 internal.kv.insert(index, (left_key, left_page));
                             }
                         }
@@ -279,8 +282,8 @@ impl Btree {
                     kv: internal.kv[mid..].to_vec(),
                 };
 
-                let left_key = right_internal.kv.last().unwrap().0;
-                let right_key = left_internal.kv.first().unwrap().0;
+                let left_key = left_internal.kv.last().unwrap().0;
+                let right_key = right_internal.kv.last().unwrap().0;
                 let left_page = self.pager.next_page_num();
 
                 if let Some(parent) = internal.parent {
@@ -319,21 +322,48 @@ impl Btree {
     }
 
     pub fn read<T>(&mut self, key: Key, f: impl FnOnce(Option<&[u8]>) -> T) -> Result<T, Error> {
-        let leaf_page = self.alloc_leaf(key)?;
+        let mut current = ROOT_PAGE_NUM;
 
-        let Node::Leaf(leaf) = self.pager.owned_node(leaf_page)? else {
-            panic!("Expected leaf node");
-        };
+        let mut ff = Some(f);
+        let f = &mut ff;
 
-        match leaf.kv.binary_search_by_key(&key, |t| t.0) {
-            Ok(index) => Ok(f(Some(&leaf.kv[index].1))),
-            Err(_) => Ok(f(None)),
+        loop {
+            let result = self
+                .pager
+                .read_node(current, |archived_node| match archived_node {
+                    ArchivedNode::Leaf(leaf) => {
+                        match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(index) => Some(f.take().unwrap()(Some(leaf.kv[index].1.as_ref()))),
+                            Err(_) => Some(f.take().unwrap()(None)),
+                        }
+                    }
+                    ArchivedNode::Internal(internal) => {
+                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(index) | Err(index) => {
+                                if let Some(next_page) =
+                                    internal.kv.get(index).map(|t| t.1.to_native())
+                                {
+                                    current = next_page;
+                                    None
+                                } else {
+                                    Some(f.take().unwrap()(None))
+                                }
+                            }
+                        }
+                    }
+                })?;
+
+            if let Some(value) = result {
+                return Ok(value);
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     #[test]
     fn test_search() {
@@ -392,5 +422,34 @@ mod tests {
                 .read(42, |v| v == Some(b"forty-two".as_ref()))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn test_insert_multiple_and_read() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        let mut map = HashMap::new();
+
+        for i in 0u64..100 {
+            let mut value = [0; 512];
+            value[0..8].copy_from_slice(&i.to_le_bytes());
+            btree.insert(i, value.to_vec()).unwrap();
+            map.insert(i, value.to_vec());
+
+            for j in 0u64..=i {
+                let expected = map.get(&j).unwrap();
+                assert!(
+                    btree.read(j, |v| v == Some(expected.as_ref())).unwrap(),
+                    "Failed at {} {}, expected {:?}, got {:?}",
+                    i,
+                    j,
+                    &expected[0..8],
+                    btree.read(j, |v| v.map(|v| v[0..8].to_vec())).unwrap()
+                );
+            }
+        }
     }
 }
