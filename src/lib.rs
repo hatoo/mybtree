@@ -191,27 +191,30 @@ impl Btree {
         }
     }
 
-    pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<(), Error> {
+    pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         let path = self.path_to(key, None)?;
 
         let leaf_page = *path.last().unwrap();
         let leaf_node = self.pager.owned_node(leaf_page)?;
-        if let Node::Leaf(mut leaf) = leaf_node {
-            match leaf.kv.binary_search_by_key(&key, |t| t.0) {
-                Ok(_) => {
-                    panic!("Duplicate key in leaf node");
+        let ret = if let Node::Leaf(mut leaf) = leaf_node {
+            let ret = match leaf.kv.binary_search_by_key(&key, |t| t.0) {
+                Ok(index) => {
+                    let old_value = std::mem::replace(&mut leaf.kv[index].1, value);
+                    Some(old_value)
                 }
                 Err(index) => {
                     leaf.kv.insert(index, (key, value));
+                    None
                 }
-            }
+            };
 
             self.split_insert(&path, &Node::Leaf(leaf))?;
+            ret
         } else {
             panic!("Expected leaf node");
-        }
+        };
 
-        Ok(())
+        Ok(ret)
     }
 
     pub fn split_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
