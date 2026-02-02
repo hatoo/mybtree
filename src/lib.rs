@@ -122,21 +122,26 @@ impl Btree {
         Ok(())
     }
 
-    pub fn path_to_leaf(&mut self, key: Key) -> Result<Vec<NodePtr>, Error> {
+    pub fn path_to(&mut self, key: Key, dest: Option<NodePtr>) -> Result<Vec<NodePtr>, Error> {
         let mut current = ROOT_PAGE_NUM;
         let mut path = vec![];
 
         enum NextNode {
-            Leaf(NodePtr),
+            Leaf,
             Next(NodePtr),
             NeedAlloc,
         }
 
         loop {
+            path.push(current);
+
+            if Some(current) == dest {
+                return Ok(path);
+            }
             let next = self
                 .pager
                 .read_node(current, |archived_node| match archived_node {
-                    ArchivedNode::Leaf(_) => NextNode::Leaf(current),
+                    ArchivedNode::Leaf(_) => NextNode::Leaf,
                     ArchivedNode::Internal(internal) => {
                         match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
                             Ok(index) | Err(index) => {
@@ -153,12 +158,10 @@ impl Btree {
                 })?;
 
             match next {
-                NextNode::Leaf(leaf_page) => {
-                    path.push(leaf_page);
+                NextNode::Leaf => {
                     return Ok(path);
                 }
                 NextNode::Next(next_page) => {
-                    path.push(current);
                     current = next_page;
                 }
                 NextNode::NeedAlloc => {
@@ -175,14 +178,12 @@ impl Btree {
                         internal.kv.push((key, new_leaf_page));
                         self.pager.write_node(current, &Node::Internal(internal))?;
 
-                        path.push(current);
                         return Ok(path);
                     } else {
                         let last = internal.kv.last_mut().unwrap();
                         last.0 = key;
                         let next = last.1;
                         self.pager.write_node(current, &Node::Internal(internal))?;
-                        path.push(current);
                         current = next;
                     }
                 }
@@ -191,7 +192,7 @@ impl Btree {
     }
 
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<(), Error> {
-        let path = self.path_to_leaf(key)?;
+        let path = self.path_to(key, None)?;
 
         let leaf_page = *path.last().unwrap();
         let leaf_node = self.pager.owned_node(leaf_page)?;
@@ -254,8 +255,8 @@ impl Btree {
                         self.split_insert(parents, &Node::Internal(internal))?;
 
                         // Parent may be split
-                        let left_path = self.path_to_leaf(left_key)?;
-                        let right_path = self.path_to_leaf(right_key)?;
+                        let left_path = self.path_to(left_key, Some(new_left_page))?;
+                        let right_path = self.path_to(right_key, Some(page))?;
 
                         self.split_insert(&left_path, &Node::Leaf(left_leaf))?;
                         self.split_insert(&right_path, &Node::Leaf(right_leaf))?;
@@ -388,7 +389,7 @@ mod tests {
             .write_node(ROOT_PAGE_NUM, &Node::Leaf(leaf))
             .unwrap();
 
-        btree.path_to_leaf(0).unwrap();
+        btree.path_to(0, None).unwrap();
     }
 
     #[test]
