@@ -546,6 +546,7 @@ impl Btree {
 
 #[cfg(test)]
 mod tests {
+    use rand::prelude::*;
     use std::collections::HashMap;
 
     use super::*;
@@ -661,5 +662,34 @@ mod tests {
         assert!(btree.read(3, |v| v == Some(b"three".as_ref())).unwrap());
 
         assert_eq!(btree.remove(999).unwrap(), None);
+    }
+    #[test]
+    fn test_remove_seq() {
+        let mut rng = rand::rng();
+
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        let mut insert = (0..1000).collect::<Vec<u64>>();
+        insert.shuffle(&mut rng);
+
+        let mut remove = insert.clone();
+        remove.shuffle(&mut rng);
+
+        for i in 0u64..1000 {
+            btree
+                .insert(i, format!("value-{}", i).as_bytes().to_vec())
+                .unwrap();
+        }
+
+        for i in 0u64..1000 {
+            assert_eq!(
+                btree.remove(i).unwrap(),
+                Some(format!("value-{}", i).as_bytes().to_vec())
+            );
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
     }
 }
