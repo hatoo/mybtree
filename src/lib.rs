@@ -393,7 +393,7 @@ impl Btree {
                 match leaf.kv.binary_search_by_key(&key, |t| t.0) {
                     Ok(index) => {
                         let old_value = leaf.kv.remove(index).1;
-                        self.pager.write_node(leaf_page, &Node::Leaf(leaf))?;
+                        self.shrink_insert(&path, &Node::Leaf(leaf))?;
                         return Ok(Some(old_value));
                     }
                     Err(_) => {
@@ -405,6 +405,23 @@ impl Btree {
             }
         }
         Ok(None)
+    }
+
+    pub fn shrink_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
+        let buffer = rkyv::to_bytes(insert)?;
+
+        let page = *path.last().unwrap();
+
+        assert!(buffer.len() <= PAGE_CONTENT_SIZE);
+
+        if buffer.len() < PAGE_CONTENT_SIZE / 2 {
+            // TODO: implement merging nodes
+            self.pager.write_buffer(page, buffer)?;
+            Ok(())
+        } else {
+            self.pager.write_buffer(page, buffer)?;
+            Ok(())
+        }
     }
 
     pub fn read<T>(&mut self, key: Key, f: impl FnOnce(Option<&[u8]>) -> T) -> Result<T, Error> {
