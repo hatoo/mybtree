@@ -393,7 +393,7 @@ impl Btree {
                 match leaf.kv.binary_search_by_key(&key, |t| t.0) {
                     Ok(index) => {
                         let old_value = leaf.kv.remove(index).1;
-                        self.shrink_insert(&path, &Node::Leaf(leaf))?;
+                        self.merge_insert(&path, &Node::Leaf(leaf))?;
                         return Ok(Some(old_value));
                     }
                     Err(_) => {
@@ -407,16 +407,97 @@ impl Btree {
         Ok(None)
     }
 
-    pub fn shrink_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
+    pub fn merge_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(insert)?;
 
         let page = *path.last().unwrap();
 
         assert!(buffer.len() <= PAGE_CONTENT_SIZE);
 
-        if buffer.len() < PAGE_CONTENT_SIZE / 2 {
-            // TODO: implement merging nodes
-            self.pager.write_buffer(page, buffer)?;
+        if buffer.len() < PAGE_CONTENT_SIZE / 2 && path.len() > 1 {
+            match insert {
+                Node::Leaf(leaf) => {
+                    if leaf.kv.is_empty() {
+                        let parents = &path[..path.len() - 1];
+                        let parent_page = *parents.last().unwrap();
+                        let parent_node = self.pager.owned_node(parent_page)?;
+                        if let Node::Internal(mut internal) = parent_node {
+                            internal.kv.retain(|&(_, ptr)| ptr != page);
+                            self.merge_insert(parents, &Node::Internal(internal))?;
+                        } else {
+                            panic!("Parent is not an internal node");
+                        }
+                    } else {
+                        // merge to left sibling
+                        let parents = &path[..path.len() - 1];
+                        let parent_page = *parents.last().unwrap();
+                        let parent_node = self.pager.owned_node(parent_page)?;
+                        if let Node::Internal(mut internal) = parent_node {
+                            let index = internal
+                                .kv
+                                .iter()
+                                .position(|&(_, ptr)| ptr == page)
+                                .unwrap();
+                            if index > 0 {
+                                let left_sibling_page = internal.kv[index - 1].1;
+                                let left_sibling_node = self.pager.owned_node(left_sibling_page)?;
+                                if let Node::Leaf(mut left_sibling) = left_sibling_node {
+                                    left_sibling.kv.extend(leaf.kv.iter().cloned());
+                                    let buffer = rkyv::to_bytes(&Node::Leaf(left_sibling))?;
+                                    if buffer.len() <= PAGE_CONTENT_SIZE {
+                                        self.pager.write_buffer(left_sibling_page, buffer)?;
+                                        internal.kv.remove(index);
+                                        self.merge_insert(parents, &Node::Internal(internal))?;
+                                        // TODO: Add page to free list
+                                    } else {
+                                        self.pager.write_node(page, insert)?;
+                                    }
+                                } else {
+                                    panic!("Left sibling is not a leaf node");
+                                }
+                            } else {
+                                // No left sibling, just write back
+                                self.pager.write_node(page, insert)?;
+                            }
+                        } else {
+                            panic!("Parent is not an internal node");
+                        }
+                    }
+                }
+                Node::Internal(internal) => {
+                    let parents = &path[..path.len() - 1];
+                    let parent_page = *parents.last().unwrap();
+                    let parent_node = self.pager.owned_node(parent_page)?;
+
+                    if let Node::Internal(mut parent_internal) = parent_node {
+                        let index = parent_internal
+                            .kv
+                            .iter()
+                            .position(|&(_, ptr)| ptr == page)
+                            .unwrap();
+                        if index > 0 {
+                            let left_sibling_page = parent_internal.kv[index - 1].1;
+                            let left_sibling_node = self.pager.owned_node(left_sibling_page)?;
+                            if let Node::Internal(mut left_sibling) = left_sibling_node {
+                                left_sibling.kv.extend(internal.kv.iter().cloned());
+                                let buffer = rkyv::to_bytes(&Node::Internal(left_sibling))?;
+                                if buffer.len() <= PAGE_CONTENT_SIZE {
+                                    self.pager.write_buffer(left_sibling_page, buffer)?;
+                                    parent_internal.kv.remove(index);
+                                    self.pager.write_node(page, insert)?; // TODO: Add page to free list
+                                    self.merge_insert(parents, &Node::Internal(parent_internal))?;
+                                } else {
+                                    self.pager.write_node(page, insert)?;
+                                }
+                            } else {
+                                self.pager.write_node(page, insert)?;
+                            }
+                        } else {
+                            self.pager.write_node(page, insert)?;
+                        }
+                    }
+                }
+            }
             Ok(())
         } else {
             self.pager.write_buffer(page, buffer)?;
