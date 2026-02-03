@@ -122,7 +122,7 @@ impl Btree {
         Ok(())
     }
 
-    pub fn path_to(&mut self, key: Key, dest: Option<NodePtr>) -> Result<Vec<NodePtr>, Error> {
+    fn path_to_alloc(&mut self, key: Key, dest: Option<NodePtr>) -> Result<Vec<NodePtr>, Error> {
         let mut current = ROOT_PAGE_NUM;
         let mut path = vec![];
 
@@ -191,8 +191,59 @@ impl Btree {
         }
     }
 
+    fn search(&mut self, key: Key) -> Result<Option<Vec<NodePtr>>, Error> {
+        let mut current = ROOT_PAGE_NUM;
+        let mut path = vec![];
+
+        enum NextNode {
+            Leaf,
+            Next(NodePtr),
+            NotFound,
+        }
+
+        loop {
+            path.push(current);
+
+            let next = self
+                .pager
+                .read_node(current, |archived_node| match archived_node {
+                    ArchivedNode::Leaf(leaf) => {
+                        match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(_) => NextNode::Leaf,
+                            Err(_) => NextNode::NotFound,
+                        }
+                    }
+                    ArchivedNode::Internal(internal) => {
+                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(index) | Err(index) => {
+                                if let Some(next_page) =
+                                    internal.kv.get(index).map(|t| t.1.to_native())
+                                {
+                                    NextNode::Next(next_page)
+                                } else {
+                                    NextNode::NotFound
+                                }
+                            }
+                        }
+                    }
+                })?;
+
+            match next {
+                NextNode::Leaf => {
+                    return Ok(Some(path));
+                }
+                NextNode::Next(next_page) => {
+                    current = next_page;
+                }
+                NextNode::NotFound => {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
-        let path = self.path_to(key, None)?;
+        let path = self.path_to_alloc(key, None)?;
 
         let leaf_page = *path.last().unwrap();
         let leaf_node = self.pager.owned_node(leaf_page)?;
@@ -258,8 +309,8 @@ impl Btree {
                         self.split_insert(parents, &Node::Internal(internal))?;
 
                         // Parent may be split
-                        let left_path = self.path_to(left_key, Some(new_left_page))?;
-                        let right_path = self.path_to(right_key, Some(page))?;
+                        let left_path = self.path_to_alloc(left_key, Some(new_left_page))?;
+                        let right_path = self.path_to_alloc(right_key, Some(page))?;
 
                         self.split_insert(&left_path, &Node::Leaf(left_leaf))?;
                         self.split_insert(&right_path, &Node::Leaf(right_leaf))?;
@@ -334,6 +385,28 @@ impl Btree {
         Ok(())
     }
 
+    pub fn remove(&mut self, key: Key) -> Result<Option<Vec<u8>>, Error> {
+        if let Some(path) = self.search(key)? {
+            let leaf_page = *path.last().unwrap();
+            let leaf_node = self.pager.owned_node(leaf_page)?;
+            if let Node::Leaf(mut leaf) = leaf_node {
+                match leaf.kv.binary_search_by_key(&key, |t| t.0) {
+                    Ok(index) => {
+                        let old_value = leaf.kv.remove(index).1;
+                        self.pager.write_node(leaf_page, &Node::Leaf(leaf))?;
+                        return Ok(Some(old_value));
+                    }
+                    Err(_) => {
+                        panic!("Key not found in leaf node");
+                    }
+                }
+            } else {
+                panic!("Expected leaf node");
+            }
+        }
+        Ok(None)
+    }
+
     pub fn read<T>(&mut self, key: Key, f: impl FnOnce(Option<&[u8]>) -> T) -> Result<T, Error> {
         let mut current = ROOT_PAGE_NUM;
 
@@ -392,7 +465,7 @@ mod tests {
             .write_node(ROOT_PAGE_NUM, &Node::Leaf(leaf))
             .unwrap();
 
-        btree.path_to(0, None).unwrap();
+        btree.path_to_alloc(0, None).unwrap();
     }
 
     #[test]
