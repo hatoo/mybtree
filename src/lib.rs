@@ -545,4 +545,23 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_remove() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        btree.insert(1, b"one".to_vec()).unwrap();
+        btree.insert(2, b"two".to_vec()).unwrap();
+        btree.insert(3, b"three".to_vec()).unwrap();
+
+        assert_eq!(btree.remove(2).unwrap(), Some(b"two".to_vec()));
+        assert!(btree.read(2, |v| v.is_none()).unwrap());
+        assert!(btree.read(1, |v| v == Some(b"one".as_ref())).unwrap());
+        assert!(btree.read(3, |v| v == Some(b"three".as_ref())).unwrap());
+
+        assert_eq!(btree.remove(999).unwrap(), None);
+    }
 }
