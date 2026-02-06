@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+moka = { version = "0.12.10", features = ["sync"] }
 rkyv = "0.8.14"
 
 [dev-dependencies]
