@@ -445,8 +445,8 @@ impl Btree {
                                     left_sibling.kv.extend(leaf.kv.iter().cloned());
                                     let buffer = rkyv::to_bytes(&Node::Leaf(left_sibling))?;
                                     if buffer.len() <= PAGE_CONTENT_SIZE {
-                                        self.pager.write_buffer(left_sibling_page, buffer)?;
-                                        internal.kv.remove(index);
+                                        self.pager.write_buffer(page, buffer)?;
+                                        internal.kv.remove(index - 1);
                                         self.merge_insert(parents, &Node::Internal(internal))?;
                                         // TODO: Add page to free list
                                     } else {
@@ -541,6 +541,39 @@ impl Btree {
                 return Ok(value);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn debug(&mut self, root: NodePtr, min: Key, max: Key) -> Result<(), Error> {
+        let node = self.pager.owned_node(root)?;
+
+        match node {
+            Node::Leaf(leaf) => {
+                println!("Leaf Node (page {}):", root);
+                for (k, v) in leaf.kv {
+                    if !(min <= k && k <= max) {
+                        panic!("Key {} out of range ({}..={})", k, min, max);
+                    }
+                    println!("  Key: {}, Value Length: {}", k, v.len());
+                }
+            }
+            Node::Internal(internal) => {
+                println!("Internal Node (page {}):", root);
+                for (k, ptr) in &internal.kv {
+                    if !(min <= *k && *k <= max) {
+                        panic!("Key {} out of range ({}..={})", k, min, max);
+                    }
+                    println!("  Key: {}, Child Page: {}", k, ptr);
+                }
+                let mut left = min;
+                for (k, ptr) in &internal.kv {
+                    self.debug(*ptr, left, *k)?;
+                    left = *k;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -665,29 +698,32 @@ mod tests {
     }
     #[test]
     fn test_remove_seq() {
-        let mut rng = rand::rng();
+        const LEN: u64 = 1000;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
         let file = tempfile::tempfile().unwrap();
         let pager = Pager::new(file);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
 
-        let mut insert = (0..1000).collect::<Vec<u64>>();
+        let mut insert = (0..LEN).collect::<Vec<u64>>();
         insert.shuffle(&mut rng);
 
         let mut remove = insert.clone();
         remove.shuffle(&mut rng);
 
-        for i in 0u64..1000 {
+        for i in insert {
             btree
                 .insert(i, format!("value-{}", i).as_bytes().to_vec())
                 .unwrap();
         }
 
-        for i in 0u64..1000 {
+        for i in remove {
             assert_eq!(
                 btree.remove(i).unwrap(),
-                Some(format!("value-{}", i).as_bytes().to_vec())
+                Some(format!("value-{}", i).as_bytes().to_vec()),
+                "Failed to remove key {}",
+                i
             );
             assert!(btree.read(i, |v| v.is_none()).unwrap());
         }
