@@ -151,75 +151,6 @@ impl Btree {
         Ok(())
     }
 
-    fn path_to_alloc(&mut self, key: Key, dest: Option<NodePtr>) -> Result<Vec<NodePtr>, Error> {
-        let mut current = ROOT_PAGE_NUM;
-        let mut path = vec![];
-
-        enum NextNode {
-            Leaf,
-            Next(NodePtr),
-            NeedAlloc,
-        }
-
-        loop {
-            path.push(current);
-
-            if Some(current) == dest {
-                return Ok(path);
-            }
-            let next = self
-                .pager
-                .read_node(current, |archived_node| match archived_node {
-                    ArchivedNode::Leaf(_) => NextNode::Leaf,
-                    ArchivedNode::Internal(internal) => {
-                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(index) | Err(index) => {
-                                if let Some(next_page) =
-                                    internal.kv.get(index).map(|t| t.1.to_native())
-                                {
-                                    NextNode::Next(next_page)
-                                } else {
-                                    NextNode::NeedAlloc
-                                }
-                            }
-                        }
-                    }
-                })?;
-
-            match next {
-                NextNode::Leaf => {
-                    return Ok(path);
-                }
-                NextNode::Next(next_page) => {
-                    current = next_page;
-                }
-                NextNode::NeedAlloc => {
-                    let Node::Internal(mut internal) = self.pager.owned_node(current)? else {
-                        panic!("Expected internal node");
-                    };
-
-                    if internal.kv.is_empty() {
-                        let new_leaf_page = self.pager.next_page_num();
-                        let new_leaf = Leaf { kv: vec![] };
-                        self.pager
-                            .write_node(new_leaf_page, &Node::Leaf(new_leaf))?;
-
-                        internal.kv.push((key, new_leaf_page));
-                        self.pager.write_node(current, &Node::Internal(internal))?;
-
-                        return Ok(path);
-                    } else {
-                        let last = internal.kv.last_mut().unwrap();
-                        last.0 = key;
-                        let next = last.1;
-                        self.pager.write_node(current, &Node::Internal(internal))?;
-                        current = next;
-                    }
-                }
-            }
-        }
-    }
-
     fn search(&mut self, key: Key) -> Result<Option<Vec<NodePtr>>, Error> {
         let mut current = ROOT_PAGE_NUM;
         let mut path = vec![];
@@ -271,30 +202,91 @@ impl Btree {
         }
     }
 
-    pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
-        let path = self.path_to_alloc(key, None)?;
+    pub fn insert(&mut self, key: Key, mut value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
+        let mut current = ROOT_PAGE_NUM;
+        let mut path = vec![];
 
-        let leaf_page = *path.last().unwrap();
-        let leaf_node = self.pager.owned_node(leaf_page)?;
-        let ret = if let Node::Leaf(mut leaf) = leaf_node {
-            let ret = match leaf.kv.binary_search_by_key(&key, |t| t.0) {
-                Ok(index) => {
-                    let old_value = std::mem::replace(&mut leaf.kv[index].1, value);
-                    Some(old_value)
+        enum NextNode {
+            Leaf,
+            Next(NodePtr),
+            NeedAlloc,
+        }
+
+        loop {
+            path.push(current);
+
+            let next = self
+                .pager
+                .read_node(current, |archived_node| match archived_node {
+                    ArchivedNode::Leaf(_) => NextNode::Leaf,
+                    ArchivedNode::Internal(internal) => {
+                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(index) | Err(index) => {
+                                if let Some(next_page) =
+                                    internal.kv.get(index).map(|t| t.1.to_native())
+                                {
+                                    NextNode::Next(next_page)
+                                } else {
+                                    NextNode::NeedAlloc
+                                }
+                            }
+                        }
+                    }
+                })?;
+
+            match next {
+                NextNode::Leaf => {
+                    let Node::Leaf(mut leaf) = self.pager.owned_node(current)? else {
+                        panic!("Expected leaf node");
+                    };
+                    match leaf.kv.binary_search_by_key(&key, |t| t.0) {
+                        Ok(index) => {
+                            std::mem::swap(&mut leaf.kv[index].1, &mut value);
+                            let old_value = value;
+                            if leaf.kv[index].1.len() > old_value.len() {
+                                self.split_insert(&path, &Node::Leaf(leaf))?;
+                            } else {
+                                self.merge_insert(&path, &Node::Leaf(leaf))?;
+                            }
+                            return Ok(Some(old_value));
+                        }
+                        Err(index) => {
+                            leaf.kv.insert(index, (key, value));
+                            self.split_insert(&path, &Node::Leaf(leaf))?;
+                            return Ok(None);
+                        }
+                    }
                 }
-                Err(index) => {
-                    leaf.kv.insert(index, (key, value));
-                    None
+                NextNode::Next(next_page) => {
+                    current = next_page;
                 }
-            };
+                NextNode::NeedAlloc => {
+                    let Node::Internal(mut internal) = self.pager.owned_node(current)? else {
+                        panic!("Expected internal node");
+                    };
 
-            self.split_insert(&path, &Node::Leaf(leaf))?;
-            ret
-        } else {
-            panic!("Expected leaf node");
-        };
+                    if internal.kv.is_empty() {
+                        let new_leaf_page = self.pager.next_page_num();
+                        let new_leaf = Leaf {
+                            kv: vec![(key, value)],
+                        };
+                        self.pager
+                            .write_node(new_leaf_page, &Node::Leaf(new_leaf))?;
 
-        Ok(ret)
+                        internal.kv.push((key, new_leaf_page));
+                        self.pager.write_node(current, &Node::Internal(internal))?;
+
+                        return Ok(None);
+                    } else {
+                        let last = internal.kv.last_mut().unwrap();
+                        last.0 = key;
+                        let next = last.1;
+                        self.pager.write_node(current, &Node::Internal(internal))?;
+                        current = next;
+                    }
+                }
+            }
+        }
     }
 
     fn split_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
@@ -639,22 +631,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    #[test]
-    fn test_search() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
-        let leaf = Leaf {
-            kv: vec![(0, b"zero".to_vec()), (10, b"ten".to_vec())],
-        };
-        btree
-            .pager
-            .write_node(ROOT_PAGE_NUM, &Node::Leaf(leaf))
-            .unwrap();
-
-        btree.path_to_alloc(0, None).unwrap();
-    }
 
     #[test]
     fn test_insert() {
