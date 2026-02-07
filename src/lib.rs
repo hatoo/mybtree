@@ -2,7 +2,7 @@ use core::panic;
 use std::{
     collections::BTreeMap,
     io::{Read, Seek, Write},
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
 };
 
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error, util::AlignedVec};
@@ -130,6 +130,51 @@ fn split_leaf(kv: Vec<(Key, Vec<u8>)>) -> Result<Vec<Vec<(Key, Vec<u8>)>>, Error
     }
     result.sort_by_key(|kv| kv.last().unwrap().0);
     Ok(result)
+}
+
+fn is_orverlap<R1: RangeBounds<Key>, R2: RangeBounds<Key>>(range1: &R1, range2: &R2) -> bool {
+    let start1 = match range1.start_bound() {
+        Bound::Included(&b) => b,
+        Bound::Excluded(&b) => {
+            if b == Key::MAX {
+                return false;
+            }
+            b + 1
+        }
+        Bound::Unbounded => Key::MIN,
+    };
+    let end1 = match range1.end_bound() {
+        Bound::Included(&b) => b,
+        Bound::Excluded(&b) => {
+            if b == Key::MIN {
+                return false;
+            }
+            b - 1
+        }
+        Bound::Unbounded => Key::MAX,
+    };
+    let start2 = match range2.start_bound() {
+        Bound::Included(&b) => b,
+        Bound::Excluded(&b) => {
+            if b == Key::MAX {
+                return false;
+            }
+            b + 1
+        }
+        Bound::Unbounded => Key::MIN,
+    };
+    let end2 = match range2.end_bound() {
+        Bound::Included(&b) => b,
+        Bound::Excluded(&b) => {
+            if b == Key::MIN {
+                return false;
+            }
+            b - 1
+        }
+        Bound::Unbounded => Key::MAX,
+    };
+
+    !(end1 < start2 || end2 < start1)
 }
 
 pub struct Btree {
@@ -435,7 +480,7 @@ impl Btree {
             Node::Internal(internal) => {
                 let mut left_key = left_key;
                 for (k, ptr) in internal.kv {
-                    if range.contains(&left_key) || range.contains(&k) {
+                    if is_orverlap(range, &(left_key..=k)) {
                         let mut child_path = path.to_vec();
                         child_path.push(ptr);
                         self.remove_range_at(&child_path, left_key, range)?;
