@@ -505,7 +505,7 @@ impl Btree {
 
         let page = *path.last().unwrap();
 
-        assert!(buffer.len() <= PAGE_CONTENT_SIZE);
+        debug_assert!(buffer.len() <= PAGE_CONTENT_SIZE);
 
         if buffer.len() < PAGE_CONTENT_SIZE / 2 && path.len() > 1 {
             match insert {
