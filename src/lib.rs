@@ -262,9 +262,16 @@ impl Btree {
                 .pager
                 .read_node(current, |archived_node| match archived_node {
                     ArchivedNode::Leaf(leaf) => {
-                        match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(_) => NextNode::Leaf,
-                            Err(_) => NextNode::Leaf,
+                        if leaf.kv.is_empty() {
+                            NextNode::NotFound
+                        } else {
+                            let min = leaf.kv.first().unwrap().0.to_native();
+                            let max = leaf.kv.last().unwrap().0.to_native();
+                            if min <= key && key <= max {
+                                NextNode::Leaf
+                            } else {
+                                NextNode::NotFound
+                            }
                         }
                     }
                     ArchivedNode::Internal(internal) => {
@@ -806,6 +813,93 @@ mod tests {
                 i
             );
             assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_remove_range() {
+        const LEN: u64 = 200;
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        for i in 0..LEN {
+            btree
+                .insert(i, format!("value-{}", i).as_bytes().to_vec())
+                .unwrap();
+        }
+
+        btree.remove_range(50..150).unwrap();
+
+        for i in 0..LEN {
+            let found = btree.read(i, |v| v.map(|v| v.to_vec())).unwrap();
+            if (50..150).contains(&i) {
+                assert!(found.is_none(), "Expected key {} to be removed", i);
+            } else {
+                assert_eq!(
+                    found,
+                    Some(format!("value-{}", i).as_bytes().to_vec()),
+                    "Expected key {} to remain",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_remove_range_edge_cases() {
+        const LEN: u64 = 50;
+
+        let setup = || {
+            let file = tempfile::tempfile().unwrap();
+            let pager = Pager::new(file);
+            let mut btree = Btree::new(pager);
+            btree.init().unwrap();
+
+            for i in 0..LEN {
+                btree
+                    .insert(i, format!("value-{}", i).as_bytes().to_vec())
+                    .unwrap();
+            }
+            btree
+        };
+
+        // Empty range should be a no-op.
+        let mut btree = setup();
+        btree.remove_range(10..10).unwrap();
+        for i in 0..LEN {
+            assert!(
+                btree
+                    .read(i, |v| v == Some(format!("value-{}", i).as_bytes()))
+                    .unwrap(),
+                "Expected key {} to remain after empty range",
+                i
+            );
+        }
+
+        // Range outside existing keys should be a no-op.
+        let mut btree = setup();
+        btree.remove_range(100..150).unwrap();
+        for i in 0..LEN {
+            assert!(
+                btree
+                    .read(i, |v| v == Some(format!("value-{}", i).as_bytes()))
+                    .unwrap(),
+                "Expected key {} to remain after out-of-range delete",
+                i
+            );
+        }
+
+        // Full range should remove everything.
+        let mut btree = setup();
+        btree.remove_range(0..LEN).unwrap();
+        for i in 0..LEN {
+            assert!(
+                btree.read(i, |v| v.is_none()).unwrap(),
+                "Expected key {} to be removed by full range",
+                i
+            );
         }
     }
 }
