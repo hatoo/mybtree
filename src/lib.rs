@@ -1,9 +1,6 @@
 use core::panic;
-use std::collections::HashSet;
 use std::io::{Read, Seek, Write};
-use std::sync::Arc;
 
-use moka::sync::Cache;
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error, util::AlignedVec};
 
 pub const PAGE_SIZE: usize = 4096;
@@ -11,7 +8,6 @@ pub type Key = u64;
 pub type NodePtr = u64;
 pub const ROOT_PAGE_NUM: u64 = 0;
 pub const PAGE_CONTENT_SIZE: usize = PAGE_SIZE - 2;
-pub const DEFAULT_PAGE_CACHE_CAPACITY: u64 = 1024;
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct Leaf {
@@ -32,8 +28,6 @@ pub enum Node {
 pub struct Pager {
     pub file: std::fs::File,
     pub next_page_num: u64,
-    pub page_cache: Cache<u64, Arc<AlignedVec<16>>>,
-    pub dirty_pages: HashSet<u64>,
 }
 
 fn from_page(buffer: &AlignedVec<16>) -> &[u8] {
@@ -53,24 +47,9 @@ impl Pager {
     pub fn new(file: std::fs::File) -> Self {
         let file_size = file.metadata().unwrap().len();
         let next_page_num = file_size / PAGE_SIZE as u64;
-        let page_cache = Cache::new(DEFAULT_PAGE_CACHE_CAPACITY);
         Pager {
             file,
             next_page_num,
-            page_cache,
-            dirty_pages: HashSet::new(),
-        }
-    }
-
-    pub fn with_cache_capacity(file: std::fs::File, capacity: u64) -> Self {
-        let file_size = file.metadata().unwrap().len();
-        let next_page_num = file_size / PAGE_SIZE as u64;
-        let page_cache = Cache::new(capacity.max(1));
-        Pager {
-            file,
-            next_page_num,
-            page_cache,
-            dirty_pages: HashSet::new(),
         }
     }
 
@@ -80,35 +59,29 @@ impl Pager {
         page_num
     }
 
-    fn read_page_buffer(&mut self, page_num: u64) -> Result<Arc<AlignedVec<16>>, Error> {
-        if let Some(buffer) = self.page_cache.get(&page_num) {
-            return Ok(buffer);
-        }
-
+    pub fn read_node<T>(
+        &mut self,
+        page_num: u64,
+        f: impl FnOnce(&rkyv::Archived<Node>) -> T,
+    ) -> Result<T, Error> {
         let mut buffer = AlignedVec::<16>::with_capacity(PAGE_SIZE);
         buffer.resize(PAGE_SIZE, 0);
         self.file
             .seek(std::io::SeekFrom::Start(page_num * PAGE_SIZE as u64))
             .unwrap();
         self.file.read_exact(&mut buffer).unwrap();
-        let buffer = Arc::new(buffer);
-        self.page_cache.insert(page_num, buffer.clone());
-        Ok(buffer)
-    }
-
-    pub fn read_node<T>(
-        &mut self,
-        page_num: u64,
-        f: impl FnOnce(&rkyv::Archived<Node>) -> T,
-    ) -> Result<T, Error> {
-        let buffer = self.read_page_buffer(page_num)?;
         let buffer = from_page(&buffer);
         let archived = rkyv::api::high::access::<rkyv::Archived<Node>, Error>(&buffer)?;
         Ok(f(archived))
     }
 
     pub fn owned_node(&mut self, page_num: u64) -> Result<Node, Error> {
-        let buffer = self.read_page_buffer(page_num)?;
+        let mut buffer = AlignedVec::<16>::with_capacity(PAGE_SIZE);
+        buffer.resize(PAGE_SIZE, 0);
+        self.file
+            .seek(std::io::SeekFrom::Start(page_num * PAGE_SIZE as u64))
+            .unwrap();
+        self.file.read_exact(&mut buffer).unwrap();
         let buffer = from_page(&buffer);
         let archived = rkyv::access::<ArchivedNode, Error>(&buffer)?;
         let node: Node = deserialize(archived)?;
@@ -117,26 +90,10 @@ impl Pager {
 
     pub fn write_buffer(&mut self, page_num: u64, mut buffer: AlignedVec<16>) -> Result<(), Error> {
         to_page(&mut buffer);
-        self.page_cache.insert(page_num, Arc::new(buffer));
-        self.dirty_pages.insert(page_num);
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> Result<(), Error> {
-        let dirty_pages: Vec<u64> = self.dirty_pages.drain().collect();
-        for page_num in dirty_pages {
-            let buffer = match self.page_cache.get(&page_num) {
-                Some(buffer) => buffer,
-                None => {
-                    continue;
-                }
-            };
-            self.file
-                .seek(std::io::SeekFrom::Start(page_num * PAGE_SIZE as u64))
-                .unwrap();
-            self.file.write_all(&buffer).unwrap();
-        }
-        self.file.sync_all().unwrap();
+        self.file
+            .seek(std::io::SeekFrom::Start(page_num * PAGE_SIZE as u64))
+            .unwrap();
+        self.file.write_all(&buffer).unwrap();
         Ok(())
     }
 
@@ -163,10 +120,6 @@ impl Btree {
         self.pager
             .write_node(ROOT_PAGE_NUM, &Node::Leaf(root_leaf))?;
         Ok(())
-    }
-
-    pub fn flush(&mut self) -> Result<(), Error> {
-        self.pager.flush()
     }
 
     fn path_to_alloc(&mut self, key: Key, dest: Option<NodePtr>) -> Result<Vec<NodePtr>, Error> {
