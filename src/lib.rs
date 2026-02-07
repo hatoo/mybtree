@@ -268,7 +268,7 @@ impl Btree {
         Ok(ret)
     }
 
-    pub fn split_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
+    fn split_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(insert)?;
 
         let page = *path.last().unwrap();
@@ -407,7 +407,7 @@ impl Btree {
         Ok(None)
     }
 
-    pub fn merge_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
+    fn merge_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(insert)?;
 
         let page = *path.last().unwrap();
