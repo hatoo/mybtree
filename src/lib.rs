@@ -868,6 +868,25 @@ mod tests {
             );
         }
 
+        btree.remove_range(10..11).unwrap();
+        for i in 0..LEN {
+            if i == 10 {
+                assert!(
+                    btree.read(i, |v| v.is_none()).unwrap(),
+                    "Expected key {} to be removed",
+                    i
+                );
+            } else {
+                assert!(
+                    btree
+                        .read(i, |v| v == Some(format!("value-{}", i).as_bytes()))
+                        .unwrap(),
+                    "Expected key {} to remain after empty range",
+                    i
+                );
+            }
+        }
+
         // Range outside existing keys should be a no-op.
         let mut btree = setup();
         btree.remove_range(100..150).unwrap();
