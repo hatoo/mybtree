@@ -1,5 +1,8 @@
 use core::panic;
-use std::io::{Read, Seek, Write};
+use std::{
+    io::{Read, Seek, Write},
+    ops::Range,
+};
 
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error, util::AlignedVec};
 
@@ -242,6 +245,57 @@ impl Btree {
         }
     }
 
+    fn search_leaf(&mut self, key: Key) -> Result<Option<Vec<NodePtr>>, Error> {
+        let mut current = ROOT_PAGE_NUM;
+        let mut path = vec![];
+
+        enum NextNode {
+            Leaf,
+            Next(NodePtr),
+            NotFound,
+        }
+
+        loop {
+            path.push(current);
+
+            let next = self
+                .pager
+                .read_node(current, |archived_node| match archived_node {
+                    ArchivedNode::Leaf(leaf) => {
+                        match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(_) => NextNode::Leaf,
+                            Err(_) => NextNode::Leaf,
+                        }
+                    }
+                    ArchivedNode::Internal(internal) => {
+                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(index) | Err(index) => {
+                                if let Some(next_page) =
+                                    internal.kv.get(index).map(|t| t.1.to_native())
+                                {
+                                    NextNode::Next(next_page)
+                                } else {
+                                    NextNode::NotFound
+                                }
+                            }
+                        }
+                    }
+                })?;
+
+            match next {
+                NextNode::Leaf => {
+                    return Ok(Some(path));
+                }
+                NextNode::Next(next_page) => {
+                    current = next_page;
+                }
+                NextNode::NotFound => {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         let path = self.path_to_alloc(key, None)?;
 
@@ -405,6 +459,32 @@ impl Btree {
             }
         }
         Ok(None)
+    }
+
+    pub fn remove_range(&mut self, mut range: Range<Key>) -> Result<(), Error> {
+        while !range.is_empty() {
+            let path = match self.search_leaf(range.start)? {
+                Some(p) => p,
+                None => break,
+            };
+            let leaf_page = *path.last().unwrap();
+            let leaf_node = self.pager.owned_node(leaf_page)?;
+            if let Node::Leaf(mut leaf) = leaf_node {
+                let Some(last_key) = leaf.kv.last().map(|(k, _)| *k) else {
+                    break;
+                };
+                leaf.kv.retain(|(k, _)| !range.contains(k));
+                self.merge_insert(&path, &Node::Leaf(leaf))?;
+                if last_key == Key::MAX {
+                    break;
+                }
+                range.start = last_key + 1;
+            } else {
+                panic!("Expected leaf node");
+            }
+        }
+
+        Ok(())
     }
 
     fn merge_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
