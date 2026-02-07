@@ -1,7 +1,7 @@
 use core::panic;
 use std::{
     io::{Read, Seek, Write},
-    ops::Range,
+    ops::RangeBounds,
 };
 
 use rkyv::{Archive, Deserialize, Serialize, deserialize, rancor::Error, util::AlignedVec};
@@ -468,28 +468,39 @@ impl Btree {
         Ok(None)
     }
 
-    pub fn remove_range(&mut self, mut range: Range<Key>) -> Result<(), Error> {
-        while !range.is_empty() {
-            let path = match self.search_leaf(range.start)? {
-                Some(p) => p,
-                None => break,
-            };
-            let leaf_page = *path.last().unwrap();
-            let leaf_node = self.pager.owned_node(leaf_page)?;
-            if let Node::Leaf(mut leaf) = leaf_node {
-                let Some(last_key) = leaf.kv.last().map(|(k, _)| *k) else {
-                    break;
-                };
+    fn remove_range_at<R: RangeBounds<Key>>(
+        &mut self,
+        path: &[NodePtr],
+        left_key: Key,
+        range: &R,
+    ) -> Result<(), Error> {
+        let node = self.pager.owned_node(*path.last().unwrap())?;
+
+        match node {
+            Node::Leaf(mut leaf) => {
                 leaf.kv.retain(|(k, _)| !range.contains(k));
                 self.merge_insert(&path, &Node::Leaf(leaf))?;
-                if last_key == Key::MAX {
-                    break;
+                Ok(())
+            }
+            Node::Internal(internal) => {
+                let mut left_key = left_key;
+                for (k, ptr) in internal.kv {
+                    if range.contains(&left_key) || range.contains(&k) {
+                        let mut child_path = path.to_vec();
+                        child_path.push(ptr);
+                        self.remove_range_at(&child_path, left_key, range)?;
+                    } else {
+                        break;
+                    }
+                    left_key = k;
                 }
-                range.start = last_key + 1;
-            } else {
-                panic!("Expected leaf node");
+                Ok(())
             }
         }
+    }
+
+    pub fn remove_range(&mut self, range: impl RangeBounds<Key>) -> Result<(), Error> {
+        self.remove_range_at(&[ROOT_PAGE_NUM], 0, &range)?;
 
         Ok(())
     }
