@@ -1,5 +1,6 @@
 use core::panic;
 use std::{
+    collections::BTreeMap,
     io::{Read, Seek, Write},
     ops::RangeBounds,
 };
@@ -104,6 +105,31 @@ impl Pager {
         let buffer = rkyv::to_bytes(node)?;
         self.write_buffer(page_num, buffer)
     }
+}
+
+fn split_leaf(kv: Vec<(Key, Vec<u8>)>) -> Result<Vec<Vec<(Key, Vec<u8>)>>, Error> {
+    let mut result = vec![];
+    let mut current = vec![kv];
+
+    while let Some(kv) = current.pop() {
+        let mid = kv.len() / 2;
+        let left = kv[..mid].to_vec();
+        let right = kv[mid..].to_vec();
+
+        if rkyv::to_bytes(&Node::Leaf(Leaf { kv: left.clone() }))?.len() <= PAGE_CONTENT_SIZE {
+            result.push(left);
+        } else {
+            current.push(left);
+        }
+
+        if rkyv::to_bytes(&Node::Leaf(Leaf { kv: right.clone() }))?.len() <= PAGE_CONTENT_SIZE {
+            result.push(right);
+        } else {
+            current.push(right);
+        }
+    }
+    result.sort_by_key(|kv| kv.last().unwrap().0);
+    Ok(result)
 }
 
 pub struct Btree {
@@ -284,54 +310,44 @@ impl Btree {
 
         match insert {
             Node::Leaf(leaf) => {
-                let mid = leaf.kv.len() / 2;
-                let left_leaf = Leaf {
-                    kv: leaf.kv[..mid].to_vec(),
-                };
-                let right_leaf = Leaf {
-                    kv: leaf.kv[mid..].to_vec(),
-                };
-
-                let left_key = left_leaf.kv.last().unwrap().0;
-                let right_key = right_leaf.kv.last().unwrap().0;
+                let mut splits = split_leaf(leaf.kv.clone())?;
 
                 if let Some(&parent_page) = parents.last() {
                     let parent_node = self.pager.owned_node(parent_page)?;
                     if let Node::Internal(mut internal) = parent_node {
-                        let new_left_page = self.pager.next_page_num();
-
-                        match internal.kv.binary_search_by_key(&left_key, |t| t.0) {
-                            Ok(_) => {
-                                panic!("Duplicate key in internal node");
-                            }
-                            Err(index) => {
-                                internal.kv.insert(index, (left_key, new_left_page));
-                            }
+                        let right = splits.pop().unwrap();
+                        self.pager
+                            .write_node(page, &Node::Leaf(Leaf { kv: right }))?;
+                        let mut left_pages = Vec::new();
+                        for split in splits {
+                            let new_page = self.pager.next_page_num();
+                            let left_key = split.last().unwrap().0;
+                            self.pager
+                                .write_node(new_page, &Node::Leaf(Leaf { kv: split }))?;
+                            left_pages.push((left_key, new_page));
                         }
-
+                        let mut kv = internal.kv.iter().cloned().collect::<BTreeMap<_, _>>();
+                        kv.extend(left_pages.into_iter());
+                        let kv = kv.into_iter().collect::<Vec<_>>();
+                        internal.kv = kv;
                         self.split_insert(parents, &Node::Internal(internal))?;
-
-                        // Parent may be split
-                        let left_path = self.path_to_alloc(left_key, Some(new_left_page))?;
-                        let right_path = self.path_to_alloc(right_key, Some(page))?;
-
-                        self.split_insert(&left_path, &Node::Leaf(left_leaf))?;
-                        self.split_insert(&right_path, &Node::Leaf(right_leaf))?;
                     } else {
                         panic!("Parent is not an internal node");
                     }
                 } else {
-                    let new_left_page = self.pager.next_page_num();
-                    let new_right_page = self.pager.next_page_num();
-                    let new_root_internal = Internal {
-                        kv: vec![(left_key, new_left_page), (right_key, new_right_page)],
-                    };
+                    let mut new_pages = Vec::new();
+                    for split in splits {
+                        let new_page = self.pager.next_page_num();
+                        let key = split.last().unwrap().0;
+                        self.pager
+                            .write_node(new_page, &Node::Leaf(Leaf { kv: split }))?;
+                        new_pages.push((key, new_page));
+                    }
 
-                    self.pager
-                        .write_node(ROOT_PAGE_NUM, &Node::Internal(new_root_internal))?;
-
-                    self.split_insert(&[ROOT_PAGE_NUM, new_left_page], &Node::Leaf(left_leaf))?;
-                    self.split_insert(&[ROOT_PAGE_NUM, new_right_page], &Node::Leaf(right_leaf))?;
+                    self.split_insert(
+                        &[ROOT_PAGE_NUM],
+                        &Node::Internal(Internal { kv: new_pages }),
+                    )?;
                 }
             }
             Node::Internal(internal) => {
