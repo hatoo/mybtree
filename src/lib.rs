@@ -245,64 +245,6 @@ impl Btree {
         }
     }
 
-    fn search_leaf(&mut self, key: Key) -> Result<Option<Vec<NodePtr>>, Error> {
-        let mut current = ROOT_PAGE_NUM;
-        let mut path = vec![];
-
-        enum NextNode {
-            Leaf,
-            Next(NodePtr),
-            NotFound,
-        }
-
-        loop {
-            path.push(current);
-
-            let next = self
-                .pager
-                .read_node(current, |archived_node| match archived_node {
-                    ArchivedNode::Leaf(leaf) => {
-                        if leaf.kv.is_empty() {
-                            NextNode::NotFound
-                        } else {
-                            let min = leaf.kv.first().unwrap().0.to_native();
-                            let max = leaf.kv.last().unwrap().0.to_native();
-                            if min <= key && key <= max {
-                                NextNode::Leaf
-                            } else {
-                                NextNode::NotFound
-                            }
-                        }
-                    }
-                    ArchivedNode::Internal(internal) => {
-                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(index) | Err(index) => {
-                                if let Some(next_page) =
-                                    internal.kv.get(index).map(|t| t.1.to_native())
-                                {
-                                    NextNode::Next(next_page)
-                                } else {
-                                    NextNode::NotFound
-                                }
-                            }
-                        }
-                    }
-                })?;
-
-            match next {
-                NextNode::Leaf => {
-                    return Ok(Some(path));
-                }
-                NextNode::Next(next_page) => {
-                    current = next_page;
-                }
-                NextNode::NotFound => {
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         let path = self.path_to_alloc(key, None)?;
 
