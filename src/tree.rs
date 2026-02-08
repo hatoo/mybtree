@@ -286,43 +286,6 @@ impl Btree {
         Ok(None)
     }
 
-    fn remove_range_at<R: RangeBounds<Key>>(
-        &mut self,
-        path: &[NodePtr],
-        left_key: Key,
-        range: &R,
-    ) -> Result<(), Error> {
-        let node = self.pager.owned_node(*path.last().unwrap())?;
-
-        match node {
-            Node::Leaf(mut leaf) => {
-                leaf.kv.retain(|(k, _)| !range.contains(k));
-                self.merge_insert(&path, &Node::Leaf(leaf))?;
-                Ok(())
-            }
-            Node::Internal(internal) => {
-                let mut left_key = left_key;
-                for (k, ptr) in internal.kv {
-                    if is_overlap(range, &(left_key..=k)) {
-                        let mut child_path = path.to_vec();
-                        child_path.push(ptr);
-                        self.remove_range_at(&child_path, left_key, range)?;
-                    } else {
-                        break;
-                    }
-                    left_key = k;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    pub fn remove_range(&mut self, range: impl RangeBounds<Key>) -> Result<(), Error> {
-        self.remove_range_at(&[ROOT_PAGE_NUM], 0, &range)?;
-
-        Ok(())
-    }
-
     fn merge_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(insert)?;
 
