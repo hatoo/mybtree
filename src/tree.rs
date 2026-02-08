@@ -224,29 +224,26 @@ impl Btree {
 
                 if let Some(&parent_page) = parents.last() {
                     let parent_node = self.pager.owned_node(parent_page)?;
-                    if let Node::Internal(mut internal) = parent_node {
-                        let right = splits.pop().unwrap();
-                        self.pager
-                            .write_node(page, &Node::Internal(Internal { kv: right }))?;
-                        let mut left_pages = Vec::new();
-
-                        for split in splits {
-                            let new_left_page = self.pager.next_page_num();
-                            let left_key = split.last().unwrap().0;
-                            self.pager.write_node(
-                                new_left_page,
-                                &Node::Internal(Internal { kv: split }),
-                            )?;
-                            left_pages.push((left_key, new_left_page));
-                        }
-                        let mut kv = internal.kv.iter().cloned().collect::<BTreeMap<_, _>>();
-                        kv.extend(left_pages.into_iter());
-                        let kv = kv.into_iter().collect::<Vec<_>>();
-                        internal.kv = kv;
-                        self.split_insert(parents, &Node::Internal(internal))?;
-                    } else {
+                    let Node::Internal(mut internal) = parent_node else {
                         panic!("Parent is not an internal node");
+                    };
+                    let right = splits.pop().unwrap();
+                    self.pager
+                        .write_node(page, &Node::Internal(Internal { kv: right }))?;
+                    let mut left_pages = Vec::new();
+
+                    for split in splits {
+                        let new_left_page = self.pager.next_page_num();
+                        let left_key = split.last().unwrap().0;
+                        self.pager
+                            .write_node(new_left_page, &Node::Internal(Internal { kv: split }))?;
+                        left_pages.push((left_key, new_left_page));
                     }
+                    let mut kv = internal.kv.iter().cloned().collect::<BTreeMap<_, _>>();
+                    kv.extend(left_pages.into_iter());
+                    let kv = kv.into_iter().collect::<Vec<_>>();
+                    internal.kv = kv;
+                    self.split_insert(parents, &Node::Internal(internal))?;
                 } else {
                     let new_pages = splits
                         .into_iter()
