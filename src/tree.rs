@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
-use std::ops::RangeBounds;
 use core::panic;
 use rkyv::rancor::Error;
+use std::collections::BTreeMap;
+use std::ops::RangeBounds;
 
-use crate::types::{Leaf, Internal, Node, Key, NodePtr, ROOT_PAGE_NUM, PAGE_CONTENT_SIZE, PAGE_SIZE};
 use crate::pager::Pager;
-use crate::util::{split_leaf, is_overlap};
+use crate::types::{
+    Internal, Key, Leaf, Node, NodePtr, PAGE_CONTENT_SIZE, PAGE_SIZE, ROOT_PAGE_NUM,
+};
+use crate::util::{is_overlap, split_internal, split_leaf};
 
 pub struct Btree {
     pub pager: Pager,
@@ -218,53 +220,49 @@ impl Btree {
                 }
             }
             Node::Internal(internal) => {
-                let mid = internal.kv.len() / 2;
-                let left_internal = Internal {
-                    kv: internal.kv[..mid].to_vec(),
-                };
-                let right_internal = Internal {
-                    kv: internal.kv[mid..].to_vec(),
-                };
-
-                let left_key = left_internal.kv.last().unwrap().0;
-                let right_key = right_internal.kv.last().unwrap().0;
+                let mut splits = split_internal(internal.kv.clone())?;
 
                 if let Some(&parent_page) = parents.last() {
                     let parent_node = self.pager.owned_node(parent_page)?;
                     if let Node::Internal(mut internal) = parent_node {
-                        let new_left_page = self.pager.next_page_num();
-                        match internal.kv.binary_search_by_key(&left_key, |t| t.0) {
-                            Ok(_) => {
-                                panic!("Duplicate key in internal node");
-                            }
-                            Err(index) => {
-                                internal.kv.insert(index, (left_key, new_left_page));
-                            }
+                        let right = splits.pop().unwrap();
+                        self.pager
+                            .write_node(page, &Node::Internal(Internal { kv: right }))?;
+                        let mut left_pages = Vec::new();
+
+                        for split in splits {
+                            let new_left_page = self.pager.next_page_num();
+                            let left_key = split.last().unwrap().0;
+                            self.pager.write_node(
+                                new_left_page,
+                                &Node::Internal(Internal { kv: split }),
+                            )?;
+                            left_pages.push((left_key, new_left_page));
                         }
-
-                        // Never fail
-                        self.pager
-                            .write_node(new_left_page, &Node::Internal(left_internal))?;
-                        self.pager
-                            .write_node(page, &Node::Internal(right_internal))?;
-
+                        let mut kv = internal.kv.iter().cloned().collect::<BTreeMap<_, _>>();
+                        kv.extend(left_pages.into_iter());
+                        let kv = kv.into_iter().collect::<Vec<_>>();
+                        internal.kv = kv;
                         self.split_insert(parents, &Node::Internal(internal))?;
                     } else {
                         panic!("Parent is not an internal node");
                     }
                 } else {
-                    let new_left_page = self.pager.next_page_num();
-                    let new_right_page = self.pager.next_page_num();
-                    let new_root_internal = Internal {
-                        kv: vec![(left_key, new_left_page), (right_key, new_right_page)],
-                    };
+                    let new_pages = splits
+                        .into_iter()
+                        .map(|split| {
+                            let new_page = self.pager.next_page_num();
+                            let key = split.last().unwrap().0;
+                            self.pager
+                                .write_node(new_page, &Node::Internal(Internal { kv: split }))?;
+                            Ok((key, new_page))
+                        })
+                        .collect::<Result<Vec<_>, Error>>()?;
+
+                    let new_root_internal = Internal { kv: new_pages };
 
                     self.pager
                         .write_node(ROOT_PAGE_NUM, &Node::Internal(new_root_internal))?;
-                    self.pager
-                        .write_node(new_left_page, &Node::Internal(left_internal))?;
-                    self.pager
-                        .write_node(new_right_page, &Node::Internal(right_internal))?;
                 }
             }
         }

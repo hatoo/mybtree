@@ -28,6 +28,38 @@ pub fn split_leaf(kv: Vec<(Key, Vec<u8>)>) -> Result<Vec<Vec<(Key, Vec<u8>)>>, E
     Ok(result)
 }
 
+pub fn split_internal(kv: Vec<(Key, u64)>) -> Result<Vec<Vec<(Key, u64)>>, Error> {
+    let mut result = vec![];
+    let mut current = vec![kv];
+
+    while let Some(kv) = current.pop() {
+        let mid = kv.len() / 2;
+        let left = kv[..mid].to_vec();
+        let right = kv[mid..].to_vec();
+
+        if rkyv::to_bytes(&Node::Internal(crate::types::Internal { kv: left.clone() }))?.len()
+            <= PAGE_CONTENT_SIZE
+        {
+            result.push(left);
+        } else {
+            current.push(left);
+        }
+
+        if rkyv::to_bytes(&Node::Internal(crate::types::Internal {
+            kv: right.clone(),
+        }))?
+        .len()
+            <= PAGE_CONTENT_SIZE
+        {
+            result.push(right);
+        } else {
+            current.push(right);
+        }
+    }
+    result.sort_by_key(|kv| kv.last().unwrap().0);
+    Ok(result)
+}
+
 pub fn is_overlap<R1: RangeBounds<Key>, R2: RangeBounds<Key>>(range1: &R1, range2: &R2) -> bool {
     let start1 = match range1.start_bound() {
         Bound::Included(&b) => b,
