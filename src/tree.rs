@@ -1,13 +1,12 @@
 use core::panic;
 use rkyv::rancor::Error;
 use std::collections::BTreeMap;
-use std::ops::RangeBounds;
 
 use crate::pager::Pager;
 use crate::types::{
     Internal, Key, Leaf, Node, NodePtr, PAGE_CONTENT_SIZE, PAGE_SIZE, ROOT_PAGE_NUM,
 };
-use crate::util::{is_overlap, split_internal, split_leaf};
+use crate::util::{split_internal, split_leaf};
 
 pub struct Btree {
     pub pager: Pager,
