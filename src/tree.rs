@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 
 use crate::pager::Pager;
-use crate::types::{Internal, Key, Leaf, Node, NodePtr, ROOT_PAGE_NUM};
+use crate::types::{Internal, Key, Leaf, Node, NodePtr, ROOT_PAGE_NUM, Value};
 use crate::util::{is_overlap, split_internal, split_leaf};
 
 pub struct Btree {
@@ -77,7 +77,7 @@ impl Btree {
         }
     }
 
-    pub fn insert(&mut self, key: Key, mut value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
+    pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         let mut current = ROOT_PAGE_NUM;
         let mut path = vec![];
 
@@ -116,17 +116,30 @@ impl Btree {
                     };
                     match leaf.kv.binary_search_by_key(&key, |t| t.0) {
                         Ok(index) => {
-                            std::mem::swap(&mut leaf.kv[index].1, &mut value);
-                            let old_value = value;
-                            if leaf.kv[index].1.len() > old_value.len() {
+                            let old_value_entry = leaf.kv[index].1.clone();
+                            let old_bytes = self.resolve_value(&old_value_entry)?;
+
+                            let new_value = self.make_value(value)?;
+                            let grew = match (&old_value_entry, &new_value) {
+                                (Value::Inline(old), Value::Inline(new_v)) => {
+                                    new_v.len() > old.len()
+                                }
+                                (Value::Overflow { .. }, Value::Inline(_)) => true,
+                                _ => false,
+                            };
+                            leaf.kv[index].1 = new_value;
+
+                            if grew {
                                 self.split_insert(&path, &Node::Leaf(leaf))?;
                             } else {
                                 self.merge_insert(&path, &Node::Leaf(leaf))?;
                             }
-                            return Ok(Some(old_value));
+                            // TODO: free old overflow pages
+                            return Ok(Some(old_bytes));
                         }
                         Err(index) => {
-                            leaf.kv.insert(index, (key, value));
+                            let new_value = self.make_value(value)?;
+                            leaf.kv.insert(index, (key, new_value));
                             self.split_insert(&path, &Node::Leaf(leaf))?;
                             return Ok(None);
                         }
@@ -142,8 +155,9 @@ impl Btree {
 
                     if internal.kv.is_empty() {
                         let new_leaf_page = self.pager.next_page_num();
+                        let new_value = self.make_value(value)?;
                         let new_leaf = Leaf {
-                            kv: vec![(key, value)],
+                            kv: vec![(key, new_value)],
                         };
                         self.pager
                             .write_node(new_leaf_page, &Node::Leaf(new_leaf))?;
@@ -273,9 +287,11 @@ impl Btree {
             };
             match leaf.kv.binary_search_by_key(&key, |t| t.0) {
                 Ok(index) => {
-                    let old_value = leaf.kv.remove(index).1;
+                    let old_value_entry = leaf.kv.remove(index).1;
                     self.merge_insert(&path, &Node::Leaf(leaf))?;
-                    return Ok(Some(old_value));
+                    let old_bytes = self.resolve_value(&old_value_entry)?;
+                    // TODO: free overflow pages
+                    return Ok(Some(old_bytes));
                 }
                 Err(_) => {
                     panic!("Key not found in leaf node");
@@ -411,39 +427,63 @@ impl Btree {
     }
 
     pub fn read<T>(&mut self, key: Key, f: impl FnOnce(Option<&[u8]>) -> T) -> Result<T, Error> {
+        enum ReadAction<T> {
+            Done(T),
+            Next(NodePtr),
+            Overflow { start_page: u64, total_len: u64 },
+        }
+
         let mut current = ROOT_PAGE_NUM;
 
         let mut ff = Some(f);
         let f = &mut ff;
 
         loop {
-            let result = self
-                .pager
-                .read_node(current, |archived_node| match archived_node {
-                    rkyv::Archived::<Node>::Leaf(leaf) => {
-                        match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(index) => Some(f.take().unwrap()(Some(leaf.kv[index].1.as_ref()))),
-                            Err(_) => Some(f.take().unwrap()(None)),
+            let result: ReadAction<T> =
+                self.pager
+                    .read_node(current, |archived_node| match archived_node {
+                        rkyv::Archived::<Node>::Leaf(leaf) => {
+                            match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                                Ok(index) => match &leaf.kv[index].1 {
+                                    rkyv::Archived::<Value>::Inline(data) => {
+                                        ReadAction::Done(f.take().unwrap()(Some(data.as_ref())))
+                                    }
+                                    rkyv::Archived::<Value>::Overflow {
+                                        start_page,
+                                        total_len,
+                                    } => ReadAction::Overflow {
+                                        start_page: start_page.to_native(),
+                                        total_len: total_len.to_native(),
+                                    },
+                                },
+                                Err(_) => ReadAction::Done(f.take().unwrap()(None)),
+                            }
                         }
-                    }
-                    rkyv::Archived::<Node>::Internal(internal) => {
-                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(index) | Err(index) => {
-                                if let Some(next_page) =
-                                    internal.kv.get(index).map(|t| t.1.to_native())
-                                {
-                                    current = next_page;
-                                    None
-                                } else {
-                                    Some(f.take().unwrap()(None))
+                        rkyv::Archived::<Node>::Internal(internal) => {
+                            match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                                Ok(index) | Err(index) => {
+                                    if let Some(next_page) =
+                                        internal.kv.get(index).map(|t| t.1.to_native())
+                                    {
+                                        ReadAction::Next(next_page)
+                                    } else {
+                                        ReadAction::Done(f.take().unwrap()(None))
+                                    }
                                 }
                             }
                         }
-                    }
-                })?;
+                    })?;
 
-            if let Some(value) = result {
-                return Ok(value);
+            match result {
+                ReadAction::Done(v) => return Ok(v),
+                ReadAction::Next(next) => current = next,
+                ReadAction::Overflow {
+                    start_page,
+                    total_len,
+                } => {
+                    let data = self.pager.read_overflow(start_page, total_len)?;
+                    return Ok(f.take().unwrap()(Some(&data)));
+                }
             }
         }
     }
@@ -469,7 +509,16 @@ impl Btree {
             Node::Leaf(leaf) => {
                 for (k, v) in leaf.kv {
                     if range.contains(&k) {
-                        f(k, &v);
+                        match v {
+                            Value::Inline(data) => f(k, &data),
+                            Value::Overflow {
+                                start_page,
+                                total_len,
+                            } => {
+                                let data = self.pager.read_overflow(start_page, total_len)?;
+                                f(k, &data);
+                            }
+                        }
                     }
                 }
             }
@@ -507,6 +556,41 @@ impl Btree {
             })
     }
 
+    /// Determine whether a value is too large for inline storage and must use overflow pages.
+    fn needs_overflow(&self, value_len: usize) -> bool {
+        let overhead = rkyv::to_bytes::<Error>(&Node::Leaf(Leaf {
+            kv: vec![(0, Value::Inline(vec![]))],
+        }))
+        .unwrap()
+        .len();
+        overhead + value_len > self.pager.page_content_size()
+    }
+
+    /// Convert a raw value into a `Value`, using overflow pages if necessary.
+    fn make_value(&mut self, value: Vec<u8>) -> Result<Value, Error> {
+        if self.needs_overflow(value.len()) {
+            let total_len = value.len() as u64;
+            let start_page = self.pager.write_overflow(&value)?;
+            Ok(Value::Overflow {
+                start_page,
+                total_len,
+            })
+        } else {
+            Ok(Value::Inline(value))
+        }
+    }
+
+    /// Resolve a `Value` into owned bytes, reading overflow pages if needed.
+    fn resolve_value(&mut self, value: &Value) -> Result<Vec<u8>, Error> {
+        match value {
+            Value::Inline(data) => Ok(data.clone()),
+            Value::Overflow {
+                start_page,
+                total_len,
+            } => self.pager.read_overflow(*start_page, *total_len),
+        }
+    }
+
     #[cfg(test)]
     pub fn debug(&mut self, root: NodePtr, min: Key, max: Key) -> Result<(), Error> {
         let node = self.pager.owned_node(root)?;
@@ -518,7 +602,14 @@ impl Btree {
                     if !(min <= k && k <= max) {
                         panic!("Key {} out of range ({}..={})", k, min, max);
                     }
-                    println!("  Key: {}, Value Length: {}", k, v.len());
+                    match &v {
+                        Value::Inline(data) => {
+                            println!("  Key: {}, Value Length: {} (inline)", k, data.len());
+                        }
+                        Value::Overflow { total_len, .. } => {
+                            println!("  Key: {}, Value Length: {} (overflow)", k, total_len);
+                        }
+                    }
                 }
             }
             Node::Internal(internal) => {
@@ -586,7 +677,7 @@ mod tests {
         let pager = Pager::new(file, 4096);
         let mut btree = Btree::new(pager);
         let root_leaf = Leaf {
-            kv: vec![(0, b"zero".to_vec())],
+            kv: vec![(0, Value::Inline(b"zero".to_vec()))],
         };
         btree
             .pager
@@ -916,5 +1007,145 @@ mod tests {
         for i in 751..1000 {
             assert!(btree.read(i, |v| v.is_some()).unwrap());
         }
+    }
+
+    #[test]
+    fn test_big_value_insert_and_read() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file, 256);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        // Insert a value much larger than a page
+        let big_value = vec![42u8; 4096];
+        btree.insert(1, big_value.clone()).unwrap();
+
+        // Read it back
+        let result = btree.read(1, |v| v.map(|b| b.to_vec())).unwrap();
+        assert_eq!(result, Some(big_value));
+    }
+
+    #[test]
+    fn test_big_value_with_small_values() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file, 256);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        // Insert small values around a big value
+        btree.insert(0, b"small-before".to_vec()).unwrap();
+        let big_value = vec![42u8; 4096];
+        btree.insert(1, big_value.clone()).unwrap();
+        btree.insert(2, b"small-after".to_vec()).unwrap();
+
+        // Verify all values
+        assert!(
+            btree
+                .read(0, |v| v == Some(b"small-before".as_ref()))
+                .unwrap()
+        );
+        assert_eq!(
+            btree.read(1, |v| v.map(|b| b.to_vec())).unwrap(),
+            Some(big_value)
+        );
+        assert!(
+            btree
+                .read(2, |v| v == Some(b"small-after".as_ref()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_big_value_update() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file, 256);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        let big_value = vec![42u8; 4096];
+        btree.insert(1, big_value.clone()).unwrap();
+
+        // Update with a bigger value
+        let bigger_value = vec![99u8; 8192];
+        let old = btree.insert(1, bigger_value.clone()).unwrap();
+        assert_eq!(old, Some(big_value));
+
+        let result = btree.read(1, |v| v.map(|b| b.to_vec())).unwrap();
+        assert_eq!(result, Some(bigger_value));
+    }
+
+    #[test]
+    fn test_big_value_remove() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file, 256);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        let big_value = vec![42u8; 4096];
+        btree.insert(1, big_value.clone()).unwrap();
+
+        let removed = btree.remove(1).unwrap();
+        assert_eq!(removed, Some(big_value));
+        assert!(btree.read(1, |v| v.is_none()).unwrap());
+    }
+
+    #[test]
+    fn test_big_value_read_range() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file, 256);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        btree.insert(0, b"small".to_vec()).unwrap();
+        let big_value = vec![42u8; 2048];
+        btree.insert(1, big_value.clone()).unwrap();
+        btree.insert(2, b"also-small".to_vec()).unwrap();
+
+        let mut results = Vec::new();
+        btree
+            .read_range(0..=2, |k, v| results.push((k, v.to_vec())))
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], (0, b"small".to_vec()));
+        assert_eq!(results[1], (1, big_value));
+        assert_eq!(results[2], (2, b"also-small".to_vec()));
+    }
+
+    #[test]
+    fn test_multiple_big_values() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file, 256);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        let mut expected = HashMap::new();
+        for i in 0u64..20 {
+            let big_value = vec![i as u8; 1024 + (i as usize * 100)];
+            btree.insert(i, big_value.clone()).unwrap();
+            expected.insert(i, big_value);
+        }
+
+        for (key, value) in &expected {
+            let result = btree.read(*key, |v| v.map(|b| b.to_vec())).unwrap();
+            assert_eq!(result.as_ref(), Some(value), "Mismatch at key {}", key);
+        }
+    }
+
+    #[test]
+    fn test_big_value_replace_with_small() {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file, 256);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        let big_value = vec![42u8; 4096];
+        btree.insert(1, big_value.clone()).unwrap();
+
+        // Replace big value with a small one
+        let old = btree.insert(1, b"tiny".to_vec()).unwrap();
+        assert_eq!(old, Some(big_value));
+
+        assert!(btree.read(1, |v| v == Some(b"tiny".as_ref())).unwrap());
     }
 }

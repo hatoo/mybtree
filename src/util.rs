@@ -1,12 +1,12 @@
 use rkyv::rancor::Error;
 use std::ops::{Bound, RangeBounds};
 
-use crate::types::{Key, Leaf, Node};
+use crate::types::{Key, Leaf, Node, Value};
 
 pub fn split_leaf(
-    kv: Vec<(Key, Vec<u8>)>,
+    kv: Vec<(Key, Value)>,
     page_content_size: usize,
-) -> Result<Vec<Vec<(Key, Vec<u8>)>>, Error> {
+) -> Result<Vec<Vec<(Key, Value)>>, Error> {
     let mut result = vec![];
     let mut current = vec![kv];
 
