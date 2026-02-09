@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 
 use crate::pager::Pager;
-use crate::types::{Internal, Key, Leaf, Node, NodePtr, OverflowPage, ROOT_PAGE_NUM, Value};
+use crate::types::{Internal, Key, Leaf, Node, NodePtr, ROOT_PAGE_NUM, Value};
 use crate::util::{is_overlap, split_internal, split_leaf};
 
 pub struct Btree {
@@ -591,7 +591,8 @@ impl Btree {
         }
     }
 
-    /// Write a large value across one or more overflow pages (rkyv-serialized).
+    /// Write a large value across one or more overflow pages.
+    /// Each overflow page layout: [next_page: u64 LE][data bytes][padding]
     /// Returns the page number of the first overflow page.
     fn write_overflow(&mut self, data: &[u8]) -> Result<u64, Error> {
         let data_per_page = self.overflow_data_per_page();
@@ -611,46 +612,37 @@ impl Btree {
                 u64::MAX
             };
 
-            let overflow_page = OverflowPage {
-                next_page,
-                data: chunk.to_vec(),
-            };
-            let buffer = rkyv::to_bytes(&overflow_page)?;
-            self.pager.write_buffer(page_num, buffer)?;
+            let mut buffer = vec![0u8; 8 + chunk.len()];
+            buffer[..8].copy_from_slice(&next_page.to_le_bytes());
+            buffer[8..].copy_from_slice(chunk);
+            self.pager.write_raw_page(page_num, &buffer);
         }
 
         Ok(pages[0])
     }
 
-    /// Read a large value stored across overflow pages (rkyv-serialized).
+    /// Read a large value stored across overflow pages.
     fn read_overflow(&mut self, start_page: u64, total_len: u64) -> Result<Vec<u8>, Error> {
+        let data_per_page = self.overflow_data_per_page();
         let mut result = Vec::with_capacity(total_len as usize);
         let mut current_page = start_page;
         let mut remaining = total_len as usize;
 
         while remaining > 0 {
-            let overflow_page = self.pager.owned_overflow_page(current_page)?;
-            let chunk_len = std::cmp::min(overflow_page.data.len(), remaining);
-            result.extend_from_slice(&overflow_page.data[..chunk_len]);
+            let buffer = self.pager.read_raw_page(current_page);
+            let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+            let chunk_len = std::cmp::min(data_per_page, remaining);
+            result.extend_from_slice(&buffer[8..8 + chunk_len]);
             remaining -= chunk_len;
-            current_page = overflow_page.next_page;
+            current_page = next_page;
         }
 
         Ok(result)
     }
 
-    /// Maximum data bytes per overflow page (page_content_size minus rkyv overhead for OverflowPage).
+    /// Maximum data bytes per overflow page (page_size minus 8-byte next-page pointer).
     fn overflow_data_per_page(&self) -> usize {
-        let ref_size: usize = 8;
-        let serialized_len = rkyv::to_bytes::<Error>(&OverflowPage {
-            next_page: 0,
-            data: vec![0u8; ref_size],
-        })
-        .unwrap()
-        .len();
-        let overhead = serialized_len - ref_size;
-        let available = self.pager.page_content_size().saturating_sub(overhead);
-        (available / 8) * 8
+        self.pager.page_size - 8
     }
 
     #[cfg(test)]

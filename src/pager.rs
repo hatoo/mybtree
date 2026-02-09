@@ -1,7 +1,7 @@
 use rkyv::{api::high, rancor::Error, util::AlignedVec};
 use std::io::{Read, Seek, Write};
 
-use crate::types::{Node, OverflowPage};
+use crate::types::Node;
 
 pub struct Pager {
     pub page_size: usize,
@@ -88,16 +88,24 @@ impl Pager {
         self.write_buffer(page_num, buffer)
     }
 
-    pub fn owned_overflow_page(&mut self, page_num: u64) -> Result<OverflowPage, Error> {
-        let mut buffer = AlignedVec::<16>::with_capacity(self.page_size);
-        buffer.resize(self.page_size, 0);
+    pub fn write_raw_page(&mut self, page_num: u64, data: &[u8]) {
+        assert!(data.len() <= self.page_size);
+        self.file
+            .seek(std::io::SeekFrom::Start(page_num * self.page_size as u64))
+            .unwrap();
+        self.file.write_all(data).unwrap();
+        if data.len() < self.page_size {
+            let padding = vec![0u8; self.page_size - data.len()];
+            self.file.write_all(&padding).unwrap();
+        }
+    }
+
+    pub fn read_raw_page(&mut self, page_num: u64) -> Vec<u8> {
+        let mut buffer = vec![0u8; self.page_size];
         self.file
             .seek(std::io::SeekFrom::Start(page_num * self.page_size as u64))
             .unwrap();
         self.file.read_exact(&mut buffer).unwrap();
-        let buffer = self.from_page(&buffer);
-        let archived = rkyv::access::<rkyv::Archived<OverflowPage>, Error>(&buffer)?;
-        let page: OverflowPage = rkyv::deserialize(archived)?;
-        Ok(page)
+        buffer
     }
 }

@@ -25,9 +25,3 @@ pub enum Node {
     Leaf(Leaf),
     Internal(Internal),
 }
-
-#[derive(Archive, Deserialize, Serialize, Debug)]
-pub struct OverflowPage {
-    pub next_page: u64,
-    pub data: Vec<u8>,
-}
