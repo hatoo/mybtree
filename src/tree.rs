@@ -1,5 +1,6 @@
 use core::panic;
 use rkyv::rancor::Error;
+use rkyv::{Archive, Archived};
 use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 
@@ -487,6 +488,26 @@ impl Btree {
         }
 
         Ok(())
+    }
+
+    pub fn available_key(&mut self) -> Result<Key, Error> {
+        self.pager
+            .read_node(ROOT_PAGE_NUM, |archived_node| match archived_node {
+                Archived::<Node>::Leaf(leaf) => {
+                    if let Some(t) = leaf.kv.last() {
+                        t.0.to_native().checked_add(1).unwrap_or(u64::MAX)
+                    } else {
+                        0
+                    }
+                }
+                Archived::<Node>::Internal(internal) => {
+                    if let Some(t) = internal.kv.last() {
+                        t.0.to_native().checked_add(1).unwrap_or(u64::MAX)
+                    } else {
+                        0
+                    }
+                }
+            })
     }
 
     #[cfg(test)]
