@@ -774,7 +774,10 @@ mod tests {
     #[test]
     fn test_read_range_full() {
         let mut btree = build_btree(200);
-        assert_eq!(read_range_keys(&mut btree, 0..=199), (0..200).collect::<Vec<_>>());
+        assert_eq!(
+            read_range_keys(&mut btree, 0..=199),
+            (0..200).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -787,7 +790,10 @@ mod tests {
     #[test]
     fn test_read_range_unbounded_end() {
         let mut btree = build_btree(200);
-        assert_eq!(read_range_keys(&mut btree, ..=5), (0..=5).collect::<Vec<_>>());
+        assert_eq!(
+            read_range_keys(&mut btree, ..=5),
+            (0..=5).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -799,7 +805,10 @@ mod tests {
     #[test]
     fn test_read_range_order() {
         let mut btree = build_btree(500);
-        assert_eq!(read_range_keys(&mut btree, 123..=321), (123..=321).collect::<Vec<_>>());
+        assert_eq!(
+            read_range_keys(&mut btree, 123..=321),
+            (123..=321).collect::<Vec<_>>()
+        );
     }
 
     #[test]
