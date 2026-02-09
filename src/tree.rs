@@ -421,10 +421,10 @@ impl Btree {
 
     pub fn read_range<R: RangeBounds<Key>>(
         &mut self,
-        range: &R,
+        range: R,
         mut f: impl FnMut(Key, &[u8]),
     ) -> Result<(), Error> {
-        self.read_range_at(ROOT_PAGE_NUM, range, &mut (f), 0)
+        self.read_range_at(ROOT_PAGE_NUM, &range, &mut (f), 0)
     }
 
     fn read_range_at<R: RangeBounds<Key>>(
@@ -515,7 +515,7 @@ mod tests {
         btree
     }
 
-    fn read_range_keys<R: RangeBounds<Key>>(btree: &mut Btree, range: &R) -> Vec<Key> {
+    fn read_range_keys<R: RangeBounds<Key>>(btree: &mut Btree, range: R) -> Vec<Key> {
         let mut keys = Vec::new();
         btree.read_range(range, |k, _| keys.push(k)).unwrap();
         keys
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn test_read_range_full() {
         let mut btree = build_btree(200);
-        let keys = read_range_keys(&mut btree, &(0..=199));
+        let keys = read_range_keys(&mut btree, 0..=199);
         let expected = (0..200).collect::<Vec<_>>();
         assert_eq!(keys, expected);
     }
@@ -663,7 +663,7 @@ mod tests {
     fn test_read_range_exclusive_start() {
         let mut btree = build_btree(200);
         let range = (Bound::Excluded(10), Bound::Included(20));
-        let keys = read_range_keys(&mut btree, &range);
+        let keys = read_range_keys(&mut btree, range);
         let expected = (11..=20).collect::<Vec<_>>();
         assert_eq!(keys, expected);
     }
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn test_read_range_unbounded_end() {
         let mut btree = build_btree(200);
-        let keys = read_range_keys(&mut btree, &(..=5));
+        let keys = read_range_keys(&mut btree, ..=5);
         let expected = (0..=5).collect::<Vec<_>>();
         assert_eq!(keys, expected);
     }
@@ -679,14 +679,14 @@ mod tests {
     #[test]
     fn test_read_range_empty() {
         let mut btree = build_btree(200);
-        let keys = read_range_keys(&mut btree, &(500..=600));
+        let keys = read_range_keys(&mut btree, 500..=600);
         assert!(keys.is_empty());
     }
 
     #[test]
     fn test_read_range_order() {
         let mut btree = build_btree(500);
-        let keys = read_range_keys(&mut btree, &(123..=321));
+        let keys = read_range_keys(&mut btree, 123..=321);
         let expected = (123..=321).collect::<Vec<_>>();
         assert_eq!(keys, expected);
     }
