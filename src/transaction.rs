@@ -124,6 +124,13 @@ impl Transaction {
     }
 }
 
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        let mut inner = self.store.lock().unwrap();
+        inner.active_transactions.remove(&self.tx_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
