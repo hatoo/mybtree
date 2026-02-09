@@ -1,12 +1,13 @@
 use core::panic;
 use rkyv::rancor::Error;
 use std::collections::BTreeMap;
+use std::ops::RangeBounds;
 
 use crate::pager::Pager;
 use crate::types::{
     Internal, Key, Leaf, Node, NodePtr, PAGE_CONTENT_SIZE, PAGE_SIZE, ROOT_PAGE_NUM,
 };
-use crate::util::{split_internal, split_leaf};
+use crate::util::{is_overlap, split_internal, split_leaf};
 
 pub struct Btree {
     pub pager: Pager,
@@ -418,6 +419,45 @@ impl Btree {
         }
     }
 
+    pub fn read_range<R: RangeBounds<Key>>(
+        &mut self,
+        range: &R,
+        mut f: impl FnMut(Key, &[u8]),
+    ) -> Result<(), Error> {
+        self.read_range_at(ROOT_PAGE_NUM, range, &mut (f), 0)
+    }
+
+    fn read_range_at<R: RangeBounds<Key>>(
+        &mut self,
+        node_ptr: NodePtr,
+        range: &R,
+        f: &mut impl FnMut(Key, &[u8]),
+        left_key: Key,
+    ) -> Result<(), Error> {
+        let node = self.pager.owned_node(node_ptr)?;
+
+        match node {
+            Node::Leaf(leaf) => {
+                for (k, v) in leaf.kv {
+                    if range.contains(&k) {
+                        f(k, &v);
+                    }
+                }
+            }
+            Node::Internal(internal) => {
+                let mut left_key = left_key;
+                for (key, ptr) in &internal.kv {
+                    if is_overlap(&(left_key..=*key), range) {
+                        self.read_range_at(*ptr, range, f, left_key)?;
+                    }
+                    left_key = *key;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn debug(&mut self, root: NodePtr, min: Key, max: Key) -> Result<(), Error> {
         let node = self.pager.owned_node(root)?;
@@ -456,8 +496,30 @@ impl Btree {
 mod tests {
     use rand::prelude::*;
     use std::collections::HashMap;
+    use std::ops::Bound;
 
     use super::*;
+
+    fn build_btree(count: u64) -> Btree {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+
+        for i in 0..count {
+            let mut value = vec![0u8; 64];
+            value[0..8].copy_from_slice(&i.to_le_bytes());
+            btree.insert(i, value).unwrap();
+        }
+
+        btree
+    }
+
+    fn read_range_keys<R: RangeBounds<Key>>(btree: &mut Btree, range: &R) -> Vec<Key> {
+        let mut keys = Vec::new();
+        btree.read_range(range, |k, _| keys.push(k)).unwrap();
+        keys
+    }
 
     #[test]
     fn test_insert() {
@@ -587,5 +649,45 @@ mod tests {
             );
             assert!(btree.read(i, |v| v.is_none()).unwrap());
         }
+    }
+
+    #[test]
+    fn test_read_range_full() {
+        let mut btree = build_btree(200);
+        let keys = read_range_keys(&mut btree, &(0..=199));
+        let expected = (0..200).collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn test_read_range_exclusive_start() {
+        let mut btree = build_btree(200);
+        let range = (Bound::Excluded(10), Bound::Included(20));
+        let keys = read_range_keys(&mut btree, &range);
+        let expected = (11..=20).collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn test_read_range_unbounded_end() {
+        let mut btree = build_btree(200);
+        let keys = read_range_keys(&mut btree, &(..=5));
+        let expected = (0..=5).collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn test_read_range_empty() {
+        let mut btree = build_btree(200);
+        let keys = read_range_keys(&mut btree, &(500..=600));
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_read_range_order() {
+        let mut btree = build_btree(500);
+        let keys = read_range_keys(&mut btree, &(123..=321));
+        let expected = (123..=321).collect::<Vec<_>>();
+        assert_eq!(keys, expected);
     }
 }
