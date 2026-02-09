@@ -286,6 +286,37 @@ impl Btree {
         Ok(None)
     }
 
+    pub fn remove_range(&mut self, range: impl RangeBounds<Key>) -> Result<(), Error> {
+        self.remove_range_at(ROOT_PAGE_NUM, &range, 0)
+    }
+
+    fn remove_range_at(
+        &mut self,
+        node_ptr: NodePtr,
+        range: &impl RangeBounds<Key>,
+        left_key: Key,
+    ) -> Result<(), Error> {
+        let node = self.pager.owned_node(node_ptr)?;
+
+        match node {
+            Node::Leaf(mut leaf) => {
+                leaf.kv.retain(|(k, _)| !range.contains(k));
+                self.merge_insert(&[node_ptr], &Node::Leaf(leaf))?;
+            }
+            Node::Internal(internal) => {
+                let mut left_key = left_key;
+                for (key, ptr) in &internal.kv {
+                    if is_overlap(&(left_key..=*key), range) {
+                        self.remove_range_at(*ptr, range, left_key)?;
+                    }
+                    left_key = *key;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn merge_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(insert)?;
 
@@ -689,5 +720,193 @@ mod tests {
         let keys = read_range_keys(&mut btree, 123..=321);
         let expected = (123..=321).collect::<Vec<_>>();
         assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn test_remove_range_inclusive() {
+        let mut btree = build_btree(100);
+        btree.remove_range(10..=20).unwrap();
+
+        // Keys in range should be removed
+        for i in 10..=20 {
+            assert!(
+                btree.read(i, |v| v.is_none()).unwrap(),
+                "Key {} should be removed",
+                i
+            );
+        }
+
+        // Keys outside range should still exist
+        for i in 0..10 {
+            assert!(
+                btree.read(i, |v| v.is_some()).unwrap(),
+                "Key {} should still exist",
+                i
+            );
+        }
+        for i in 21..100 {
+            assert!(
+                btree.read(i, |v| v.is_some()).unwrap(),
+                "Key {} should still exist",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_remove_range_exclusive_start() {
+        let mut btree = build_btree(100);
+        btree
+            .remove_range((Bound::Excluded(10), Bound::Included(20)))
+            .unwrap();
+
+        // Key 10 should exist
+        assert!(btree.read(10, |v| v.is_some()).unwrap());
+
+        // Keys 11-20 should be removed
+        for i in 11..=20 {
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+
+        // Keys outside should exist
+        for i in 0..10 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+        for i in 21..100 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_remove_range_unbounded_end() {
+        let mut btree = build_btree(100);
+        btree.remove_range(80..).unwrap();
+
+        // Keys 80-99 should be removed
+        for i in 80..100 {
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+
+        // Keys 0-79 should exist
+        for i in 0..80 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_remove_range_unbounded_start() {
+        let mut btree = build_btree(100);
+        btree.remove_range(..=20).unwrap();
+
+        // Keys 0-20 should be removed
+        for i in 0..=20 {
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+
+        // Keys 21-99 should exist
+        for i in 21..100 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_remove_range_nonexistent() {
+        let mut btree = build_btree(100);
+        btree.remove_range(200..=300).unwrap();
+
+        // All original keys should still exist
+        for i in 0..100 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_remove_range_empty() {
+        let mut btree = build_btree(100);
+        btree.remove_range(50..50).unwrap();
+
+        // All keys should still exist (empty range)
+        for i in 0..100 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_remove_range_all_keys() {
+        let mut btree = build_btree(100);
+        btree.remove_range(0..=99).unwrap();
+
+        // All keys should be removed
+        for i in 0..100 {
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_remove_range_multiple_calls() {
+        let mut btree = build_btree(100);
+
+        // Remove first range
+        btree.remove_range(10..=20).unwrap();
+
+        // Verify first range is removed
+        for i in 10..=20 {
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+
+        // Remove second range
+        btree.remove_range(50..=60).unwrap();
+
+        // Verify both ranges are removed
+        for i in 10..=20 {
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+        for i in 50..=60 {
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+
+        // Verify unaffected keys still exist
+        for i in 0..10 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+        for i in 21..50 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+        for i in 61..100 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_remove_range_verify_read_range() {
+        let mut btree = build_btree(100);
+        btree.remove_range(30..=70).unwrap();
+
+        let keys = read_range_keys(&mut btree, 0..=99);
+        let mut expected = (0..30).collect::<Vec<_>>();
+        expected.extend(71..100);
+
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn test_remove_range_large_dataset() {
+        let mut btree = build_btree(1000);
+        btree.remove_range(250..=750).unwrap();
+
+        // Verify removed range
+        for i in 250..=750 {
+            assert!(btree.read(i, |v| v.is_none()).unwrap());
+        }
+
+        // Verify remaining first half
+        for i in 0..250 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
+
+        // Verify remaining second half
+        for i in 751..1000 {
+            assert!(btree.read(i, |v| v.is_some()).unwrap());
+        }
     }
 }
