@@ -30,7 +30,7 @@ pub struct Transaction {
 
 pub struct Operation {
     reads: BTreeSet<Key>,
-    writes: BTreeMap<Key, Vec<u8>>,
+    writes: BTreeMap<Key, Option<Vec<u8>>>,
 }
 
 impl TransactionStore {
@@ -68,7 +68,7 @@ impl Transaction {
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             op.reads.insert(key);
             if let Some(value) = op.writes.get(&key) {
-                return Ok(Some(value.clone()));
+                return Ok(value.clone());
             }
         }
         let value = inner.btree.read(key, |f| f.map(|v| v.to_vec()))?;
@@ -78,7 +78,14 @@ impl Transaction {
     pub fn write(&self, key: Key, value: Vec<u8>) {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            op.writes.insert(key, value);
+            op.writes.insert(key, Some(value));
+        }
+    }
+
+    pub fn remove(&self, key: Key) {
+        let mut inner = self.store.lock().unwrap();
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            op.writes.insert(key, None);
         }
     }
 
@@ -106,7 +113,11 @@ impl Transaction {
         }
 
         for (key, value) in current_op.writes {
-            inner.btree.insert(key, value)?;
+            if let Some(value) = value {
+                inner.btree.insert(key, value)?;
+            } else {
+                inner.btree.remove(key)?;
+            }
         }
 
         Ok(())
@@ -316,12 +327,11 @@ mod tests {
         tx1.write(1, vec![1, 2, 3]);
         tx2.write(1, vec![4, 5, 6]);
 
-        match tx1.commit() {
-            Err(_) => {
-                // Conflict detected when two transactions write to same key
-            }
-            Ok(_) => panic!("Expected conflict error"),
-        }
+        let result = tx1.commit();
+        assert!(result.is_err());
+        // Verify it's a proper error with the conflict in it
+        let err_str = format!("{:?}", result.unwrap_err());
+        assert!(err_str.contains("Conflict") || err_str.contains("TransactionError"));
     }
 
     #[test]
@@ -341,5 +351,190 @@ mod tests {
             tx.write(2, vec![4, 5, 6]);
             assert!(tx.commit().is_ok());
         }
+    }
+
+    #[test]
+    fn test_remove_key() {
+        let (store, _temp) = setup_transaction_store();
+
+        // First, insert a key
+        {
+            let tx = store.begin_transaction();
+            tx.write(1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
+        }
+
+        // Then remove it
+        {
+            let tx = store.begin_transaction();
+            tx.remove(1);
+            assert!(tx.commit().is_ok());
+        }
+
+        // Verify it's gone
+        {
+            let tx = store.begin_transaction();
+            assert_eq!(tx.read(1).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn test_remove_in_transaction() {
+        let (store, _temp) = setup_transaction_store();
+        let tx = store.begin_transaction();
+
+        tx.write(1, vec![1, 2, 3]);
+        assert_eq!(tx.read(1).unwrap(), Some(vec![1, 2, 3]));
+
+        tx.remove(1);
+        assert_eq!(tx.read(1).unwrap(), None);
+    }
+
+    #[test]
+    fn test_data_persists_after_commit() {
+        let (store, _temp) = setup_transaction_store();
+
+        // Write in first transaction
+        {
+            let tx = store.begin_transaction();
+            tx.write(1, vec![1, 2, 3]);
+            tx.write(2, vec![4, 5, 6]);
+            assert!(tx.commit().is_ok());
+        }
+
+        // Read in second transaction to verify persistence
+        {
+            let tx = store.begin_transaction();
+            assert_eq!(tx.read(1).unwrap(), Some(vec![1, 2, 3]));
+            assert_eq!(tx.read(2).unwrap(), Some(vec![4, 5, 6]));
+        }
+    }
+
+    #[test]
+    fn test_commit_after_conflict_fails() {
+        let (store, _temp) = setup_transaction_store();
+
+        let tx1 = store.begin_transaction();
+        let tx2 = store.begin_transaction();
+
+        tx1.write(1, vec![1, 2, 3]);
+        tx2.write(1, vec![4, 5, 6]);
+
+        // First commit should fail due to conflict
+        assert!(tx1.commit().is_err());
+
+        // Second transaction should succeed now
+        assert!(tx2.commit().is_ok());
+    }
+
+    #[test]
+    fn test_read_after_write_in_other_transaction() {
+        let (store, _temp) = setup_transaction_store();
+
+        // First transaction writes
+        {
+            let tx = store.begin_transaction();
+            tx.write(1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
+        }
+
+        // Second transaction reads and writes to different key
+        {
+            let tx = store.begin_transaction();
+            assert_eq!(tx.read(1).unwrap(), Some(vec![1, 2, 3]));
+            tx.write(2, vec![4, 5, 6]);
+            assert!(tx.commit().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_multiple_reads_same_key() {
+        let (store, _temp) = setup_transaction_store();
+
+        {
+            let tx = store.begin_transaction();
+            tx.write(1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
+        }
+
+        let tx = store.begin_transaction();
+        assert_eq!(tx.read(1).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(tx.read(1).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(tx.read(1).unwrap(), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn test_write_after_read_same_transaction() {
+        let (store, _temp) = setup_transaction_store();
+
+        {
+            let tx = store.begin_transaction();
+            tx.write(1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
+        }
+
+        let tx = store.begin_transaction();
+        assert_eq!(tx.read(1).unwrap(), Some(vec![1, 2, 3]));
+        tx.write(1, vec![4, 5, 6]);
+        assert_eq!(tx.read(1).unwrap(), Some(vec![4, 5, 6]));
+        assert!(tx.commit().is_ok());
+    }
+
+    #[test]
+    fn test_complex_conflict_scenario() {
+        let (store, _temp) = setup_transaction_store();
+
+        // Setup: write initial values
+        {
+            let tx = store.begin_transaction();
+            tx.write(1, vec![1]);
+            tx.write(2, vec![2]);
+            tx.write(3, vec![3]);
+            assert!(tx.commit().is_ok());
+        }
+
+        let tx1 = store.begin_transaction();
+        let tx2 = store.begin_transaction();
+        let tx3 = store.begin_transaction();
+
+        // tx1 reads 1, writes 4
+        tx1.read(1).unwrap();
+        tx1.write(4, vec![4, 4]);
+
+        // tx2 reads 2, writes 3
+        tx2.read(2).unwrap();
+        tx2.write(3, vec![3, 3]);
+
+        // tx3 writes 5
+        tx3.write(5, vec![5, 5]);
+
+        // tx3 should succeed (writes to 5, no conflicts with any other transaction)
+        assert!(tx3.commit().is_ok());
+
+        // tx1 should succeed (reads 1, writes 4, no conflicts)
+        assert!(tx1.commit().is_ok());
+
+        // tx2 should succeed (reads 2, writes 3, no conflicts)
+        assert!(tx2.commit().is_ok());
+    }
+
+    #[test]
+    fn test_remove_with_conflict() {
+        let (store, _temp) = setup_transaction_store();
+
+        {
+            let tx = store.begin_transaction();
+            tx.write(1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
+        }
+
+        let tx1 = store.begin_transaction();
+        let tx2 = store.begin_transaction();
+
+        tx1.read(1).unwrap();
+        tx2.remove(1);
+
+        // tx2 removes key 1 that tx1 read -> conflict
+        assert!(tx2.commit().is_err());
     }
 }
