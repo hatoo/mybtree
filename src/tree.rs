@@ -1,4 +1,3 @@
-use core::panic;
 use rkyv::Archived;
 use rkyv::rancor::Error;
 use std::collections::BTreeMap;
@@ -7,6 +6,14 @@ use std::ops::RangeBounds;
 use crate::pager::Pager;
 use crate::types::{Internal, Key, Leaf, Node, NodePtr, ROOT_PAGE_NUM, Value};
 use crate::util::{is_overlap, split_internal, split_leaf};
+
+/// Find the child page for `key` in an archived internal node.
+fn find_child_page(internal: &Archived<Internal>, key: Key) -> Option<NodePtr> {
+    let index = match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+        Ok(i) | Err(i) => i,
+    };
+    internal.kv.get(index).map(|t| t.1.to_native())
+}
 
 pub struct Btree {
     pub pager: Pager,
@@ -30,8 +37,8 @@ impl Btree {
         let mut current = ROOT_PAGE_NUM;
         let mut path = vec![];
 
-        enum NextNode {
-            Leaf,
+        enum SearchResult {
+            Found,
             Next(NodePtr),
             NotFound,
         }
@@ -39,40 +46,25 @@ impl Btree {
         loop {
             path.push(current);
 
-            let next = self
+            let result = self
                 .pager
                 .read_node(current, |archived_node| match archived_node {
-                    rkyv::Archived::<Node>::Leaf(leaf) => {
+                    Archived::<Node>::Leaf(leaf) => {
                         match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(_) => NextNode::Leaf,
-                            Err(_) => NextNode::NotFound,
+                            Ok(_) => SearchResult::Found,
+                            Err(_) => SearchResult::NotFound,
                         }
                     }
-                    rkyv::Archived::<Node>::Internal(internal) => {
-                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(index) | Err(index) => {
-                                if let Some(next_page) =
-                                    internal.kv.get(index).map(|t| t.1.to_native())
-                                {
-                                    NextNode::Next(next_page)
-                                } else {
-                                    NextNode::NotFound
-                                }
-                            }
-                        }
-                    }
+                    Archived::<Node>::Internal(internal) => match find_child_page(internal, key) {
+                        Some(next) => SearchResult::Next(next),
+                        None => SearchResult::NotFound,
+                    },
                 })?;
 
-            match next {
-                NextNode::Leaf => {
-                    return Ok(Some(path));
-                }
-                NextNode::Next(next_page) => {
-                    current = next_page;
-                }
-                NextNode::NotFound => {
-                    return Ok(None);
-                }
+            match result {
+                SearchResult::Found => return Ok(Some(path)),
+                SearchResult::Next(next) => current = next,
+                SearchResult::NotFound => return Ok(None),
             }
         }
     }
@@ -93,20 +85,11 @@ impl Btree {
             let next = self
                 .pager
                 .read_node(current, |archived_node| match archived_node {
-                    rkyv::Archived::<Node>::Leaf(_) => NextNode::Leaf,
-                    rkyv::Archived::<Node>::Internal(internal) => {
-                        match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(index) | Err(index) => {
-                                if let Some(next_page) =
-                                    internal.kv.get(index).map(|t| t.1.to_native())
-                                {
-                                    NextNode::Next(next_page)
-                                } else {
-                                    NextNode::NeedAlloc
-                                }
-                            }
-                        }
-                    }
+                    Archived::<Node>::Leaf(_) => NextNode::Leaf,
+                    Archived::<Node>::Internal(internal) => match find_child_page(internal, key) {
+                        Some(next) => NextNode::Next(next),
+                        None => NextNode::NeedAlloc,
+                    },
                 })?;
 
             match next {
@@ -189,93 +172,58 @@ impl Btree {
             return Ok(());
         }
 
-        match insert {
-            Node::Leaf(leaf) => {
-                let mut splits = split_leaf(leaf.kv.clone(), self.pager.page_content_size())?;
+        let page_content_size = self.pager.page_content_size();
+        let keyed_nodes: Vec<(Key, Node)> = match insert {
+            Node::Leaf(leaf) => split_leaf(leaf.kv.clone(), page_content_size)?
+                .into_iter()
+                .map(|kv| (kv.last().unwrap().0, Node::Leaf(Leaf { kv })))
+                .collect(),
+            Node::Internal(internal) => split_internal(internal.kv.clone(), page_content_size)?
+                .into_iter()
+                .map(|kv| (kv.last().unwrap().0, Node::Internal(Internal { kv })))
+                .collect(),
+        };
 
-                if let Some(&parent_page) = parents.last() {
-                    let parent_node = self.pager.owned_node(parent_page)?;
-                    let Node::Internal(mut internal) = parent_node else {
-                        panic!("Parent is not an internal node");
-                    };
-                    let right = splits.pop().unwrap();
-                    self.pager
-                        .write_node(page, &Node::Leaf(Leaf { kv: right }))?;
-                    let mut left_pages = Vec::new();
-                    for split in splits {
-                        let new_page = self.pager.next_page_num();
-                        let left_key = split.last().unwrap().0;
-                        self.pager
-                            .write_node(new_page, &Node::Leaf(Leaf { kv: split }))?;
-                        left_pages.push((left_key, new_page));
-                    }
-                    let mut kv = internal.kv.iter().cloned().collect::<BTreeMap<_, _>>();
-                    kv.extend(left_pages.into_iter());
-                    let kv = kv.into_iter().collect::<Vec<_>>();
-                    internal.kv = kv;
-                    self.split_insert(parents, &Node::Internal(internal))?;
-                } else {
-                    let mut new_pages = Vec::new();
-                    for split in splits {
-                        let new_page = self.pager.next_page_num();
-                        let key = split.last().unwrap().0;
-                        self.pager
-                            .write_node(new_page, &Node::Leaf(Leaf { kv: split }))?;
-                        new_pages.push((key, new_page));
-                    }
+        self.write_splits(keyed_nodes, page, parents)
+    }
 
-                    self.split_insert(
-                        &[ROOT_PAGE_NUM],
-                        &Node::Internal(Internal { kv: new_pages }),
-                    )?;
-                }
+    /// Write split nodes to pages and update the parent.
+    /// The last node in `keyed_nodes` is written to `page`; the rest get new pages.
+    fn write_splits(
+        &mut self,
+        mut keyed_nodes: Vec<(Key, Node)>,
+        page: NodePtr,
+        parents: &[NodePtr],
+    ) -> Result<(), Error> {
+        if let Some(&parent_page) = parents.last() {
+            let (_right_key, right_node) = keyed_nodes.pop().unwrap();
+            self.pager.write_node(page, &right_node)?;
+
+            let Node::Internal(mut parent_internal) = self.pager.owned_node(parent_page)? else {
+                panic!("Parent is not an internal node");
+            };
+            let mut kv_map: BTreeMap<_, _> = parent_internal.kv.into_iter().collect();
+            for (key, node) in keyed_nodes {
+                let new_page = self.pager.next_page_num();
+                self.pager.write_node(new_page, &node)?;
+                kv_map.insert(key, new_page);
             }
-            Node::Internal(internal) => {
-                let mut splits =
-                    split_internal(internal.kv.clone(), self.pager.page_content_size())?;
-
-                if let Some(&parent_page) = parents.last() {
-                    let parent_node = self.pager.owned_node(parent_page)?;
-                    let Node::Internal(mut internal) = parent_node else {
-                        panic!("Parent is not an internal node");
-                    };
-                    let right = splits.pop().unwrap();
-                    self.pager
-                        .write_node(page, &Node::Internal(Internal { kv: right }))?;
-                    let mut left_pages = Vec::new();
-
-                    for split in splits {
-                        let new_left_page = self.pager.next_page_num();
-                        let left_key = split.last().unwrap().0;
-                        self.pager
-                            .write_node(new_left_page, &Node::Internal(Internal { kv: split }))?;
-                        left_pages.push((left_key, new_left_page));
-                    }
-                    let mut kv = internal.kv.iter().cloned().collect::<BTreeMap<_, _>>();
-                    kv.extend(left_pages.into_iter());
-                    let kv = kv.into_iter().collect::<Vec<_>>();
-                    internal.kv = kv;
-                    self.split_insert(parents, &Node::Internal(internal))?;
-                } else {
-                    let new_pages = splits
-                        .into_iter()
-                        .map(|split| {
-                            let new_page = self.pager.next_page_num();
-                            let key = split.last().unwrap().0;
-                            self.pager
-                                .write_node(new_page, &Node::Internal(Internal { kv: split }))?;
-                            Ok((key, new_page))
-                        })
-                        .collect::<Result<Vec<_>, Error>>()?;
-
-                    let new_root_internal = Internal { kv: new_pages };
-
-                    self.pager
-                        .write_node(ROOT_PAGE_NUM, &Node::Internal(new_root_internal))?;
-                }
-            }
+            parent_internal.kv = kv_map.into_iter().collect();
+            self.split_insert(parents, &Node::Internal(parent_internal))
+        } else {
+            let new_entries = keyed_nodes
+                .into_iter()
+                .map(|(key, node)| {
+                    let new_page = self.pager.next_page_num();
+                    self.pager.write_node(new_page, &node)?;
+                    Ok((key, new_page))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            self.split_insert(
+                &[ROOT_PAGE_NUM],
+                &Node::Internal(Internal { kv: new_entries }),
+            )
         }
-        Ok(())
     }
 
     pub fn remove(&mut self, key: Key) -> Result<Option<Vec<u8>>, Error> {
@@ -339,90 +287,76 @@ impl Btree {
 
         debug_assert!(buffer.len() <= self.pager.page_content_size());
 
-        if buffer.len() < self.pager.page_content_size() / 2 && path.len() > 1 {
-            match insert {
-                Node::Leaf(leaf) => {
-                    if leaf.kv.is_empty() {
-                        let parents = &path[..path.len() - 1];
-                        let parent_page = *parents.last().unwrap();
-                        let parent_node = self.pager.owned_node(parent_page)?;
-                        let Node::Internal(mut internal) = parent_node else {
-                            panic!("Parent is not an internal node");
-                        };
-                        internal.kv.retain(|&(_, ptr)| ptr != page);
-                        self.merge_insert(parents, &Node::Internal(internal))?;
-                    } else {
-                        // merge to left sibling
-                        let parents = &path[..path.len() - 1];
-                        let parent_page = *parents.last().unwrap();
-                        let parent_node = self.pager.owned_node(parent_page)?;
-                        let Node::Internal(mut internal) = parent_node else {
-                            panic!("Parent is not an internal node");
-                        };
-                        let index = internal
-                            .kv
-                            .iter()
-                            .position(|&(_, ptr)| ptr == page)
-                            .unwrap();
-                        if index > 0 {
-                            let left_sibling_page = internal.kv[index - 1].1;
-                            let left_sibling_node = self.pager.owned_node(left_sibling_page)?;
-                            let Node::Leaf(mut left_sibling) = left_sibling_node else {
-                                panic!("Left sibling is not a leaf node");
-                            };
-                            left_sibling.kv.extend(leaf.kv.iter().cloned());
-                            let buffer = rkyv::to_bytes(&Node::Leaf(left_sibling))?;
-                            if buffer.len() <= self.pager.page_content_size() {
-                                self.pager.write_buffer(page, buffer)?;
-                                internal.kv.remove(index - 1);
-                                self.merge_insert(parents, &Node::Internal(internal))?;
-                                // TODO: Add page to free list
-                            } else {
-                                self.pager.write_node(page, insert)?;
-                            }
-                        } else {
-                            // No left sibling, just write back
-                            self.pager.write_node(page, insert)?;
-                        }
-                    }
-                }
-                Node::Internal(internal) => {
-                    let parents = &path[..path.len() - 1];
-                    let parent_page = *parents.last().unwrap();
-                    let parent_node = self.pager.owned_node(parent_page)?;
+        if buffer.len() >= self.pager.page_content_size() / 2 || path.len() <= 1 {
+            return self.pager.write_buffer(page, buffer);
+        }
 
-                    if let Node::Internal(mut parent_internal) = parent_node {
-                        let index = parent_internal
-                            .kv
-                            .iter()
-                            .position(|&(_, ptr)| ptr == page)
-                            .unwrap();
-                        if index > 0 {
-                            let left_sibling_page = parent_internal.kv[index - 1].1;
-                            let left_sibling_node = self.pager.owned_node(left_sibling_page)?;
-                            if let Node::Internal(mut left_sibling) = left_sibling_node {
-                                left_sibling.kv.extend(internal.kv.iter().cloned());
-                                let buffer = rkyv::to_bytes(&Node::Internal(left_sibling))?;
-                                if buffer.len() <= self.pager.page_content_size() {
-                                    self.pager.write_buffer(page, buffer)?;
-                                    parent_internal.kv.remove(index - 1);
-                                    self.merge_insert(parents, &Node::Internal(parent_internal))?;
-                                } else {
-                                    self.pager.write_node(page, insert)?;
-                                }
-                            } else {
-                                self.pager.write_node(page, insert)?;
-                            }
-                        } else {
-                            self.pager.write_node(page, insert)?;
-                        }
-                    }
-                }
+        // Handle empty leaf: remove from parent entirely
+        if let Node::Leaf(leaf) = insert {
+            if leaf.kv.is_empty() {
+                let parents = &path[..path.len() - 1];
+                let parent_page = *parents.last().unwrap();
+                let Node::Internal(mut internal) = self.pager.owned_node(parent_page)? else {
+                    panic!("Parent is not an internal node");
+                };
+                internal.kv.retain(|&(_, ptr)| ptr != page);
+                return self.merge_insert(parents, &Node::Internal(internal));
             }
-            Ok(())
-        } else {
+        }
+
+        let parents = &path[..path.len() - 1];
+        if !self.try_merge_with_left_sibling(page, insert, parents)? {
+            self.pager.write_node(page, insert)?;
+        }
+        Ok(())
+    }
+
+    /// Attempt to merge `insert` with its left sibling in the parent.
+    /// Returns `true` if the merge was performed, `false` otherwise.
+    fn try_merge_with_left_sibling(
+        &mut self,
+        page: NodePtr,
+        insert: &Node,
+        parents: &[NodePtr],
+    ) -> Result<bool, Error> {
+        let parent_page = *parents.last().unwrap();
+        let Node::Internal(mut parent_internal) = self.pager.owned_node(parent_page)? else {
+            return Ok(false);
+        };
+
+        let index = parent_internal
+            .kv
+            .iter()
+            .position(|&(_, ptr)| ptr == page)
+            .unwrap();
+        if index == 0 {
+            return Ok(false);
+        }
+
+        let left_sibling_page = parent_internal.kv[index - 1].1;
+        let left_sibling_node = self.pager.owned_node(left_sibling_page)?;
+
+        let merged = match (left_sibling_node, insert) {
+            (Node::Leaf(mut left), Node::Leaf(right)) => {
+                left.kv.extend(right.kv.iter().cloned());
+                Node::Leaf(left)
+            }
+            (Node::Internal(mut left), Node::Internal(right)) => {
+                left.kv.extend(right.kv.iter().cloned());
+                Node::Internal(left)
+            }
+            _ => return Ok(false),
+        };
+
+        let buffer = rkyv::to_bytes(&merged)?;
+        if buffer.len() <= self.pager.page_content_size() {
             self.pager.write_buffer(page, buffer)?;
-            Ok(())
+            parent_internal.kv.remove(index - 1);
+            self.merge_insert(parents, &Node::Internal(parent_internal))?;
+            // TODO: Add page to free list
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -442,13 +376,13 @@ impl Btree {
             let result: ReadAction<T> =
                 self.pager
                     .read_node(current, |archived_node| match archived_node {
-                        rkyv::Archived::<Node>::Leaf(leaf) => {
+                        Archived::<Node>::Leaf(leaf) => {
                             match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
                                 Ok(index) => match &leaf.kv[index].1 {
-                                    rkyv::Archived::<Value>::Inline(data) => {
+                                    Archived::<Value>::Inline(data) => {
                                         ReadAction::Done(f.take().unwrap()(Some(data.as_ref())))
                                     }
-                                    rkyv::Archived::<Value>::Overflow {
+                                    Archived::<Value>::Overflow {
                                         start_page,
                                         total_len,
                                     } => ReadAction::Overflow {
@@ -459,17 +393,10 @@ impl Btree {
                                 Err(_) => ReadAction::Done(f.take().unwrap()(None)),
                             }
                         }
-                        rkyv::Archived::<Node>::Internal(internal) => {
-                            match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                                Ok(index) | Err(index) => {
-                                    if let Some(next_page) =
-                                        internal.kv.get(index).map(|t| t.1.to_native())
-                                    {
-                                        ReadAction::Next(next_page)
-                                    } else {
-                                        ReadAction::Done(f.take().unwrap()(None))
-                                    }
-                                }
+                        Archived::<Node>::Internal(internal) => {
+                            match find_child_page(internal, key) {
+                                Some(next) => ReadAction::Next(next),
+                                None => ReadAction::Done(f.take().unwrap()(None)),
                             }
                         }
                     })?;
