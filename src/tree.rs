@@ -616,18 +616,23 @@ mod tests {
 
     use super::*;
 
-    fn build_btree(count: u64) -> Btree {
+    /// Create an initialized btree backed by a temp file with the given page size.
+    fn new_btree(page_size: usize) -> Btree {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 4096);
+        let pager = Pager::new(file, page_size);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
+        btree
+    }
 
+    /// Create a btree pre-populated with keys `0..count`, each with a 64-byte value.
+    fn build_btree(count: u64) -> Btree {
+        let mut btree = new_btree(4096);
         for i in 0..count {
             let mut value = vec![0u8; 64];
             value[0..8].copy_from_slice(&i.to_le_bytes());
             btree.insert(i, value).unwrap();
         }
-
         btree
     }
 
@@ -637,13 +642,49 @@ mod tests {
         keys
     }
 
+    fn read_value(btree: &mut Btree, key: Key) -> Option<Vec<u8>> {
+        btree.read(key, |v| v.map(|b| b.to_vec())).unwrap()
+    }
+
+    fn assert_read_eq(btree: &mut Btree, key: Key, expected: &[u8]) {
+        assert!(
+            btree.read(key, |v| v == Some(expected)).unwrap(),
+            "Key {} value mismatch",
+            key
+        );
+    }
+
+    fn assert_key_exists(btree: &mut Btree, key: Key) {
+        assert!(
+            btree.read(key, |v| v.is_some()).unwrap(),
+            "Key {} should exist",
+            key
+        );
+    }
+
+    fn assert_key_absent(btree: &mut Btree, key: Key) {
+        assert!(
+            btree.read(key, |v| v.is_none()).unwrap(),
+            "Key {} should be absent",
+            key
+        );
+    }
+
+    fn assert_keys_exist(btree: &mut Btree, range: impl IntoIterator<Item = u64>) {
+        for k in range {
+            assert_key_exists(btree, k);
+        }
+    }
+
+    fn assert_keys_absent(btree: &mut Btree, range: impl IntoIterator<Item = u64>) {
+        for k in range {
+            assert_key_absent(btree, k);
+        }
+    }
+
     #[test]
     fn test_insert() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 4096);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
-
+        let mut btree = new_btree(4096);
         btree.insert(1, b"one".to_vec()).unwrap();
     }
 
@@ -659,68 +700,45 @@ mod tests {
             .pager
             .write_node(ROOT_PAGE_NUM, &Node::Leaf(root_leaf))
             .unwrap();
-        assert!(btree.read(0, |v| v == Some(b"zero".as_ref())).unwrap());
+        assert_read_eq(&mut btree, 0, b"zero");
     }
 
     #[test]
     fn test_insert_and_read() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 4096);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
-
+        let mut btree = new_btree(4096);
         btree.insert(42, b"forty-two".to_vec()).unwrap();
-        assert!(
-            btree
-                .read(42, |v| v == Some(b"forty-two".as_ref()))
-                .unwrap()
-        );
+        assert_read_eq(&mut btree, 42, b"forty-two");
     }
 
     #[test]
     fn test_insert_multiple_and_read() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 64);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
-
+        let mut btree = new_btree(64);
         let mut map = HashMap::new();
 
         for i in 0u64..256 {
             let value = format!("value-{}", i).as_bytes().to_vec();
-            btree.insert(i, value.to_vec()).unwrap();
-            map.insert(i, value.to_vec());
+            btree.insert(i, value.clone()).unwrap();
+            map.insert(i, value);
 
             for j in 0u64..=i {
                 let expected = map.get(&j).unwrap();
-                assert!(
-                    btree.read(j, |v| v == Some(expected.as_ref())).unwrap(),
-                    "Failed at {} {}, expected {:?}, got {:?}",
-                    i,
-                    j,
-                    &expected,
-                    btree.read(j, |v| v.unwrap().to_vec())
-                );
+                assert_read_eq(&mut btree, j, expected);
             }
         }
     }
 
     #[test]
     fn test_remove() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 64);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
+        let mut btree = new_btree(64);
 
         btree.insert(1, b"one".to_vec()).unwrap();
         btree.insert(2, b"two".to_vec()).unwrap();
         btree.insert(3, b"three".to_vec()).unwrap();
 
         assert_eq!(btree.remove(2).unwrap(), Some(b"two".to_vec()));
-        assert!(btree.read(2, |v| v.is_none()).unwrap());
-        assert!(btree.read(1, |v| v == Some(b"one".as_ref())).unwrap());
-        assert!(btree.read(3, |v| v == Some(b"three".as_ref())).unwrap());
-
+        assert_key_absent(&mut btree, 2);
+        assert_read_eq(&mut btree, 1, b"one");
+        assert_read_eq(&mut btree, 3, b"three");
         assert_eq!(btree.remove(999).unwrap(), None);
     }
 
@@ -728,11 +746,7 @@ mod tests {
     fn test_remove_seq() {
         const LEN: u64 = 1000;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 64);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
+        let mut btree = new_btree(64);
 
         let mut insert = (0..LEN).collect::<Vec<u64>>();
         insert.shuffle(&mut rng);
@@ -753,48 +767,39 @@ mod tests {
                 "Failed to remove key {}",
                 i
             );
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
+            assert_key_absent(&mut btree, i);
         }
     }
 
     #[test]
     fn test_read_range_full() {
         let mut btree = build_btree(200);
-        let keys = read_range_keys(&mut btree, 0..=199);
-        let expected = (0..200).collect::<Vec<_>>();
-        assert_eq!(keys, expected);
+        assert_eq!(read_range_keys(&mut btree, 0..=199), (0..200).collect::<Vec<_>>());
     }
 
     #[test]
     fn test_read_range_exclusive_start() {
         let mut btree = build_btree(200);
-        let range = (Bound::Excluded(10), Bound::Included(20));
-        let keys = read_range_keys(&mut btree, range);
-        let expected = (11..=20).collect::<Vec<_>>();
-        assert_eq!(keys, expected);
+        let keys = read_range_keys(&mut btree, (Bound::Excluded(10), Bound::Included(20)));
+        assert_eq!(keys, (11..=20).collect::<Vec<_>>());
     }
 
     #[test]
     fn test_read_range_unbounded_end() {
         let mut btree = build_btree(200);
-        let keys = read_range_keys(&mut btree, ..=5);
-        let expected = (0..=5).collect::<Vec<_>>();
-        assert_eq!(keys, expected);
+        assert_eq!(read_range_keys(&mut btree, ..=5), (0..=5).collect::<Vec<_>>());
     }
 
     #[test]
     fn test_read_range_empty() {
         let mut btree = build_btree(200);
-        let keys = read_range_keys(&mut btree, 500..=600);
-        assert!(keys.is_empty());
+        assert!(read_range_keys(&mut btree, 500..=600).is_empty());
     }
 
     #[test]
     fn test_read_range_order() {
         let mut btree = build_btree(500);
-        let keys = read_range_keys(&mut btree, 123..=321);
-        let expected = (123..=321).collect::<Vec<_>>();
-        assert_eq!(keys, expected);
+        assert_eq!(read_range_keys(&mut btree, 123..=321), (123..=321).collect::<Vec<_>>());
     }
 
     #[test]
@@ -802,30 +807,9 @@ mod tests {
         let mut btree = build_btree(100);
         btree.remove_range(10..=20).unwrap();
 
-        // Keys in range should be removed
-        for i in 10..=20 {
-            assert!(
-                btree.read(i, |v| v.is_none()).unwrap(),
-                "Key {} should be removed",
-                i
-            );
-        }
-
-        // Keys outside range should still exist
-        for i in 0..10 {
-            assert!(
-                btree.read(i, |v| v.is_some()).unwrap(),
-                "Key {} should still exist",
-                i
-            );
-        }
-        for i in 21..100 {
-            assert!(
-                btree.read(i, |v| v.is_some()).unwrap(),
-                "Key {} should still exist",
-                i
-            );
-        }
+        assert_keys_absent(&mut btree, 10..=20);
+        assert_keys_exist(&mut btree, 0..10);
+        assert_keys_exist(&mut btree, 21..100);
     }
 
     #[test]
@@ -835,21 +819,10 @@ mod tests {
             .remove_range((Bound::Excluded(10), Bound::Included(20)))
             .unwrap();
 
-        // Key 10 should exist
-        assert!(btree.read(10, |v| v.is_some()).unwrap());
-
-        // Keys 11-20 should be removed
-        for i in 11..=20 {
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
-        }
-
-        // Keys outside should exist
-        for i in 0..10 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
-        for i in 21..100 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
+        assert_key_exists(&mut btree, 10);
+        assert_keys_absent(&mut btree, 11..=20);
+        assert_keys_exist(&mut btree, 0..10);
+        assert_keys_exist(&mut btree, 21..100);
     }
 
     #[test]
@@ -857,15 +830,8 @@ mod tests {
         let mut btree = build_btree(100);
         btree.remove_range(80..).unwrap();
 
-        // Keys 80-99 should be removed
-        for i in 80..100 {
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
-        }
-
-        // Keys 0-79 should exist
-        for i in 0..80 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
+        assert_keys_absent(&mut btree, 80..100);
+        assert_keys_exist(&mut btree, 0..80);
     }
 
     #[test]
@@ -873,83 +839,44 @@ mod tests {
         let mut btree = build_btree(100);
         btree.remove_range(..=20).unwrap();
 
-        // Keys 0-20 should be removed
-        for i in 0..=20 {
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
-        }
-
-        // Keys 21-99 should exist
-        for i in 21..100 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
+        assert_keys_absent(&mut btree, 0..=20);
+        assert_keys_exist(&mut btree, 21..100);
     }
 
     #[test]
     fn test_remove_range_nonexistent() {
         let mut btree = build_btree(100);
         btree.remove_range(200..=300).unwrap();
-
-        // All original keys should still exist
-        for i in 0..100 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
+        assert_keys_exist(&mut btree, 0..100);
     }
 
     #[test]
     fn test_remove_range_empty() {
         let mut btree = build_btree(100);
         btree.remove_range(50..50).unwrap();
-
-        // All keys should still exist (empty range)
-        for i in 0..100 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
+        assert_keys_exist(&mut btree, 0..100);
     }
 
     #[test]
     fn test_remove_range_all_keys() {
         let mut btree = build_btree(100);
         btree.remove_range(0..=99).unwrap();
-
-        // All keys should be removed
-        for i in 0..100 {
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
-        }
+        assert_keys_absent(&mut btree, 0..100);
     }
 
     #[test]
     fn test_remove_range_multiple_calls() {
         let mut btree = build_btree(100);
 
-        // Remove first range
         btree.remove_range(10..=20).unwrap();
+        assert_keys_absent(&mut btree, 10..=20);
 
-        // Verify first range is removed
-        for i in 10..=20 {
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
-        }
-
-        // Remove second range
         btree.remove_range(50..=60).unwrap();
-
-        // Verify both ranges are removed
-        for i in 10..=20 {
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
-        }
-        for i in 50..=60 {
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
-        }
-
-        // Verify unaffected keys still exist
-        for i in 0..10 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
-        for i in 21..50 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
-        for i in 61..100 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
+        assert_keys_absent(&mut btree, 10..=20);
+        assert_keys_absent(&mut btree, 50..=60);
+        assert_keys_exist(&mut btree, 0..10);
+        assert_keys_exist(&mut btree, 21..50);
+        assert_keys_exist(&mut btree, 61..100);
     }
 
     #[test]
@@ -960,7 +887,6 @@ mod tests {
         let keys = read_range_keys(&mut btree, 0..=99);
         let mut expected = (0..30).collect::<Vec<_>>();
         expected.extend(71..100);
-
         assert_eq!(keys, expected);
     }
 
@@ -969,108 +895,60 @@ mod tests {
         let mut btree = build_btree(1000);
         btree.remove_range(250..=750).unwrap();
 
-        // Verify removed range
-        for i in 250..=750 {
-            assert!(btree.read(i, |v| v.is_none()).unwrap());
-        }
-
-        // Verify remaining first half
-        for i in 0..250 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
-
-        // Verify remaining second half
-        for i in 751..1000 {
-            assert!(btree.read(i, |v| v.is_some()).unwrap());
-        }
+        assert_keys_absent(&mut btree, 250..=750);
+        assert_keys_exist(&mut btree, 0..250);
+        assert_keys_exist(&mut btree, 751..1000);
     }
 
     #[test]
     fn test_big_value_insert_and_read() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 256);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
-
-        // Insert a value much larger than a page
+        let mut btree = new_btree(256);
         let big_value = vec![42u8; 4096];
         btree.insert(1, big_value.clone()).unwrap();
-
-        // Read it back
-        let result = btree.read(1, |v| v.map(|b| b.to_vec())).unwrap();
-        assert_eq!(result, Some(big_value));
+        assert_eq!(read_value(&mut btree, 1), Some(big_value));
     }
 
     #[test]
     fn test_big_value_with_small_values() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 256);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
+        let mut btree = new_btree(256);
 
-        // Insert small values around a big value
         btree.insert(0, b"small-before".to_vec()).unwrap();
         let big_value = vec![42u8; 4096];
         btree.insert(1, big_value.clone()).unwrap();
         btree.insert(2, b"small-after".to_vec()).unwrap();
 
-        // Verify all values
-        assert!(
-            btree
-                .read(0, |v| v == Some(b"small-before".as_ref()))
-                .unwrap()
-        );
-        assert_eq!(
-            btree.read(1, |v| v.map(|b| b.to_vec())).unwrap(),
-            Some(big_value)
-        );
-        assert!(
-            btree
-                .read(2, |v| v == Some(b"small-after".as_ref()))
-                .unwrap()
-        );
+        assert_read_eq(&mut btree, 0, b"small-before");
+        assert_eq!(read_value(&mut btree, 1), Some(big_value));
+        assert_read_eq(&mut btree, 2, b"small-after");
     }
 
     #[test]
     fn test_big_value_update() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 256);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
+        let mut btree = new_btree(256);
 
         let big_value = vec![42u8; 4096];
         btree.insert(1, big_value.clone()).unwrap();
 
-        // Update with a bigger value
         let bigger_value = vec![99u8; 8192];
         let old = btree.insert(1, bigger_value.clone()).unwrap();
         assert_eq!(old, Some(big_value));
-
-        let result = btree.read(1, |v| v.map(|b| b.to_vec())).unwrap();
-        assert_eq!(result, Some(bigger_value));
+        assert_eq!(read_value(&mut btree, 1), Some(bigger_value));
     }
 
     #[test]
     fn test_big_value_remove() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 256);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
+        let mut btree = new_btree(256);
 
         let big_value = vec![42u8; 4096];
         btree.insert(1, big_value.clone()).unwrap();
 
-        let removed = btree.remove(1).unwrap();
-        assert_eq!(removed, Some(big_value));
-        assert!(btree.read(1, |v| v.is_none()).unwrap());
+        assert_eq!(btree.remove(1).unwrap(), Some(big_value));
+        assert_key_absent(&mut btree, 1);
     }
 
     #[test]
     fn test_big_value_read_range() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 256);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
+        let mut btree = new_btree(256);
 
         btree.insert(0, b"small".to_vec()).unwrap();
         let big_value = vec![42u8; 2048];
@@ -1090,10 +968,7 @@ mod tests {
 
     #[test]
     fn test_multiple_big_values() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 256);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
+        let mut btree = new_btree(256);
 
         let mut expected = HashMap::new();
         for i in 0u64..20 {
@@ -1103,25 +978,24 @@ mod tests {
         }
 
         for (key, value) in &expected {
-            let result = btree.read(*key, |v| v.map(|b| b.to_vec())).unwrap();
-            assert_eq!(result.as_ref(), Some(value), "Mismatch at key {}", key);
+            assert_eq!(
+                read_value(&mut btree, *key).as_ref(),
+                Some(value),
+                "Mismatch at key {}",
+                key
+            );
         }
     }
 
     #[test]
     fn test_big_value_replace_with_small() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 256);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
+        let mut btree = new_btree(256);
 
         let big_value = vec![42u8; 4096];
         btree.insert(1, big_value.clone()).unwrap();
 
-        // Replace big value with a small one
         let old = btree.insert(1, b"tiny".to_vec()).unwrap();
         assert_eq!(old, Some(big_value));
-
-        assert!(btree.read(1, |v| v == Some(b"tiny".as_ref())).unwrap());
+        assert_read_eq(&mut btree, 1, b"tiny");
     }
 }
