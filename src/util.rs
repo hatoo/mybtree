@@ -1,24 +1,28 @@
 use rkyv::rancor::Error;
 use std::ops::{Bound, RangeBounds};
 
-use crate::types::{Key, Leaf, Node, PAGE_CONTENT_SIZE};
+use crate::types::{Key, Leaf, Node};
 
-pub fn split_leaf(kv: Vec<(Key, Vec<u8>)>) -> Result<Vec<Vec<(Key, Vec<u8>)>>, Error> {
+pub fn split_leaf(
+    kv: Vec<(Key, Vec<u8>)>,
+    page_content_size: usize,
+) -> Result<Vec<Vec<(Key, Vec<u8>)>>, Error> {
     let mut result = vec![];
     let mut current = vec![kv];
 
     while let Some(kv) = current.pop() {
+        debug_assert!(kv.len() >= 2);
         let mid = kv.len() / 2;
         let left = kv[..mid].to_vec();
         let right = kv[mid..].to_vec();
 
-        if rkyv::to_bytes(&Node::Leaf(Leaf { kv: left.clone() }))?.len() <= PAGE_CONTENT_SIZE {
+        if rkyv::to_bytes(&Node::Leaf(Leaf { kv: left.clone() }))?.len() <= page_content_size {
             result.push(left);
         } else {
             current.push(left);
         }
 
-        if rkyv::to_bytes(&Node::Leaf(Leaf { kv: right.clone() }))?.len() <= PAGE_CONTENT_SIZE {
+        if rkyv::to_bytes(&Node::Leaf(Leaf { kv: right.clone() }))?.len() <= page_content_size {
             result.push(right);
         } else {
             current.push(right);
@@ -28,17 +32,21 @@ pub fn split_leaf(kv: Vec<(Key, Vec<u8>)>) -> Result<Vec<Vec<(Key, Vec<u8>)>>, E
     Ok(result)
 }
 
-pub fn split_internal(kv: Vec<(Key, u64)>) -> Result<Vec<Vec<(Key, u64)>>, Error> {
+pub fn split_internal(
+    kv: Vec<(Key, u64)>,
+    page_content_size: usize,
+) -> Result<Vec<Vec<(Key, u64)>>, Error> {
     let mut result = vec![];
     let mut current = vec![kv];
 
     while let Some(kv) = current.pop() {
+        debug_assert!(kv.len() >= 2);
         let mid = kv.len() / 2;
         let left = kv[..mid].to_vec();
         let right = kv[mid..].to_vec();
 
         if rkyv::to_bytes(&Node::Internal(crate::types::Internal { kv: left.clone() }))?.len()
-            <= PAGE_CONTENT_SIZE
+            <= page_content_size
         {
             result.push(left);
         } else {
@@ -49,7 +57,7 @@ pub fn split_internal(kv: Vec<(Key, u64)>) -> Result<Vec<Vec<(Key, u64)>>, Error
             kv: right.clone(),
         }))?
         .len()
-            <= PAGE_CONTENT_SIZE
+            <= page_content_size
         {
             result.push(right);
         } else {

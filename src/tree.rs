@@ -1,13 +1,11 @@
 use core::panic;
+use rkyv::Archived;
 use rkyv::rancor::Error;
-use rkyv::{Archive, Archived};
 use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 
 use crate::pager::Pager;
-use crate::types::{
-    Internal, Key, Leaf, Node, NodePtr, PAGE_CONTENT_SIZE, PAGE_SIZE, ROOT_PAGE_NUM,
-};
+use crate::types::{Internal, Key, Leaf, Node, NodePtr, ROOT_PAGE_NUM};
 use crate::util::{is_overlap, split_internal, split_leaf};
 
 pub struct Btree {
@@ -21,7 +19,6 @@ impl Btree {
 
     pub fn init(&mut self) -> Result<(), Error> {
         self.pager.next_page_num = 1;
-        self.pager.file.set_len(PAGE_SIZE as u64).unwrap();
 
         let root_leaf = Leaf { kv: vec![] };
         self.pager
@@ -173,14 +170,14 @@ impl Btree {
         let page = *path.last().unwrap();
         let parents = &path[..path.len() - 1];
 
-        if buffer.len() <= PAGE_CONTENT_SIZE {
+        if buffer.len() <= self.pager.page_content_size() {
             self.pager.write_buffer(page, buffer)?;
             return Ok(());
         }
 
         match insert {
             Node::Leaf(leaf) => {
-                let mut splits = split_leaf(leaf.kv.clone())?;
+                let mut splits = split_leaf(leaf.kv.clone(), self.pager.page_content_size())?;
 
                 if let Some(&parent_page) = parents.last() {
                     let parent_node = self.pager.owned_node(parent_page)?;
@@ -220,7 +217,8 @@ impl Btree {
                 }
             }
             Node::Internal(internal) => {
-                let mut splits = split_internal(internal.kv.clone())?;
+                let mut splits =
+                    split_internal(internal.kv.clone(), self.pager.page_content_size())?;
 
                 if let Some(&parent_page) = parents.last() {
                     let parent_node = self.pager.owned_node(parent_page)?;
@@ -323,9 +321,9 @@ impl Btree {
 
         let page = *path.last().unwrap();
 
-        debug_assert!(buffer.len() <= PAGE_CONTENT_SIZE);
+        debug_assert!(buffer.len() <= self.pager.page_content_size());
 
-        if buffer.len() < PAGE_CONTENT_SIZE / 2 && path.len() > 1 {
+        if buffer.len() < self.pager.page_content_size() / 2 && path.len() > 1 {
             match insert {
                 Node::Leaf(leaf) => {
                     if leaf.kv.is_empty() {
@@ -358,7 +356,7 @@ impl Btree {
                             };
                             left_sibling.kv.extend(leaf.kv.iter().cloned());
                             let buffer = rkyv::to_bytes(&Node::Leaf(left_sibling))?;
-                            if buffer.len() <= PAGE_CONTENT_SIZE {
+                            if buffer.len() <= self.pager.page_content_size() {
                                 self.pager.write_buffer(page, buffer)?;
                                 internal.kv.remove(index - 1);
                                 self.merge_insert(parents, &Node::Internal(internal))?;
@@ -389,10 +387,9 @@ impl Btree {
                             if let Node::Internal(mut left_sibling) = left_sibling_node {
                                 left_sibling.kv.extend(internal.kv.iter().cloned());
                                 let buffer = rkyv::to_bytes(&Node::Internal(left_sibling))?;
-                                if buffer.len() <= PAGE_CONTENT_SIZE {
-                                    self.pager.write_buffer(left_sibling_page, buffer)?;
-                                    parent_internal.kv.remove(index);
-                                    self.pager.write_node(page, insert)?; // TODO: Add page to free list
+                                if buffer.len() <= self.pager.page_content_size() {
+                                    self.pager.write_buffer(page, buffer)?;
+                                    parent_internal.kv.remove(index - 1);
                                     self.merge_insert(parents, &Node::Internal(parent_internal))?;
                                 } else {
                                     self.pager.write_node(page, insert)?;
@@ -554,7 +551,7 @@ mod tests {
 
     fn build_btree(count: u64) -> Btree {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file);
+        let pager = Pager::new(file, 4096);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
 
@@ -576,7 +573,7 @@ mod tests {
     #[test]
     fn test_insert() {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file);
+        let pager = Pager::new(file, 4096);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
 
@@ -586,7 +583,7 @@ mod tests {
     #[test]
     fn test_read() {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file);
+        let pager = Pager::new(file, 4096);
         let mut btree = Btree::new(pager);
         let root_leaf = Leaf {
             kv: vec![(0, b"zero".to_vec())],
@@ -601,7 +598,7 @@ mod tests {
     #[test]
     fn test_insert_and_read() {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file);
+        let pager = Pager::new(file, 4096);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
 
@@ -616,26 +613,16 @@ mod tests {
     #[test]
     fn test_insert_multiple_and_read() {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file);
+        let pager = Pager::new(file, 64);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
 
         let mut map = HashMap::new();
 
-        for i in 0u64..100 {
-            let mut value = [0; 512];
-            value[0..8].copy_from_slice(&i.to_le_bytes());
+        for i in 0u64..256 {
+            let value = format!("value-{}", i).as_bytes().to_vec();
             btree.insert(i, value.to_vec()).unwrap();
             map.insert(i, value.to_vec());
-
-            match btree.pager.owned_node(ROOT_PAGE_NUM).unwrap() {
-                Node::Internal(internal) => {
-                    dbg!(internal);
-                }
-                Node::Leaf(leaf) => {
-                    dbg!(leaf.kv.iter().map(|(k, _)| *k).collect::<Vec<_>>());
-                }
-            }
 
             for j in 0u64..=i {
                 let expected = map.get(&j).unwrap();
@@ -644,8 +631,8 @@ mod tests {
                     "Failed at {} {}, expected {:?}, got {:?}",
                     i,
                     j,
-                    &expected[0..8],
-                    btree.read(j, |v| v.map(|v| v[0..8].to_vec())).unwrap()
+                    &expected,
+                    btree.read(j, |v| v.unwrap().to_vec())
                 );
             }
         }
@@ -654,7 +641,7 @@ mod tests {
     #[test]
     fn test_remove() {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file);
+        let pager = Pager::new(file, 64);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
 
@@ -676,7 +663,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file);
+        let pager = Pager::new(file, 64);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
 

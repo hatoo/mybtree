@@ -146,7 +146,7 @@ mod tests {
             .open(temp_file.path())
             .unwrap();
 
-        let pager = Pager::new(file);
+        let pager = Pager::new(file, 256);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
 

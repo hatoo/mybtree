@@ -1,10 +1,8 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
-pub const PAGE_SIZE: usize = 4096;
 pub type Key = u64;
 pub type NodePtr = u64;
 pub const ROOT_PAGE_NUM: u64 = 0;
-pub const PAGE_CONTENT_SIZE: usize = PAGE_SIZE - 2;
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct Leaf {
