@@ -558,12 +558,7 @@ impl Btree {
 
     /// Determine whether a value is too large for inline storage and must use overflow pages.
     fn needs_overflow(&self, value_len: usize) -> bool {
-        let overhead = rkyv::to_bytes::<Error>(&Node::Leaf(Leaf {
-            kv: vec![(0, Value::Inline(vec![]))],
-        }))
-        .unwrap()
-        .len();
-        overhead + value_len > self.pager.page_content_size()
+        value_len > self.pager.page_content_size() / 2
     }
 
     /// Convert a raw value into a `Value`, using overflow pages if necessary.
