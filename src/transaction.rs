@@ -68,6 +68,16 @@ impl TransactionStore {
         let mut inner = self.inner.lock().unwrap();
         inner.btree.init_table()
     }
+
+    pub fn drop_table(&self, root: NodePtr) -> Result<(), Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.btree.free_tree(root)
+    }
+
+    pub fn get_next_page_num(&self) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        inner.btree.pager.get_next_page_num()
+    }
 }
 
 impl<'a> Transaction<'a> {

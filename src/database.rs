@@ -131,18 +131,24 @@ impl Database {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), DatabaseError> {
-        // Find catalog key for this table via transaction
+        // Find catalog key and root page for this table
         let tx = self.store.begin_transaction();
         let entries = tx.read_range(CATALOG_PAGE_NUM, ..)?;
-        let found_key = entries.iter().find_map(|(key, value)| {
+        let found = entries.iter().find_map(|(key, value)| {
             let meta = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value).ok()?;
-            if meta.name == name { Some(*key) } else { None }
+            if meta.name == name {
+                Some((*key, meta.root_page.to_native()))
+            } else {
+                None
+            }
         });
 
-        match found_key {
-            Some(key) => {
+        match found {
+            Some((key, root_page)) => {
                 tx.remove(CATALOG_PAGE_NUM, key);
                 tx.commit()?;
+                // Free all pages belonging to the table's tree
+                self.store.drop_table(root_page)?;
                 Ok(())
             }
             None => Err(DatabaseError::TableNotFound(name.to_string())),
@@ -703,6 +709,66 @@ mod tests {
         assert_eq!(
             tx.get("flags", k2).unwrap().unwrap().values[0],
             DbValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_drop_table_frees_pages() {
+        let temp = NamedTempFile::new().unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        let pager = Pager::new(file, 256);
+        let db = Database::create(pager).unwrap();
+
+        db.create_table("users", users_schema()).unwrap();
+
+        // Insert many rows to allocate several pages
+        let tx = db.begin_transaction();
+        for i in 0..100 {
+            tx.insert(
+                "users",
+                &Row {
+                    values: vec![
+                        DbValue::Text(format!("user_{}", i)),
+                        DbValue::Integer(i as i64),
+                    ],
+                },
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let pages_before_drop = db.store.get_next_page_num();
+
+        db.drop_table("users").unwrap();
+
+        // Re-create and re-insert — should reuse freed pages
+        db.create_table("users2", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        for i in 0..100 {
+            tx.insert(
+                "users2",
+                &Row {
+                    values: vec![
+                        DbValue::Text(format!("user_{}", i)),
+                        DbValue::Integer(i as i64),
+                    ],
+                },
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let pages_after_reinsert = db.store.get_next_page_num();
+
+        assert!(
+            pages_after_reinsert <= pages_before_drop + 1,
+            "Pages were not reused after drop_table: before_drop={}, after_reinsert={}",
+            pages_before_drop,
+            pages_after_reinsert,
         );
     }
 }

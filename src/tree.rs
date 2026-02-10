@@ -44,6 +44,25 @@ impl Btree {
         Ok(page)
     }
 
+    /// Free all pages belonging to the tree rooted at `root`, including
+    /// overflow pages. The root page itself is also freed.
+    pub fn free_tree(&mut self, root: NodePtr) -> Result<(), Error> {
+        let node = self.pager.owned_node(root)?;
+        match node {
+            Node::Leaf(leaf) => {
+                for (_, v) in &leaf.kv {
+                    self.free_value_pages(v)?;
+                }
+            }
+            Node::Internal(internal) => {
+                for (_, ptr) in &internal.kv {
+                    self.free_tree(*ptr)?;
+                }
+            }
+        }
+        self.free_page(root)
+    }
+
     pub fn insert(
         &mut self,
         root: NodePtr,
