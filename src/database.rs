@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ops::RangeBounds;
 
 use rkyv::rancor::Error;
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::Pager;
 use crate::transaction::{TransactionError, TransactionStore};
@@ -10,7 +11,7 @@ use crate::types::{Key, NodePtr};
 
 // ── Column types ────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     Integer,
     Text,
@@ -27,14 +28,14 @@ pub enum DbValue {
     Null,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct Column {
     pub name: String,
     pub column_type: ColumnType,
     pub nullable: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct Schema {
     pub columns: Vec<Column>,
 }
@@ -145,101 +146,11 @@ fn deserialize_row(data: &[u8]) -> Result<Row, DatabaseError> {
 
 // ── Table metadata serialisation ────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 struct TableMeta {
     name: String,
     schema: Schema,
     root_page: NodePtr,
-}
-
-fn serialize_table_meta(meta: &TableMeta) -> Vec<u8> {
-    let mut buf = Vec::new();
-    // table name
-    let name_bytes = meta.name.as_bytes();
-    buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(name_bytes);
-    // column count
-    buf.extend_from_slice(&(meta.schema.columns.len() as u32).to_le_bytes());
-    for col in &meta.schema.columns {
-        let col_name = col.name.as_bytes();
-        buf.extend_from_slice(&(col_name.len() as u32).to_le_bytes());
-        buf.extend_from_slice(col_name);
-        buf.push(match col.column_type {
-            ColumnType::Integer => 0,
-            ColumnType::Text => 1,
-            ColumnType::Float => 2,
-            ColumnType::Bool => 3,
-        });
-        buf.push(if col.nullable { 1 } else { 0 });
-    }
-    // root page
-    buf.extend_from_slice(&meta.root_page.to_le_bytes());
-    buf
-}
-
-fn deserialize_table_meta(data: &[u8]) -> Result<TableMeta, DatabaseError> {
-    let mut pos = 0;
-
-    let read_u32 = |pos: &mut usize, data: &[u8]| -> Result<u32, DatabaseError> {
-        let bytes: [u8; 4] = data[*pos..*pos + 4]
-            .try_into()
-            .map_err(|_| DatabaseError::SchemaMismatch("truncated u32".into()))?;
-        *pos += 4;
-        Ok(u32::from_le_bytes(bytes))
-    };
-
-    // table name
-    let name_len = read_u32(&mut pos, data)? as usize;
-    let name = std::str::from_utf8(&data[pos..pos + name_len])
-        .map_err(|_| DatabaseError::SchemaMismatch("invalid table name".into()))?
-        .to_string();
-    pos += name_len;
-
-    // columns
-    let col_count = read_u32(&mut pos, data)? as usize;
-    let mut columns = Vec::with_capacity(col_count);
-    for _ in 0..col_count {
-        let col_name_len = read_u32(&mut pos, data)? as usize;
-        let col_name = std::str::from_utf8(&data[pos..pos + col_name_len])
-            .map_err(|_| DatabaseError::SchemaMismatch("invalid column name".into()))?
-            .to_string();
-        pos += col_name_len;
-
-        let type_byte = data[pos];
-        pos += 1;
-        let column_type = match type_byte {
-            0 => ColumnType::Integer,
-            1 => ColumnType::Text,
-            2 => ColumnType::Float,
-            3 => ColumnType::Bool,
-            _ => {
-                return Err(DatabaseError::SchemaMismatch(format!(
-                    "unknown column type: {type_byte}"
-                )));
-            }
-        };
-
-        let nullable = data[pos] != 0;
-        pos += 1;
-
-        columns.push(Column {
-            name: col_name,
-            column_type,
-            nullable,
-        });
-    }
-
-    // root page
-    let root_bytes: [u8; 8] = data[pos..pos + 8]
-        .try_into()
-        .map_err(|_| DatabaseError::SchemaMismatch("truncated root page".into()))?;
-    let root_page = u64::from_le_bytes(root_bytes);
-
-    Ok(TableMeta {
-        name,
-        schema: Schema { columns },
-        root_page,
-    })
 }
 
 // ── Database ────────────────────────────────────────────────────────
@@ -283,9 +194,8 @@ impl Database {
         self.next_table_id += 1;
 
         // Persist to catalog via transaction
-        let serialized = serialize_table_meta(&meta);
         let tx = self.store.begin_transaction();
-        tx.write(id, serialized);
+        tx.write(id, rkyv::to_bytes::<Error>(&meta)?.to_vec());
         tx.commit(self.catalog_root)?;
 
         self.tables.insert(name.to_string(), meta);
@@ -301,13 +211,8 @@ impl Database {
         let tx = self.store.begin_transaction();
         let entries = tx.read_range(self.catalog_root, ..)?;
         let found_key = entries.iter().find_map(|(key, value)| {
-            if let Ok(meta) = deserialize_table_meta(value)
-                && meta.name == name
-            {
-                Some(*key)
-            } else {
-                None
-            }
+            let meta = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value).ok()?;
+            if meta.name == name { Some(*key) } else { None }
         });
 
         if let Some(key) = found_key {
