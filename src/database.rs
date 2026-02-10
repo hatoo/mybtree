@@ -89,9 +89,6 @@ struct TableMeta {
 pub struct Database {
     store: TransactionStore,
     catalog_root: NodePtr,
-    data_root: NodePtr,
-    tables: HashMap<String, TableMeta>,
-    next_table_id: u64,
 }
 
 impl Database {
@@ -99,45 +96,48 @@ impl Database {
         let mut btree = Btree::new(pager);
         btree.init()?;
         let catalog_root = btree.init_table()?;
-        let data_root = btree.init_table()?;
 
         Ok(Database {
             store: TransactionStore::new(btree),
             catalog_root,
-            data_root,
-            tables: HashMap::new(),
-            next_table_id: 0,
         })
     }
 
-    pub fn create_table(&mut self, name: &str, schema: Schema) -> Result<(), DatabaseError> {
-        if self.tables.contains_key(name) {
+    fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
+        let tx = self.store.begin_transaction();
+        let entries = tx.read_range(self.catalog_root, ..)?;
+        for (_key, value) in &entries {
+            if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
+                if archived.name == name {
+                    let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
+                    return Ok(Some(meta));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn create_table(&self, name: &str, schema: Schema) -> Result<(), DatabaseError> {
+        if self.find_table_meta(name)?.is_some() {
             return Err(DatabaseError::TableAlreadyExists(name.to_string()));
         }
 
+        let root_page = self.store.init_table()?;
         let meta = TableMeta {
             name: name.to_string(),
             schema,
-            root_page: self.data_root,
+            root_page,
         };
-
-        let id = self.next_table_id;
-        self.next_table_id += 1;
 
         // Persist to catalog via transaction
         let tx = self.store.begin_transaction();
-        tx.write(id, rkyv::to_bytes::<Error>(&meta)?.to_vec());
-        tx.commit(self.catalog_root)?;
+        tx.insert(self.catalog_root, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
+        tx.commit()?;
 
-        self.tables.insert(name.to_string(), meta);
         Ok(())
     }
 
-    pub fn drop_table(&mut self, name: &str) -> Result<(), DatabaseError> {
-        if !self.tables.contains_key(name) {
-            return Err(DatabaseError::TableNotFound(name.to_string()));
-        }
-
+    pub fn drop_table(&self, name: &str) -> Result<(), DatabaseError> {
         // Find catalog key for this table via transaction
         let tx = self.store.begin_transaction();
         let entries = tx.read_range(self.catalog_root, ..)?;
@@ -146,20 +146,34 @@ impl Database {
             if meta.name == name { Some(*key) } else { None }
         });
 
-        if let Some(key) = found_key {
-            tx.remove(key);
+        match found_key {
+            Some(key) => {
+                tx.remove(self.catalog_root, key);
+                tx.commit()?;
+                Ok(())
+            }
+            None => Err(DatabaseError::TableNotFound(name.to_string())),
         }
-        tx.commit(self.catalog_root)?;
-
-        self.tables.remove(name);
-        Ok(())
     }
 
     pub fn begin_transaction(&self) -> DbTransaction<'_> {
+        // Snapshot catalog metadata before starting the data transaction
+        let tx = self.store.begin_transaction();
+        let entries = tx.read_range(self.catalog_root, ..).unwrap_or_default();
+        drop(tx);
+
+        let mut tables = HashMap::new();
+        for (_key, value) in &entries {
+            if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
+                if let Ok(meta) = rkyv::deserialize::<TableMeta, Error>(archived) {
+                    tables.insert(meta.name.clone(), meta);
+                }
+            }
+        }
+
         DbTransaction {
             tx: self.store.begin_transaction(),
-            tables: &self.tables,
-            data_root: self.data_root,
+            tables,
         }
     }
 }
@@ -225,8 +239,7 @@ fn validate_row(row: &Row, schema: &Schema) -> Result<(), DatabaseError> {
 
 pub struct DbTransaction<'a> {
     tx: crate::Transaction<'a>,
-    tables: &'a HashMap<String, TableMeta>,
-    data_root: NodePtr,
+    tables: HashMap<String, TableMeta>,
 }
 
 impl<'a> DbTransaction<'a> {
@@ -240,13 +253,13 @@ impl<'a> DbTransaction<'a> {
         let meta = self.get_meta(table_name)?;
         validate_row(row, &meta.schema)?;
         let bytes = serialize_row(row);
-        let key = self.tx.insert(self.data_root, bytes)?;
+        let key = self.tx.insert(meta.root_page, bytes)?;
         Ok(key)
     }
 
     pub fn get(&self, table_name: &str, key: Key) -> Result<Option<Row>, DatabaseError> {
-        self.get_meta(table_name)?;
-        let data = self.tx.read(self.data_root, key)?;
+        let meta = self.get_meta(table_name)?;
+        let data = self.tx.read(meta.root_page, key)?;
         match data {
             Some(bytes) => Ok(Some(deserialize_row(&bytes)?)),
             None => Ok(None),
@@ -258,8 +271,8 @@ impl<'a> DbTransaction<'a> {
         table_name: &str,
         range: impl RangeBounds<Key>,
     ) -> Result<Vec<(Key, Row)>, DatabaseError> {
-        self.get_meta(table_name)?;
-        let raw = self.tx.read_range(self.data_root, range)?;
+        let meta = self.get_meta(table_name)?;
+        let raw = self.tx.read_range(meta.root_page, range)?;
         let mut result = Vec::with_capacity(raw.len());
         for (key, bytes) in raw {
             result.push((key, deserialize_row(&bytes)?));
@@ -268,9 +281,9 @@ impl<'a> DbTransaction<'a> {
     }
 
     pub fn delete(&self, table_name: &str, key: Key) -> Result<(), DatabaseError> {
-        self.get_meta(table_name)?;
-        self.tx.read(self.data_root, key)?;
-        self.tx.remove(key);
+        let meta = self.get_meta(table_name)?;
+        self.tx.read(meta.root_page, key)?;
+        self.tx.remove(meta.root_page, key);
         Ok(())
     }
 
@@ -278,12 +291,12 @@ impl<'a> DbTransaction<'a> {
         let meta = self.get_meta(table_name)?;
         validate_row(row, &meta.schema)?;
         let bytes = serialize_row(row);
-        self.tx.write(key, bytes);
+        self.tx.write(meta.root_page, key, bytes);
         Ok(())
     }
 
     pub fn commit(self) -> Result<(), DatabaseError> {
-        self.tx.commit(self.data_root)?;
+        self.tx.commit()?;
         Ok(())
     }
 }
@@ -328,15 +341,15 @@ mod tests {
     // 1. Create table + verify schema
     #[test]
     fn test_create_table() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
-        assert!(db.tables.contains_key("users"));
-        assert_eq!(db.tables["users"].schema.columns.len(), 2);
+        let meta = db.find_table_meta("users").unwrap().unwrap();
+        assert_eq!(meta.schema.columns.len(), 2);
     }
 
     #[test]
     fn test_create_table_already_exists() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
         let err = db.create_table("users", users_schema()).unwrap_err();
         assert!(matches!(err, DatabaseError::TableAlreadyExists(_)));
@@ -345,7 +358,7 @@ mod tests {
     // 2. Insert row + get by key
     #[test]
     fn test_insert_and_get() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let row = Row {
@@ -364,7 +377,7 @@ mod tests {
     // 3. Insert with schema mismatch
     #[test]
     fn test_schema_mismatch_wrong_type() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let bad_row = Row {
@@ -378,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_schema_mismatch_wrong_column_count() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let bad_row = Row {
@@ -393,7 +406,7 @@ mod tests {
     // 4. Scan range of rows
     #[test]
     fn test_scan_range() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let tx = db.begin_transaction();
@@ -433,7 +446,7 @@ mod tests {
     // 5. Update and delete rows
     #[test]
     fn test_update_row() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let tx = db.begin_transaction();
@@ -465,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_delete_row() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let tx = db.begin_transaction();
@@ -490,7 +503,7 @@ mod tests {
     // 6. Multiple tables in same database
     #[test]
     fn test_multiple_tables() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
         db.create_table(
             "products",
@@ -540,7 +553,7 @@ mod tests {
     // 7. Transaction commit/rollback behavior
     #[test]
     fn test_rollback_on_drop() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let tx = db.begin_transaction();
@@ -560,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_commit_persists() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let tx = db.begin_transaction();
@@ -581,7 +594,7 @@ mod tests {
     // 8. Nullable column handling
     #[test]
     fn test_nullable_column() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table(
             "events",
             Schema {
@@ -619,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_non_nullable_rejects_null() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
 
         let tx = db.begin_transaction();
@@ -637,15 +650,15 @@ mod tests {
     // 9. Drop table
     #[test]
     fn test_drop_table() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table("users", users_schema()).unwrap();
         db.drop_table("users").unwrap();
-        assert!(!db.tables.contains_key("users"));
+        assert!(db.find_table_meta("users").unwrap().is_none());
     }
 
     #[test]
     fn test_drop_nonexistent_table() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         let err = db.drop_table("nope").unwrap_err();
         assert!(matches!(err, DatabaseError::TableNotFound(_)));
     }
@@ -662,7 +675,7 @@ mod tests {
     // Bool column round-trip
     #[test]
     fn test_bool_column() {
-        let (mut db, _tmp) = open_db();
+        let (db, _tmp) = open_db();
         db.create_table(
             "flags",
             Schema {

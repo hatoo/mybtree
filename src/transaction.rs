@@ -30,9 +30,9 @@ pub struct Transaction<'a> {
 }
 
 pub struct Operation {
-    reads: BTreeSet<Key>,
-    writes: BTreeMap<Key, Option<Vec<u8>>>,
-    range_reads: Vec<(Bound<Key>, Bound<Key>)>,
+    reads: BTreeSet<(NodePtr, Key)>,
+    writes: BTreeMap<(NodePtr, Key), Option<Vec<u8>>>,
+    range_reads: Vec<(NodePtr, Bound<Key>, Bound<Key>)>,
 }
 
 impl TransactionStore {
@@ -63,14 +63,19 @@ impl TransactionStore {
             tx_id,
         }
     }
+
+    pub fn init_table(&self) -> Result<NodePtr, Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.btree.init_table()
+    }
 }
 
 impl<'a> Transaction<'a> {
     pub fn read(&self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, Error> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            op.reads.insert(key);
-            if let Some(value) = op.writes.get(&key) {
+            op.reads.insert((root, key));
+            if let Some(value) = op.writes.get(&(root, key)) {
                 return Ok(value.clone());
             }
         }
@@ -78,17 +83,17 @@ impl<'a> Transaction<'a> {
         Ok(value)
     }
 
-    pub fn write(&self, key: Key, value: Vec<u8>) {
+    pub fn write(&self, root: NodePtr, key: Key, value: Vec<u8>) {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            op.writes.insert(key, Some(value));
+            op.writes.insert((root, key), Some(value));
         }
     }
 
-    pub fn remove(&self, key: Key) {
+    pub fn remove(&self, root: NodePtr, key: Key) {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            op.writes.insert(key, None);
+            op.writes.insert((root, key), None);
         }
     }
 
@@ -96,9 +101,13 @@ impl<'a> Transaction<'a> {
         let mut inner = self.store.lock().unwrap();
         let mut key = inner.btree.available_key(root)?;
 
-        // Also consider keys from all active transactions' writes
+        // Also consider keys from all active transactions' writes for the same root
         for op in inner.active_transactions.values() {
-            if let Some(&max_write_key) = op.writes.keys().rev().find(|&&k| op.writes[&k].is_some())
+            if let Some(&(_, max_write_key)) = op
+                .writes
+                .keys()
+                .rev()
+                .find(|&&(r, k)| r == root && op.writes[&(r, k)].is_some())
             {
                 let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
                 if candidate > key {
@@ -108,7 +117,7 @@ impl<'a> Transaction<'a> {
         }
 
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            op.writes.insert(key, Some(value));
+            op.writes.insert((root, key), Some(value));
         }
 
         Ok(key)
@@ -134,14 +143,15 @@ impl<'a> Transaction<'a> {
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             // Record individual keys as reads
             for key in results.keys() {
-                op.reads.insert(*key);
+                op.reads.insert((root, *key));
             }
             // Record range read for phantom protection
-            op.range_reads.push(range_bound.clone());
+            op.range_reads
+                .push((root, range_bound.0.clone(), range_bound.1.clone()));
 
-            // Overlay local writes
-            for (key, value) in &op.writes {
-                if range_bound.contains(key) {
+            // Overlay local writes for this root
+            for ((w_root, key), value) in &op.writes {
+                if *w_root == root && range_bound.contains(key) {
                     if let Some(v) = value {
                         results.insert(*key, v.clone());
                     } else {
@@ -169,26 +179,30 @@ impl<'a> Transaction<'a> {
 
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             // Also find keys in range from local writes
-            for (key, value) in op.writes.clone() {
-                if range_bound.contains(&key) && value.is_some() && !keys_to_remove.contains(&key) {
+            for ((w_root, key), value) in op.writes.clone() {
+                if w_root == root
+                    && range_bound.contains(&key)
+                    && value.is_some()
+                    && !keys_to_remove.contains(&key)
+                {
                     keys_to_remove.push(key);
                 }
             }
 
             // Record range read for conflict detection
-            op.range_reads.push(range_bound);
+            op.range_reads.push((root, range_bound.0, range_bound.1));
 
             // Mark all keys for removal
             for key in keys_to_remove {
-                op.reads.insert(key);
-                op.writes.insert(key, None);
+                op.reads.insert((root, key));
+                op.writes.insert((root, key), None);
             }
         }
 
         Ok(())
     }
 
-    pub fn commit(self, root: NodePtr) -> Result<(), Error> {
+    pub fn commit(self) -> Result<(), Error> {
         let mut inner = self.store.lock().unwrap();
 
         let current_op = inner.active_transactions.remove(&self.tx_id).unwrap();
@@ -209,17 +223,17 @@ impl<'a> Transaction<'a> {
                     }
                 }
                 // Check if other's range reads conflict with our writes
-                for range_read in &other_op.range_reads {
-                    for write_key in current_op.writes.keys() {
-                        if range_read.contains(write_key) {
+                for (rr_root, rr_start, rr_end) in &other_op.range_reads {
+                    for (w_root, w_key) in current_op.writes.keys() {
+                        if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
                             fail!(TransactionError::Conflict);
                         }
                     }
                 }
                 // Check if our range reads conflict with other's writes
-                for range_read in &current_op.range_reads {
-                    for write_key in other_op.writes.keys() {
-                        if range_read.contains(write_key) {
+                for (rr_root, rr_start, rr_end) in &current_op.range_reads {
+                    for (w_root, w_key) in other_op.writes.keys() {
+                        if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
                             fail!(TransactionError::Conflict);
                         }
                     }
@@ -227,7 +241,7 @@ impl<'a> Transaction<'a> {
             }
         }
 
-        for (key, value) in current_op.writes {
+        for ((root, key), value) in current_op.writes {
             if let Some(value) = value {
                 inner.btree.insert(root, key, value)?;
             } else {
@@ -297,7 +311,7 @@ mod tests {
         let key = 1u64;
         let value = vec![1, 2, 3, 4, 5];
 
-        tx.write(key, value.clone());
+        tx.write(root, key, value.clone());
         let read_value = tx.read(root, key).unwrap();
 
         assert_eq!(read_value, Some(value));
@@ -317,9 +331,9 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
         let tx = store.begin_transaction();
 
-        tx.write(1, vec![1, 2, 3]);
-        tx.write(2, vec![4, 5, 6]);
-        tx.write(3, vec![7, 8, 9]);
+        tx.write(root, 1, vec![1, 2, 3]);
+        tx.write(root, 2, vec![4, 5, 6]);
+        tx.write(root, 3, vec![7, 8, 9]);
 
         assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
         assert_eq!(tx.read(root, 2).unwrap(), Some(vec![4, 5, 6]));
@@ -332,10 +346,10 @@ mod tests {
         let tx = store.begin_transaction();
 
         let key = 1u64;
-        tx.write(key, vec![1, 2, 3]);
+        tx.write(root, key, vec![1, 2, 3]);
         assert_eq!(tx.read(root, key).unwrap(), Some(vec![1, 2, 3]));
 
-        tx.write(key, vec![4, 5, 6]);
+        tx.write(root, key, vec![4, 5, 6]);
         assert_eq!(tx.read(root, key).unwrap(), Some(vec![4, 5, 6]));
     }
 
@@ -344,8 +358,8 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
         let tx = store.begin_transaction();
 
-        tx.write(1, vec![1, 2, 3]);
-        let result = tx.commit(root);
+        tx.write(root, 1, vec![1, 2, 3]);
+        let result = tx.commit();
         assert!(result.is_ok());
     }
 
@@ -356,11 +370,11 @@ mod tests {
         let tx1 = store.begin_transaction();
         let tx2 = store.begin_transaction();
 
-        tx1.write(1, vec![1, 2, 3]);
-        tx2.write(2, vec![4, 5, 6]);
+        tx1.write(root, 1, vec![1, 2, 3]);
+        tx2.write(root, 2, vec![4, 5, 6]);
 
-        assert!(tx1.commit(root).is_ok());
-        assert!(tx2.commit(root).is_ok());
+        assert!(tx1.commit().is_ok());
+        assert!(tx2.commit().is_ok());
     }
 
     #[test]
@@ -370,12 +384,12 @@ mod tests {
         let tx1 = store.begin_transaction();
         let tx2 = store.begin_transaction();
 
-        tx1.write(1, vec![1, 2, 3]);
-        tx2.write(1, vec![4, 5, 6]);
+        tx1.write(root, 1, vec![1, 2, 3]);
+        tx2.write(root, 1, vec![4, 5, 6]);
 
         // Both transactions write to the same key, so first one to commit should fail
         // because there's an active transaction with conflicting writes
-        let result = tx1.commit(root);
+        let result = tx1.commit();
         assert!(result.is_err());
     }
 
@@ -387,14 +401,14 @@ mod tests {
         let tx2 = store.begin_transaction();
 
         tx1.read(root, 1).unwrap();
-        tx2.write(1, vec![4, 5, 6]);
+        tx2.write(root, 1, vec![4, 5, 6]);
 
         // tx2 tries to commit: it writes to key 1 that tx1 read
         // The commit check: does tx1.reads contain any of tx2.writes? No, tx1 reads 1 but tx2 writes 1
         // Actually, the check is: does tx2.writes conflict with active transactions?
         // Active transactions include tx1. tx1.reads includes 1. tx2.writes includes 1.
         // So there's a conflict: another transaction (tx1) read a key (1) that we (tx2) are writing to
-        let result = tx2.commit(root);
+        let result = tx2.commit();
         assert!(result.is_err());
     }
 
@@ -405,14 +419,14 @@ mod tests {
         let tx1 = store.begin_transaction();
         let tx2 = store.begin_transaction();
 
-        tx1.write(1, vec![1, 2, 3]);
+        tx1.write(root, 1, vec![1, 2, 3]);
         tx2.read(root, 1).unwrap();
 
         // tx1 tries to commit: it writes to key 1. tx2 is active and read from key 1.
         // The check: does tx1.writes (1) conflict with tx2?
         // For read_key in tx2.reads: if tx1.writes contains it -> CONFLICT
         // tx2.reads includes 1, tx1.writes includes 1 -> CONFLICT
-        let result = tx1.commit(root);
+        let result = tx1.commit();
         assert!(result.is_err());
     }
 
@@ -424,20 +438,20 @@ mod tests {
         let tx2 = store.begin_transaction();
         let tx3 = store.begin_transaction();
 
-        tx1.write(1, vec![1, 2, 3]);
-        tx2.write(2, vec![4, 5, 6]);
-        tx3.write(3, vec![7, 8, 9]);
+        tx1.write(root, 1, vec![1, 2, 3]);
+        tx2.write(root, 2, vec![4, 5, 6]);
+        tx3.write(root, 3, vec![7, 8, 9]);
 
-        assert!(tx1.commit(root).is_ok());
-        assert!(tx2.commit(root).is_ok());
-        assert!(tx3.commit(root).is_ok());
+        assert!(tx1.commit().is_ok());
+        assert!(tx2.commit().is_ok());
+        assert!(tx3.commit().is_ok());
     }
 
     #[test]
     fn test_empty_transaction_commit() {
-        let (store, root, _temp) = setup_transaction_store();
+        let (store, _root, _temp) = setup_transaction_store();
         let tx = store.begin_transaction();
-        assert!(tx.commit(root).is_ok());
+        assert!(tx.commit().is_ok());
     }
 
     #[test]
@@ -447,10 +461,10 @@ mod tests {
         let tx1 = store.begin_transaction();
         let tx2 = store.begin_transaction();
 
-        tx1.write(1, vec![1, 2, 3]);
-        tx2.write(1, vec![4, 5, 6]);
+        tx1.write(root, 1, vec![1, 2, 3]);
+        tx2.write(root, 1, vec![4, 5, 6]);
 
-        let result = tx1.commit(root);
+        let result = tx1.commit();
         assert!(result.is_err());
         // Verify it's a proper error with the conflict in it
         let err_str = format!("{:?}", result.unwrap_err());
@@ -464,15 +478,15 @@ mod tests {
         // First transaction
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1, 2, 3]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
         }
 
         // Second transaction
         {
             let tx = store.begin_transaction();
-            tx.write(2, vec![4, 5, 6]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 2, vec![4, 5, 6]);
+            assert!(tx.commit().is_ok());
         }
     }
 
@@ -483,15 +497,15 @@ mod tests {
         // First, insert a key
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1, 2, 3]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
         }
 
         // Then remove it
         {
             let tx = store.begin_transaction();
-            tx.remove(1);
-            assert!(tx.commit(root).is_ok());
+            tx.remove(root, 1);
+            assert!(tx.commit().is_ok());
         }
 
         // Verify it's gone
@@ -506,10 +520,10 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
         let tx = store.begin_transaction();
 
-        tx.write(1, vec![1, 2, 3]);
+        tx.write(root, 1, vec![1, 2, 3]);
         assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
 
-        tx.remove(1);
+        tx.remove(root, 1);
         assert_eq!(tx.read(root, 1).unwrap(), None);
     }
 
@@ -520,9 +534,9 @@ mod tests {
         // Write in first transaction
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1, 2, 3]);
-            tx.write(2, vec![4, 5, 6]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1, 2, 3]);
+            tx.write(root, 2, vec![4, 5, 6]);
+            assert!(tx.commit().is_ok());
         }
 
         // Read in second transaction to verify persistence
@@ -540,14 +554,14 @@ mod tests {
         let tx1 = store.begin_transaction();
         let tx2 = store.begin_transaction();
 
-        tx1.write(1, vec![1, 2, 3]);
-        tx2.write(1, vec![4, 5, 6]);
+        tx1.write(root, 1, vec![1, 2, 3]);
+        tx2.write(root, 1, vec![4, 5, 6]);
 
         // First commit should fail due to conflict
-        assert!(tx1.commit(root).is_err());
+        assert!(tx1.commit().is_err());
 
         // Second transaction should succeed now
-        assert!(tx2.commit(root).is_ok());
+        assert!(tx2.commit().is_ok());
     }
 
     #[test]
@@ -557,16 +571,16 @@ mod tests {
         // First transaction writes
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1, 2, 3]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
         }
 
         // Second transaction reads and writes to different key
         {
             let tx = store.begin_transaction();
             assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
-            tx.write(2, vec![4, 5, 6]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 2, vec![4, 5, 6]);
+            assert!(tx.commit().is_ok());
         }
     }
 
@@ -576,8 +590,8 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1, 2, 3]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx = store.begin_transaction();
@@ -592,15 +606,15 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1, 2, 3]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx = store.begin_transaction();
         assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
-        tx.write(1, vec![4, 5, 6]);
+        tx.write(root, 1, vec![4, 5, 6]);
         assert_eq!(tx.read(root, 1).unwrap(), Some(vec![4, 5, 6]));
-        assert!(tx.commit(root).is_ok());
+        assert!(tx.commit().is_ok());
     }
 
     #[test]
@@ -610,10 +624,10 @@ mod tests {
         // Setup: write initial values
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1]);
-            tx.write(2, vec![2]);
-            tx.write(3, vec![3]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1]);
+            tx.write(root, 2, vec![2]);
+            tx.write(root, 3, vec![3]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx1 = store.begin_transaction();
@@ -622,23 +636,23 @@ mod tests {
 
         // tx1 reads 1, writes 4
         tx1.read(root, 1).unwrap();
-        tx1.write(4, vec![4, 4]);
+        tx1.write(root, 4, vec![4, 4]);
 
         // tx2 reads 2, writes 3
         tx2.read(root, 2).unwrap();
-        tx2.write(3, vec![3, 3]);
+        tx2.write(root, 3, vec![3, 3]);
 
         // tx3 writes 5
-        tx3.write(5, vec![5, 5]);
+        tx3.write(root, 5, vec![5, 5]);
 
         // tx3 should succeed (writes to 5, no conflicts with any other transaction)
-        assert!(tx3.commit(root).is_ok());
+        assert!(tx3.commit().is_ok());
 
         // tx1 should succeed (reads 1, writes 4, no conflicts)
-        assert!(tx1.commit(root).is_ok());
+        assert!(tx1.commit().is_ok());
 
         // tx2 should succeed (reads 2, writes 3, no conflicts)
-        assert!(tx2.commit(root).is_ok());
+        assert!(tx2.commit().is_ok());
     }
 
     #[test]
@@ -647,18 +661,18 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1, 2, 3]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1, 2, 3]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx1 = store.begin_transaction();
         let tx2 = store.begin_transaction();
 
         tx1.read(root, 1).unwrap();
-        tx2.remove(1);
+        tx2.remove(root, 1);
 
         // tx2 removes key 1 that tx1 read -> conflict
-        assert!(tx2.commit(root).is_err());
+        assert!(tx2.commit().is_err());
     }
 
     #[test]
@@ -667,12 +681,12 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1]);
-            tx.write(3, vec![3]);
-            tx.write(5, vec![5]);
-            tx.write(7, vec![7]);
-            tx.write(9, vec![9]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1]);
+            tx.write(root, 3, vec![3]);
+            tx.write(root, 5, vec![5]);
+            tx.write(root, 7, vec![7]);
+            tx.write(root, 9, vec![9]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx = store.begin_transaction();
@@ -686,13 +700,13 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1]);
-            tx.write(5, vec![5]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1]);
+            tx.write(root, 5, vec![5]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx = store.begin_transaction();
-        tx.write(3, vec![3]);
+        tx.write(root, 3, vec![3]);
         let results = tx.read_range(root, 1..=5).unwrap();
         assert_eq!(results, vec![(1, vec![1]), (3, vec![3]), (5, vec![5])]);
     }
@@ -703,14 +717,14 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1]);
-            tx.write(3, vec![3]);
-            tx.write(5, vec![5]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1]);
+            tx.write(root, 3, vec![3]);
+            tx.write(root, 5, vec![5]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx = store.begin_transaction();
-        tx.remove(3);
+        tx.remove(root, 3);
         let results = tx.read_range(root, 1..=5).unwrap();
         assert_eq!(results, vec![(1, vec![1]), (5, vec![5])]);
     }
@@ -730,17 +744,17 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(1, vec![1]);
-            tx.write(3, vec![3]);
-            tx.write(5, vec![5]);
-            tx.write(7, vec![7]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 1, vec![1]);
+            tx.write(root, 3, vec![3]);
+            tx.write(root, 5, vec![5]);
+            tx.write(root, 7, vec![7]);
+            assert!(tx.commit().is_ok());
         }
 
         {
             let tx = store.begin_transaction();
             tx.remove_range(root, 2..=5).unwrap();
-            assert!(tx.commit(root).is_ok());
+            assert!(tx.commit().is_ok());
         }
 
         // Verify only keys outside range remain
@@ -758,9 +772,9 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         let tx = store.begin_transaction();
-        tx.write(1, vec![1]);
-        tx.write(3, vec![3]);
-        tx.write(5, vec![5]);
+        tx.write(root, 1, vec![1]);
+        tx.write(root, 3, vec![3]);
+        tx.write(root, 5, vec![5]);
         tx.remove_range(root, 2..=4).unwrap();
 
         // Key 3 should be removed, 1 and 5 should remain
@@ -780,10 +794,10 @@ mod tests {
         tx1.read_range(root, 1..=10).unwrap();
 
         // tx2 writes to a key within that range
-        tx2.write(5, vec![5]);
+        tx2.write(root, 5, vec![5]);
 
         // tx2 should conflict because tx1 has a range read covering key 5
-        assert!(tx2.commit(root).is_err());
+        assert!(tx2.commit().is_err());
     }
 
     #[test]
@@ -797,10 +811,10 @@ mod tests {
         tx1.read_range(root, 1..=10).unwrap();
 
         // tx2 writes to a key outside that range
-        tx2.write(20, vec![20]);
+        tx2.write(root, 20, vec![20]);
 
         // No conflict expected
-        assert!(tx2.commit(root).is_ok());
+        assert!(tx2.commit().is_ok());
     }
 
     #[test]
@@ -809,18 +823,18 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(3, vec![3]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 3, vec![3]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx1 = store.begin_transaction();
         let tx2 = store.begin_transaction();
 
         tx1.remove_range(root, 1..=5).unwrap();
-        tx2.write(4, vec![4]);
+        tx2.write(root, 4, vec![4]);
 
         // tx2 writes to key 4, which is within tx1's range read -> conflict
-        assert!(tx2.commit(root).is_err());
+        assert!(tx2.commit().is_err());
     }
 
     #[test]
@@ -831,10 +845,10 @@ mod tests {
         let tx2 = store.begin_transaction();
 
         tx1.read_range(root, 1..=10).unwrap();
-        tx2.write(5, vec![5]);
+        tx2.write(root, 5, vec![5]);
 
         // tx1 commits: its range_reads cover 1..=10, tx2 writes to 5 which is in range -> conflict
-        assert!(tx1.commit(root).is_err());
+        assert!(tx1.commit().is_err());
     }
 
     #[test]
@@ -859,15 +873,15 @@ mod tests {
 
         {
             let tx = store.begin_transaction();
-            tx.write(10, vec![10]);
-            assert!(tx.commit(root).is_ok());
+            tx.write(root, 10, vec![10]);
+            assert!(tx.commit().is_ok());
         }
 
         let tx = store.begin_transaction();
         let key = tx.insert(root, vec![42]).unwrap();
         assert!(key > 10);
         assert_eq!(tx.read(root, key).unwrap(), Some(vec![42]));
-        assert!(tx.commit(root).is_ok());
+        assert!(tx.commit().is_ok());
     }
 
     #[test]
@@ -882,8 +896,8 @@ mod tests {
 
         // Keys should be different, so no conflict
         assert_ne!(k1, k2);
-        assert!(tx1.commit(root).is_ok());
-        assert!(tx2.commit(root).is_ok());
+        assert!(tx1.commit().is_ok());
+        assert!(tx2.commit().is_ok());
     }
 
     #[test]
@@ -894,7 +908,7 @@ mod tests {
         {
             let tx = store.begin_transaction();
             key = tx.insert(root, vec![99]).unwrap();
-            assert!(tx.commit(root).is_ok());
+            assert!(tx.commit().is_ok());
         }
 
         {
