@@ -64,9 +64,9 @@ fn write_all_at(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> io::Re
 }
 
 pub struct Pager {
-    pub page_size: usize,
-    pub file: std::fs::File,
-    pub next_page_num: u64,
+    page_size: usize,
+    file: std::fs::File,
+    next_page_num: u64,
 }
 
 impl Pager {
@@ -80,6 +80,15 @@ impl Pager {
         }
     }
 
+    pub fn init(&mut self) -> Result<(), Error> {
+        self.file.set_len(0).map_err(Error::new)?;
+        Ok(())
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
     pub fn page_content_size(&self) -> usize {
         self.page_size - 2
     }
@@ -88,6 +97,10 @@ impl Pager {
         let page_num = self.next_page_num;
         self.next_page_num += 1;
         page_num
+    }
+
+    pub fn get_next_page_num(&self) -> u64 {
+        self.next_page_num
     }
 
     fn from_page<'a>(&self, buffer: &'a AlignedVec<16>) -> &'a [u8] {
