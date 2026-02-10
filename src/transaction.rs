@@ -33,10 +33,15 @@ pub struct Operation {
     reads: BTreeSet<(NodePtr, Key)>,
     writes: BTreeMap<(NodePtr, Key), Option<Vec<u8>>>,
     range_reads: Vec<(NodePtr, Bound<Key>, Bound<Key>)>,
-    // Index operation tracking
+    // Index conflict tracking
     index_reads: BTreeSet<(NodePtr, Vec<u8>)>,
     index_writes: BTreeSet<(NodePtr, Vec<u8>)>,
     index_range_reads: Vec<(NodePtr, Bound<Vec<u8>>, Bound<Vec<u8>>)>,
+    // Deferred index operations: (idx_root, value_bytes, key) → true=insert, false=remove
+    index_ops: BTreeMap<(NodePtr, Vec<u8>, Key), bool>,
+    // Deferred structural operations
+    deferred_free_trees: Vec<NodePtr>,
+    deferred_free_index_trees: Vec<NodePtr>,
 }
 
 impl TransactionStore {
@@ -63,6 +68,9 @@ impl TransactionStore {
                 index_reads: BTreeSet::new(),
                 index_writes: BTreeSet::new(),
                 index_range_reads: Vec::new(),
+                index_ops: BTreeMap::new(),
+                deferred_free_trees: Vec::new(),
+                deferred_free_index_trees: Vec::new(),
             },
         );
         Transaction {
@@ -257,7 +265,7 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    // ── Structural operations (applied directly to btree) ──────────
+    // ── Structural operations ──────────────────────────────────────
 
     pub fn init_table(&self) -> Result<NodePtr, Error> {
         let mut inner = self.store.lock().unwrap();
@@ -271,22 +279,29 @@ impl<'a> Transaction<'a> {
 
     pub fn free_tree(&self, root: NodePtr) -> Result<(), Error> {
         let mut inner = self.store.lock().unwrap();
-        inner.btree.free_tree(root)
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            op.deferred_free_trees.push(root);
+        }
+        Ok(())
     }
 
     pub fn free_index_tree(&self, root: NodePtr) -> Result<(), Error> {
         let mut inner = self.store.lock().unwrap();
-        inner.btree.free_index_tree(root)
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            op.deferred_free_index_trees.push(root);
+        }
+        Ok(())
     }
 
-    // ── Index tree operations (applied directly to btree, tracked for conflicts) ──
+    // ── Index tree operations (deferred, with local overlay) ────────
 
     pub fn index_insert(&self, idx_root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             op.index_writes.insert((idx_root, value.clone()));
+            op.index_ops.insert((idx_root, value, key), true);
         }
-        inner.btree.index_insert(idx_root, key, value)
+        Ok(true)
     }
 
     pub fn index_remove(&self, idx_root: NodePtr, value: &Value, key: Key) -> Result<bool, Error> {
@@ -294,19 +309,45 @@ impl<'a> Transaction<'a> {
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             if let Value::Inline(bytes) = value {
                 op.index_writes.insert((idx_root, bytes.clone()));
+                op.index_ops.insert((idx_root, bytes.clone(), key), false);
             }
         }
-        inner.btree.index_remove(idx_root, value, key)
+        Ok(true)
     }
 
     pub fn index_read(&self, idx_root: NodePtr, value: &Value) -> Result<Option<Key>, Error> {
         let mut inner = self.store.lock().unwrap();
+        let value_bytes = match value {
+            Value::Inline(bytes) => bytes.clone(),
+            _ => return inner.btree.index_read(idx_root, value, |k| k),
+        };
+
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            if let Value::Inline(bytes) = value {
-                op.index_reads.insert((idx_root, bytes.clone()));
+            op.index_reads.insert((idx_root, value_bytes.clone()));
+
+            // Check local overlay: find a locally inserted entry
+            let start = (idx_root, value_bytes.clone(), 0u64);
+            let end = (idx_root, value_bytes.clone(), u64::MAX);
+            for ((_, _, k), is_insert) in op.index_ops.range(start..=end) {
+                if *is_insert {
+                    return Ok(Some(*k));
+                }
             }
         }
-        inner.btree.index_read(idx_root, value, |k| k)
+
+        // Read from btree
+        let btree_key = inner.btree.index_read(idx_root, value, |k| k)?;
+
+        if let Some(key) = btree_key {
+            if let Some(op) = inner.active_transactions.get(&self.tx_id) {
+                if op.index_ops.get(&(idx_root, value_bytes, key)) == Some(&false) {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(key));
+        }
+
+        Ok(None)
     }
 
     pub fn index_read_range<R: RangeBounds<Vec<u8>>>(
@@ -315,18 +356,46 @@ impl<'a> Transaction<'a> {
         range: R,
     ) -> Result<Vec<Key>, Error> {
         let mut inner = self.store.lock().unwrap();
+        let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
+
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            op.index_range_reads.push((
-                idx_root,
-                range.start_bound().cloned(),
-                range.end_bound().cloned(),
-            ));
+            op.index_range_reads
+                .push((idx_root, range_bound.0.clone(), range_bound.1.clone()));
         }
-        let mut keys = Vec::new();
-        inner
-            .btree
-            .index_read_range(idx_root, range, |_v, k| keys.push(k))?;
-        Ok(keys)
+
+        // Read from btree: collect (value_bytes, key) pairs
+        let mut btree_entries: Vec<(Vec<u8>, Key)> = Vec::new();
+        inner.btree.index_read_range(
+            idx_root,
+            (range_bound.0.clone(), range_bound.1.clone()),
+            |v, k| {
+                btree_entries.push((v.to_vec(), k));
+            },
+        )?;
+
+        if let Some(op) = inner.active_transactions.get(&self.tx_id) {
+            let mut result_keys = Vec::new();
+
+            // Include btree results not locally removed
+            for (v, k) in &btree_entries {
+                if op.index_ops.get(&(idx_root, v.clone(), *k)) != Some(&false) {
+                    result_keys.push(*k);
+                }
+            }
+
+            // Add locally inserted entries whose value is in range
+            for ((root, val, key), is_insert) in &op.index_ops {
+                if *root == idx_root && *is_insert && range_bound.contains(val) {
+                    if !result_keys.contains(key) {
+                        result_keys.push(*key);
+                    }
+                }
+            }
+
+            Ok(result_keys)
+        } else {
+            Ok(btree_entries.into_iter().map(|(_, k)| k).collect())
+        }
     }
 
     pub fn commit(self) -> Result<(), Error> {
@@ -334,80 +403,110 @@ impl<'a> Transaction<'a> {
 
         let current_op = inner.active_transactions.remove(&self.tx_id).unwrap();
 
-        for (other_tx_id, other_op) in &inner.active_transactions {
-            if *other_tx_id != self.tx_id {
-                for read_key in &other_op.reads {
-                    if current_op.writes.contains_key(read_key) {
-                        fail!(TransactionError::Conflict);
+        let mut conflict = false;
+        'check: for (other_tx_id, other_op) in &inner.active_transactions {
+            if *other_tx_id == self.tx_id {
+                continue;
+            }
+            for read_key in &other_op.reads {
+                if current_op.writes.contains_key(read_key) {
+                    conflict = true;
+                    break 'check;
+                }
+            }
+            for write_key in other_op.writes.keys() {
+                if current_op.reads.contains(write_key) {
+                    conflict = true;
+                    break 'check;
+                }
+                if current_op.writes.contains_key(write_key) {
+                    conflict = true;
+                    break 'check;
+                }
+            }
+            for (rr_root, rr_start, rr_end) in &other_op.range_reads {
+                for (w_root, w_key) in current_op.writes.keys() {
+                    if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
+                        conflict = true;
+                        break 'check;
                     }
                 }
-                for write_key in other_op.writes.keys() {
-                    if current_op.reads.contains(write_key) {
-                        fail!(TransactionError::Conflict);
-                    }
-                    if current_op.writes.contains_key(write_key) {
-                        fail!(TransactionError::Conflict);
-                    }
-                }
-                // Check if other's range reads conflict with our writes
-                for (rr_root, rr_start, rr_end) in &other_op.range_reads {
-                    for (w_root, w_key) in current_op.writes.keys() {
-                        if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
-                            fail!(TransactionError::Conflict);
-                        }
+            }
+            for (rr_root, rr_start, rr_end) in &current_op.range_reads {
+                for (w_root, w_key) in other_op.writes.keys() {
+                    if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
+                        conflict = true;
+                        break 'check;
                     }
                 }
-                // Check if our range reads conflict with other's writes
-                for (rr_root, rr_start, rr_end) in &current_op.range_reads {
-                    for (w_root, w_key) in other_op.writes.keys() {
-                        if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
-                            fail!(TransactionError::Conflict);
-                        }
-                    }
-                }
+            }
 
-                // ── Index conflict detection ──────────────────────
-                // index_read vs index_write
-                for read_key in &other_op.index_reads {
-                    if current_op.index_writes.contains(read_key) {
-                        fail!(TransactionError::Conflict);
+            // ── Index conflict detection ──────────────────────
+            for read_key in &other_op.index_reads {
+                if current_op.index_writes.contains(read_key) {
+                    conflict = true;
+                    break 'check;
+                }
+            }
+            for read_key in &current_op.index_reads {
+                if other_op.index_writes.contains(read_key) {
+                    conflict = true;
+                    break 'check;
+                }
+            }
+            for write_key in &other_op.index_writes {
+                if current_op.index_writes.contains(write_key) {
+                    conflict = true;
+                    break 'check;
+                }
+            }
+            for (rr_root, rr_start, rr_end) in &other_op.index_range_reads {
+                for (w_root, w_val) in &current_op.index_writes {
+                    if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_val) {
+                        conflict = true;
+                        break 'check;
                     }
                 }
-                for read_key in &current_op.index_reads {
-                    if other_op.index_writes.contains(read_key) {
-                        fail!(TransactionError::Conflict);
-                    }
-                }
-                // index_write vs index_write
-                for write_key in &other_op.index_writes {
-                    if current_op.index_writes.contains(write_key) {
-                        fail!(TransactionError::Conflict);
-                    }
-                }
-                // index_range_read vs index_write
-                for (rr_root, rr_start, rr_end) in &other_op.index_range_reads {
-                    for (w_root, w_val) in &current_op.index_writes {
-                        if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_val) {
-                            fail!(TransactionError::Conflict);
-                        }
-                    }
-                }
-                for (rr_root, rr_start, rr_end) in &current_op.index_range_reads {
-                    for (w_root, w_val) in &other_op.index_writes {
-                        if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_val) {
-                            fail!(TransactionError::Conflict);
-                        }
+            }
+            for (rr_root, rr_start, rr_end) in &current_op.index_range_reads {
+                for (w_root, w_val) in &other_op.index_writes {
+                    if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_val) {
+                        conflict = true;
+                        break 'check;
                     }
                 }
             }
         }
 
+        if conflict {
+            fail!(TransactionError::Conflict);
+        }
+
+        // Apply node writes
         for ((root, key), value) in current_op.writes {
             if let Some(value) = value {
                 inner.btree.insert(root, key, value)?;
             } else {
                 inner.btree.remove(root, key)?;
             }
+        }
+
+        // Apply deferred index operations
+        for ((idx_root, value_bytes, key), is_insert) in current_op.index_ops {
+            if is_insert {
+                inner.btree.index_insert(idx_root, key, value_bytes)?;
+            } else {
+                let value = Value::Inline(value_bytes);
+                inner.btree.index_remove(idx_root, &value, key)?;
+            }
+        }
+
+        // Apply deferred free operations
+        for root in current_op.deferred_free_trees {
+            inner.btree.free_tree(root)?;
+        }
+        for root in current_op.deferred_free_index_trees {
+            inner.btree.free_index_tree(root)?;
         }
 
         Ok(())
