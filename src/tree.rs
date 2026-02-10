@@ -20,10 +20,13 @@ pub struct Btree {
 }
 
 impl Btree {
+    /// Create a new `Btree` backed by the given [`Pager`].
     pub fn new(pager: Pager) -> Self {
         Btree { pager }
     }
 
+    /// Initialize a fresh database file, setting up the free list.
+    /// The pager is reset and the first page is allocated for the free list head.
     pub fn init(&mut self) -> Result<(), Error> {
         self.pager.init()?;
 
@@ -63,6 +66,9 @@ impl Btree {
         self.free_page(root)
     }
 
+    /// Insert or update a key-value pair in the tree rooted at `root`.
+    /// Returns the previous value if the key already existed, or `None` for a new key.
+    /// Large values are automatically stored in overflow pages.
     pub fn insert(
         &mut self,
         root: NodePtr,
@@ -228,6 +234,8 @@ impl Btree {
         }
     }
 
+    /// Remove the entry for `key` from the tree rooted at `root`.
+    /// Returns the old value if the key was found, or `None` if it did not exist.
     pub fn remove(&mut self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, Error> {
         let mut current = root;
         let mut path = vec![];
@@ -269,6 +277,7 @@ impl Btree {
         }
     }
 
+    /// Remove all entries whose keys fall within `range` from the tree rooted at `root`.
     pub fn remove_range(
         &mut self,
         root: NodePtr,
@@ -401,6 +410,9 @@ impl Btree {
         }
     }
 
+    /// Look up a single key in the tree rooted at `root`.
+    /// The closure `f` receives `Some(&[u8])` if found or `None` if absent,
+    /// and its return value is propagated to the caller.
     pub fn read<T>(
         &mut self,
         root: NodePtr,
@@ -461,6 +473,8 @@ impl Btree {
         }
     }
 
+    /// Iterate over all entries in the tree rooted at `root` whose keys fall
+    /// within `range`, calling `f(key, value)` for each entry in order.
     pub fn read_range<R: RangeBounds<Key>>(
         &mut self,
         root: NodePtr,
@@ -510,6 +524,8 @@ impl Btree {
         Ok(())
     }
 
+    /// Return the smallest key not yet present in the tree rooted at `root`.
+    /// This is derived from the maximum existing key plus one.
     pub fn available_key(&mut self, root: NodePtr) -> Result<Key, Error> {
         self.pager
             .read_node(root, |archived_node| match archived_node {
@@ -683,6 +699,8 @@ impl Btree {
         self.write_free_list_head(page_num)
     }
 
+    /// Print a human-readable dump of the tree rooted at `root` for debugging.
+    /// Panics if any key is outside `[min, max]`.
     #[cfg(test)]
     pub fn debug(&mut self, root: NodePtr, min: Key, max: Key) -> Result<(), Error> {
         let node = self.pager.owned_node(root)?;
