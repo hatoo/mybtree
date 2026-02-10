@@ -33,42 +33,6 @@ impl Btree {
         Ok(())
     }
 
-    fn search(&mut self, key: Key) -> Result<Option<Vec<NodePtr>>, Error> {
-        let mut current = ROOT_PAGE_NUM;
-        let mut path = vec![];
-
-        enum SearchResult {
-            Found,
-            Next(NodePtr),
-            NotFound,
-        }
-
-        loop {
-            path.push(current);
-
-            let result = self
-                .pager
-                .read_node(current, |archived_node| match archived_node {
-                    Archived::<Node>::Leaf(leaf) => {
-                        match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(_) => SearchResult::Found,
-                            Err(_) => SearchResult::NotFound,
-                        }
-                    }
-                    Archived::<Node>::Internal(internal) => match find_child_page(internal, key) {
-                        Some(next) => SearchResult::Next(next),
-                        None => SearchResult::NotFound,
-                    },
-                })?;
-
-            match result {
-                SearchResult::Found => return Ok(Some(path)),
-                SearchResult::Next(next) => current = next,
-                SearchResult::NotFound => return Ok(None),
-            }
-        }
-    }
-
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         let mut current = ROOT_PAGE_NUM;
         let mut path = vec![];
@@ -227,26 +191,44 @@ impl Btree {
     }
 
     pub fn remove(&mut self, key: Key) -> Result<Option<Vec<u8>>, Error> {
-        if let Some(path) = self.search(key)? {
-            let leaf_page = *path.last().unwrap();
-            let leaf_node = self.pager.owned_node(leaf_page)?;
-            let Node::Leaf(mut leaf) = leaf_node else {
-                panic!("Expected leaf node");
-            };
-            match leaf.kv.binary_search_by_key(&key, |t| t.0) {
-                Ok(index) => {
+        let mut current = ROOT_PAGE_NUM;
+        let mut path = vec![];
+
+        loop {
+            path.push(current);
+
+            let next = self
+                .pager
+                .read_node(current, |archived_node| match archived_node {
+                    Archived::<Node>::Leaf(leaf) => {
+                        match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
+                            Ok(_) => None,        // found — stop traversal
+                            Err(_) => Some(None), // not found
+                        }
+                    }
+                    Archived::<Node>::Internal(internal) => Some(find_child_page(internal, key)),
+                })?;
+
+            match next {
+                None => {
+                    // Key found in current leaf
+                    let Node::Leaf(mut leaf) = self.pager.owned_node(current)? else {
+                        panic!("Expected leaf node");
+                    };
+                    let index = leaf
+                        .kv
+                        .binary_search_by_key(&key, |t| t.0)
+                        .expect("Key not found in leaf node");
                     let old_value_entry = leaf.kv.remove(index).1;
                     self.merge_insert(&path, &Node::Leaf(leaf))?;
                     let old_bytes = self.resolve_value(&old_value_entry)?;
                     // TODO: free overflow pages
                     return Ok(Some(old_bytes));
                 }
-                Err(_) => {
-                    panic!("Key not found in leaf node");
-                }
+                Some(Some(next_page)) => current = next_page,
+                Some(None) => return Ok(None),
             }
         }
-        Ok(None)
     }
 
     pub fn remove_range(&mut self, range: impl RangeBounds<Key>) -> Result<(), Error> {
