@@ -33,6 +33,10 @@ pub struct Operation {
     reads: BTreeSet<(NodePtr, Key)>,
     writes: BTreeMap<(NodePtr, Key), Option<Vec<u8>>>,
     range_reads: Vec<(NodePtr, Bound<Key>, Bound<Key>)>,
+    // Index operation tracking
+    index_reads: BTreeSet<(NodePtr, Vec<u8>)>,
+    index_writes: BTreeSet<(NodePtr, Vec<u8>)>,
+    index_range_reads: Vec<(NodePtr, Bound<Vec<u8>>, Bound<Vec<u8>>)>,
 }
 
 impl TransactionStore {
@@ -56,6 +60,9 @@ impl TransactionStore {
                 reads: BTreeSet::new(),
                 writes: BTreeMap::new(),
                 range_reads: Vec::new(),
+                index_reads: BTreeSet::new(),
+                index_writes: BTreeSet::new(),
+                index_range_reads: Vec::new(),
             },
         );
         Transaction {
@@ -272,20 +279,33 @@ impl<'a> Transaction<'a> {
         inner.btree.free_index_tree(root)
     }
 
-    // ── Index tree operations (applied directly to btree) ───────────
+    // ── Index tree operations (applied directly to btree, tracked for conflicts) ──
 
     pub fn index_insert(&self, idx_root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
         let mut inner = self.store.lock().unwrap();
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            op.index_writes.insert((idx_root, value.clone()));
+        }
         inner.btree.index_insert(idx_root, key, value)
     }
 
     pub fn index_remove(&self, idx_root: NodePtr, value: &Value, key: Key) -> Result<bool, Error> {
         let mut inner = self.store.lock().unwrap();
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            if let Value::Inline(bytes) = value {
+                op.index_writes.insert((idx_root, bytes.clone()));
+            }
+        }
         inner.btree.index_remove(idx_root, value, key)
     }
 
     pub fn index_read(&self, idx_root: NodePtr, value: &Value) -> Result<Option<Key>, Error> {
         let mut inner = self.store.lock().unwrap();
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            if let Value::Inline(bytes) = value {
+                op.index_reads.insert((idx_root, bytes.clone()));
+            }
+        }
         inner.btree.index_read(idx_root, value, |k| k)
     }
 
@@ -295,6 +315,13 @@ impl<'a> Transaction<'a> {
         range: R,
     ) -> Result<Vec<Key>, Error> {
         let mut inner = self.store.lock().unwrap();
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            op.index_range_reads.push((
+                idx_root,
+                range.start_bound().cloned(),
+                range.end_bound().cloned(),
+            ));
+        }
         let mut keys = Vec::new();
         inner
             .btree
@@ -334,6 +361,40 @@ impl<'a> Transaction<'a> {
                 for (rr_root, rr_start, rr_end) in &current_op.range_reads {
                     for (w_root, w_key) in other_op.writes.keys() {
                         if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
+                            fail!(TransactionError::Conflict);
+                        }
+                    }
+                }
+
+                // ── Index conflict detection ──────────────────────
+                // index_read vs index_write
+                for read_key in &other_op.index_reads {
+                    if current_op.index_writes.contains(read_key) {
+                        fail!(TransactionError::Conflict);
+                    }
+                }
+                for read_key in &current_op.index_reads {
+                    if other_op.index_writes.contains(read_key) {
+                        fail!(TransactionError::Conflict);
+                    }
+                }
+                // index_write vs index_write
+                for write_key in &other_op.index_writes {
+                    if current_op.index_writes.contains(write_key) {
+                        fail!(TransactionError::Conflict);
+                    }
+                }
+                // index_range_read vs index_write
+                for (rr_root, rr_start, rr_end) in &other_op.index_range_reads {
+                    for (w_root, w_val) in &current_op.index_writes {
+                        if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_val) {
+                            fail!(TransactionError::Conflict);
+                        }
+                    }
+                }
+                for (rr_root, rr_start, rr_end) in &current_op.index_range_reads {
+                    for (w_root, w_val) in &other_op.index_writes {
+                        if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_val) {
                             fail!(TransactionError::Conflict);
                         }
                     }
