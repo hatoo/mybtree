@@ -1,5 +1,5 @@
 use rkyv::{api::high, rancor::Error, util::AlignedVec};
-use std::io::{Read, Seek, Write};
+use std::os::unix::fs::FileExt;
 
 use crate::types::Node;
 
@@ -46,66 +46,62 @@ impl Pager {
     }
 
     pub fn read_node<T>(
-        &mut self,
+        &self,
         page_num: u64,
         f: impl FnOnce(&rkyv::Archived<Node>) -> T,
     ) -> Result<T, Error> {
         let mut buffer = AlignedVec::<16>::with_capacity(self.page_size);
         buffer.resize(self.page_size, 0);
         self.file
-            .seek(std::io::SeekFrom::Start(page_num * self.page_size as u64))
+            .read_exact_at(&mut buffer, page_num * self.page_size as u64)
             .unwrap();
-        self.file.read_exact(&mut buffer).unwrap();
         let buffer = self.from_page(&buffer);
         let archived = high::access::<rkyv::Archived<Node>, Error>(&buffer)?;
         Ok(f(archived))
     }
 
-    pub fn owned_node(&mut self, page_num: u64) -> Result<Node, Error> {
+    pub fn owned_node(&self, page_num: u64) -> Result<Node, Error> {
         let mut buffer = AlignedVec::<16>::with_capacity(self.page_size);
         buffer.resize(self.page_size, 0);
         self.file
-            .seek(std::io::SeekFrom::Start(page_num * self.page_size as u64))
+            .read_exact_at(&mut buffer, page_num * self.page_size as u64)
             .unwrap();
-        self.file.read_exact(&mut buffer).unwrap();
         let buffer = self.from_page(&buffer);
         let archived = rkyv::access::<rkyv::Archived<Node>, Error>(&buffer)?;
         let node: Node = rkyv::deserialize(archived)?;
         Ok(node)
     }
 
-    pub fn write_buffer(&mut self, page_num: u64, mut buffer: AlignedVec<16>) -> Result<(), Error> {
+    pub fn write_buffer(&self, page_num: u64, mut buffer: AlignedVec<16>) -> Result<(), Error> {
         self.to_page(&mut buffer);
         self.file
-            .seek(std::io::SeekFrom::Start(page_num * self.page_size as u64))
+            .write_all_at(&buffer, page_num * self.page_size as u64)
             .unwrap();
-        self.file.write_all(&buffer).unwrap();
         Ok(())
     }
 
-    pub fn write_node(&mut self, page_num: u64, node: &Node) -> Result<(), Error> {
+    pub fn write_node(&self, page_num: u64, node: &Node) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(node)?;
         self.write_buffer(page_num, buffer)
     }
 
-    pub fn write_raw_page(&mut self, page_num: u64, data: &[u8]) {
+    pub fn write_raw_page(&self, page_num: u64, data: &[u8]) {
         assert!(data.len() <= self.page_size);
-        self.file
-            .seek(std::io::SeekFrom::Start(page_num * self.page_size as u64))
-            .unwrap();
-        self.file.write_all(data).unwrap();
+        let offset = page_num * self.page_size as u64;
+        self.file.write_all_at(data, offset).unwrap();
         if data.len() < self.page_size {
             let padding = vec![0u8; self.page_size - data.len()];
-            self.file.write_all(&padding).unwrap();
+            self.file
+                .write_all_at(&padding, offset + data.len() as u64)
+                .unwrap();
         }
     }
 
-    pub fn read_raw_page(&mut self, page_num: u64) -> Vec<u8> {
+    pub fn read_raw_page(&self, page_num: u64) -> Vec<u8> {
         let mut buffer = vec![0u8; self.page_size];
         self.file
-            .seek(std::io::SeekFrom::Start(page_num * self.page_size as u64))
+            .read_exact_at(&mut buffer, page_num * self.page_size as u64)
             .unwrap();
-        self.file.read_exact(&mut buffer).unwrap();
         buffer
     }
 }
