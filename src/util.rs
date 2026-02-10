@@ -1,7 +1,8 @@
 use rkyv::rancor::Error;
 use std::ops::{Bound, RangeBounds};
 
-use crate::types::{Key, Leaf, Node, Value};
+use crate::types::{Key, Leaf, Node, NodePtr, Value};
+use crate::types::{IndexInternal, IndexLeaf, IndexNode};
 
 pub fn split_leaf(
     kv: Vec<(Key, Value)>,
@@ -65,6 +66,76 @@ pub fn split_internal(
         }
     }
     result.sort_by_key(|kv| kv.last().unwrap().0);
+    Ok(result)
+}
+
+pub fn split_index_leaf(
+    kv: Vec<(Value, Key)>,
+    page_content_size: usize,
+) -> Result<Vec<Vec<(Value, Key)>>, Error> {
+    let mut result = vec![];
+    let mut current = vec![kv];
+
+    while let Some(kv) = current.pop() {
+        debug_assert!(kv.len() >= 2);
+        let mid = kv.len() / 2;
+        let left = kv[..mid].to_vec();
+        let right = kv[mid..].to_vec();
+
+        if rkyv::to_bytes(&IndexNode::Leaf(IndexLeaf { kv: left.clone() }))?.len()
+            <= page_content_size
+        {
+            result.push(left);
+        } else {
+            current.push(left);
+        }
+
+        if rkyv::to_bytes(&IndexNode::Leaf(IndexLeaf { kv: right.clone() }))?.len()
+            <= page_content_size
+        {
+            result.push(right);
+        } else {
+            current.push(right);
+        }
+    }
+    // Caller must sort the result chunks (Value comparison requires I/O).
+    Ok(result)
+}
+
+pub fn split_index_internal(
+    kv: Vec<(Value, NodePtr)>,
+    page_content_size: usize,
+) -> Result<Vec<Vec<(Value, NodePtr)>>, Error> {
+    let mut result = vec![];
+    let mut current = vec![kv];
+
+    while let Some(kv) = current.pop() {
+        debug_assert!(kv.len() >= 2);
+        let mid = kv.len() / 2;
+        let left = kv[..mid].to_vec();
+        let right = kv[mid..].to_vec();
+
+        if rkyv::to_bytes(&IndexNode::Internal(IndexInternal { kv: left.clone() }))?
+            .len()
+            <= page_content_size
+        {
+            result.push(left);
+        } else {
+            current.push(left);
+        }
+
+        if rkyv::to_bytes(&IndexNode::Internal(IndexInternal {
+            kv: right.clone(),
+        }))?
+        .len()
+            <= page_content_size
+        {
+            result.push(right);
+        } else {
+            current.push(right);
+        }
+    }
+    // Caller must sort the result chunks (Value comparison requires I/O).
     Ok(result)
 }
 

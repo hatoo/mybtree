@@ -1,11 +1,14 @@
 use rkyv::Archived;
 use rkyv::rancor::Error;
 use std::collections::BTreeMap;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 
 use crate::pager::Pager;
-use crate::types::{FREE_LIST_PAGE_NUM, Internal, Key, Leaf, Node, NodePtr, Value};
-use crate::util::{is_overlap, split_internal, split_leaf};
+use crate::types::{
+    FREE_LIST_PAGE_NUM, IndexInternal, IndexLeaf, IndexNode, Internal, Key, Leaf, Node, NodePtr,
+    Value,
+};
+use crate::util::{is_overlap, split_index_internal, split_index_leaf, split_internal, split_leaf};
 
 /// Find the child page for `key` in an archived internal node.
 fn find_child_page(internal: &Archived<Internal>, key: Key) -> Option<NodePtr> {
@@ -576,6 +579,22 @@ impl Btree {
         }
     }
 
+    /// Find the child page for a given value in an index internal node.
+    /// Returns `None` if value is greater than all entries (needs alloc).
+    fn find_index_child(
+        &mut self,
+        internal: &IndexInternal,
+        value_bytes: &[u8],
+    ) -> Result<Option<NodePtr>, Error> {
+        for (v, ptr) in &internal.kv {
+            let v_bytes = self.resolve_value(v)?;
+            if v_bytes.as_slice() >= value_bytes {
+                return Ok(Some(*ptr));
+            }
+        }
+        Ok(None)
+    }
+
     /// Write a large value across one or more overflow pages.
     /// Each overflow page layout: [next_page: u64 LE][data bytes][padding]
     /// Returns the page number of the first overflow page.
@@ -697,6 +716,485 @@ impl Btree {
         buf[..8].copy_from_slice(&head.to_le_bytes());
         self.pager.write_raw_page(page_num, &buf)?;
         self.write_free_list_head(page_num)
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Index tree operations (IndexNode: value → key mapping)
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Initialize a new index tree, returning its root page number.
+    pub fn init_index(&mut self) -> Result<NodePtr, Error> {
+        let page = self.alloc_page()?;
+        let root_leaf = IndexLeaf { kv: vec![] };
+        self.pager
+            .write_index_node(page, &IndexNode::Leaf(root_leaf))?;
+        Ok(page)
+    }
+
+    /// Free all pages belonging to an index tree rooted at `root`,
+    /// including overflow pages. The root page itself is also freed.
+    pub fn free_index_tree(&mut self, root: NodePtr) -> Result<(), Error> {
+        let node = self.pager.owned_index_node(root)?;
+        match node {
+            IndexNode::Leaf(leaf) => {
+                for (v, _) in &leaf.kv {
+                    self.free_value_pages(v)?;
+                }
+            }
+            IndexNode::Internal(internal) => {
+                for (_, ptr) in &internal.kv {
+                    self.free_index_tree(*ptr)?;
+                }
+            }
+        }
+        self.free_page(root)
+    }
+
+    /// Insert a (value, key) pair into the index tree rooted at `root`.
+    /// The tree is sorted by `value` (actual bytes). Returns `true` if the entry was newly
+    /// inserted, `false` if the exact (value, key) pair already existed.
+    pub fn index_insert(&mut self, root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
+        let new_value = self.make_value(value)?;
+        let new_bytes = self.resolve_value(&new_value)?;
+        let mut current = root;
+        let mut path = vec![];
+
+        loop {
+            path.push(current);
+            let node = self.pager.owned_index_node(current)?;
+
+            match node {
+                IndexNode::Leaf(mut leaf) => {
+                    // Linear search comparing by resolved bytes
+                    let mut insert_pos = leaf.kv.len();
+                    for (i, (v, k)) in leaf.kv.iter().enumerate() {
+                        let v_bytes = self.resolve_value(v)?;
+                        let cmp = v_bytes.as_slice().cmp(new_bytes.as_slice());
+                        match cmp {
+                            std::cmp::Ordering::Equal => {
+                                let cmp_key = k.cmp(&key);
+                                match cmp_key {
+                                    std::cmp::Ordering::Equal => return Ok(false),
+                                    std::cmp::Ordering::Greater => {
+                                        insert_pos = i;
+                                        break;
+                                    }
+                                    std::cmp::Ordering::Less => {}
+                                }
+                            }
+                            std::cmp::Ordering::Greater => {
+                                insert_pos = i;
+                                break;
+                            }
+                            std::cmp::Ordering::Less => {}
+                        }
+                    }
+                    leaf.kv.insert(insert_pos, (new_value, key));
+                    self.index_split_insert(root, &path, &IndexNode::Leaf(leaf))?;
+                    return Ok(true);
+                }
+                IndexNode::Internal(mut internal) => {
+                    match self.find_index_child(&internal, &new_bytes)? {
+                        Some(next) => {
+                            current = next;
+                        }
+                        None => {
+                            // value is beyond all entries
+                            if internal.kv.is_empty() {
+                                let new_leaf_page = self.alloc_page()?;
+                                let new_leaf = IndexLeaf {
+                                    kv: vec![(new_value.clone(), key)],
+                                };
+                                self.pager
+                                    .write_index_node(new_leaf_page, &IndexNode::Leaf(new_leaf))?;
+                                internal.kv.push((new_value, new_leaf_page));
+                                self.pager
+                                    .write_index_node(current, &IndexNode::Internal(internal))?;
+                                return Ok(true);
+                            } else {
+                                let last = internal.kv.last_mut().unwrap();
+                                last.0 = new_value.clone();
+                                let next = last.1;
+                                self.pager
+                                    .write_index_node(current, &IndexNode::Internal(internal))?;
+                                current = next;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove the entry matching `(value, key)` from the index tree rooted at `root`.
+    /// Routes by `value` (actual bytes). Returns `true` if the entry was found and removed.
+    pub fn index_remove(&mut self, root: NodePtr, value: &Value, key: Key) -> Result<bool, Error> {
+        let target_bytes = self.resolve_value(value)?;
+        let mut current = root;
+        let mut path = vec![];
+
+        loop {
+            path.push(current);
+            let node = self.pager.owned_index_node(current)?;
+
+            match node {
+                IndexNode::Leaf(mut leaf) => {
+                    // Find the entry by resolved bytes + key
+                    let mut found_idx = None;
+                    for (i, (v, k)) in leaf.kv.iter().enumerate() {
+                        let v_bytes = self.resolve_value(v)?;
+                        if v_bytes == target_bytes && *k == key {
+                            found_idx = Some(i);
+                            break;
+                        }
+                    }
+                    match found_idx {
+                        Some(idx) => {
+                            let old_value_entry = leaf.kv.remove(idx).0;
+                            self.index_merge_insert(root, &path, &IndexNode::Leaf(leaf))?;
+                            self.free_value_pages(&old_value_entry)?;
+                            return Ok(true);
+                        }
+                        None => return Ok(false),
+                    }
+                }
+                IndexNode::Internal(internal) => {
+                    match self.find_index_child(&internal, &target_bytes)? {
+                        Some(next) => current = next,
+                        None => return Ok(false),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Look up by value in the index tree rooted at `root`.
+    /// The closure `f` receives `Some(key)` if found or `None` if absent.
+    /// Comparison is by actual bytes. If multiple entries share the same value,
+    /// returns the first match.
+    pub fn index_read<T>(
+        &mut self,
+        root: NodePtr,
+        value: &Value,
+        f: impl FnOnce(Option<Key>) -> T,
+    ) -> Result<T, Error> {
+        let target_bytes = self.resolve_value(value)?;
+        let mut current = root;
+        let mut ff = Some(f);
+
+        loop {
+            let node = self.pager.owned_index_node(current)?;
+            match node {
+                IndexNode::Leaf(leaf) => {
+                    for (v, k) in &leaf.kv {
+                        let v_bytes = self.resolve_value(v)?;
+                        if v_bytes == target_bytes {
+                            return Ok(ff.take().unwrap()(Some(*k)));
+                        }
+                    }
+                    return Ok(ff.take().unwrap()(None));
+                }
+                IndexNode::Internal(internal) => {
+                    match self.find_index_child(&internal, &target_bytes)? {
+                        Some(next) => current = next,
+                        None => return Ok(ff.take().unwrap()(None)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Iterate over all entries in the index tree whose values (by actual bytes)
+    /// fall within `range`, calling `f(value_bytes, key)` for each entry in order.
+    pub fn index_read_range<R: RangeBounds<Vec<u8>>>(
+        &mut self,
+        root: NodePtr,
+        range: R,
+        mut f: impl FnMut(&[u8], Key),
+    ) -> Result<(), Error> {
+        self.index_read_range_at(root, &range, &mut f)
+    }
+
+    fn index_read_range_at<R: RangeBounds<Vec<u8>>>(
+        &mut self,
+        node_ptr: NodePtr,
+        range: &R,
+        f: &mut impl FnMut(&[u8], Key),
+    ) -> Result<(), Error> {
+        let node = self.pager.owned_index_node(node_ptr)?;
+
+        match node {
+            IndexNode::Leaf(leaf) => {
+                for (v, k) in leaf.kv {
+                    let v_bytes = self.resolve_value(&v)?;
+                    if range.contains(&v_bytes) {
+                        f(&v_bytes, k);
+                    }
+                }
+            }
+            IndexNode::Internal(internal) => {
+                for i in 0..internal.kv.len() {
+                    let max_bytes = self.resolve_value(&internal.kv[i].0)?;
+                    let ptr = internal.kv[i].1;
+
+                    // Skip if max_value is below range start
+                    let below_start = match range.start_bound() {
+                        Bound::Included(s) => max_bytes.as_slice() < s.as_slice(),
+                        Bound::Excluded(s) => max_bytes.as_slice() <= s.as_slice(),
+                        Bound::Unbounded => false,
+                    };
+                    if below_start {
+                        continue;
+                    }
+
+                    // Stop if this subtree's min value exceeds range end
+                    if i > 0 {
+                        let prev_max_bytes = self.resolve_value(&internal.kv[i - 1].0)?;
+                        let beyond_end = match range.end_bound() {
+                            Bound::Included(e) => prev_max_bytes.as_slice() > e.as_slice(),
+                            Bound::Excluded(e) => prev_max_bytes.as_slice() >= e.as_slice(),
+                            Bound::Unbounded => false,
+                        };
+                        if beyond_end {
+                            break;
+                        }
+                    }
+
+                    self.index_read_range_at(ptr, range, f)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Return the smallest key not yet present in the index tree rooted at `root`.
+    /// Since the tree is sorted by value, this traverses all leaves to find the max key.
+    pub fn index_available_key(&mut self, root: NodePtr) -> Result<Key, Error> {
+        let node = self.pager.owned_index_node(root)?;
+        match node {
+            IndexNode::Leaf(leaf) => Ok(leaf
+                .kv
+                .iter()
+                .map(|t| t.1)
+                .max()
+                .map_or(0, |k| k.checked_add(1).unwrap_or(u64::MAX))),
+            IndexNode::Internal(internal) => {
+                let mut max_key: Key = 0;
+                for (_, ptr) in &internal.kv {
+                    let child_key = self.index_available_key(*ptr)?;
+                    max_key = max_key.max(child_key);
+                }
+                Ok(max_key)
+            }
+        }
+    }
+
+    fn index_split_insert(
+        &mut self,
+        root: NodePtr,
+        path: &[NodePtr],
+        insert: &IndexNode,
+    ) -> Result<(), Error> {
+        let buffer = rkyv::to_bytes(insert)?;
+
+        let page = *path.last().unwrap();
+        let parents = &path[..path.len() - 1];
+
+        if buffer.len() <= self.pager.page_content_size() {
+            self.pager.write_buffer(page, buffer)?;
+            return Ok(());
+        }
+
+        let page_content_size = self.pager.page_content_size();
+        let mut keyed_nodes: Vec<(Value, IndexNode)> = match insert {
+            IndexNode::Leaf(leaf) => split_index_leaf(leaf.kv.clone(), page_content_size)?
+                .into_iter()
+                .map(|kv| {
+                    let max_value = kv.last().unwrap().0.clone();
+                    (max_value, IndexNode::Leaf(IndexLeaf { kv }))
+                })
+                .collect(),
+            IndexNode::Internal(internal) => {
+                split_index_internal(internal.kv.clone(), page_content_size)?
+                    .into_iter()
+                    .map(|kv| {
+                        let max_value = kv.last().unwrap().0.clone();
+                        (max_value, IndexNode::Internal(IndexInternal { kv }))
+                    })
+                    .collect()
+            }
+        };
+
+        // Sort split chunks by resolved max value bytes
+        self.sort_keyed_nodes(&mut keyed_nodes)?;
+
+        self.index_write_splits(root, keyed_nodes, page, parents)
+    }
+
+    /// Sort a vec of (Value, T) by resolved byte content of the Value.
+    fn sort_keyed_nodes<T>(&mut self, nodes: &mut Vec<(Value, T)>) -> Result<(), Error> {
+        // Resolve all values to bytes, then sort by those bytes
+        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
+        for (v, _) in nodes.iter() {
+            bytes.push(self.resolve_value(v)?);
+        }
+        // Build index array and sort
+        let mut indices: Vec<usize> = (0..nodes.len()).collect();
+        indices.sort_by(|&a, &b| bytes[a].cmp(&bytes[b]));
+        // Reorder in-place using the sorted indices
+        let mut sorted = Vec::with_capacity(nodes.len());
+        for &i in &indices {
+            // Safe because we consume the original vec below
+            sorted.push(i);
+        }
+        let mut taken: Vec<Option<(Value, T)>> = nodes.drain(..).map(Some).collect();
+        for i in sorted {
+            nodes.push(taken[i].take().unwrap());
+        }
+        Ok(())
+    }
+
+    /// Sort an IndexInternal's kv entries by resolved byte content of the Value.
+    fn sort_index_internal_kv(&mut self, kv: &mut Vec<(Value, NodePtr)>) -> Result<(), Error> {
+        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(kv.len());
+        for (v, _) in kv.iter() {
+            bytes.push(self.resolve_value(v)?);
+        }
+        let mut indices: Vec<usize> = (0..kv.len()).collect();
+        indices.sort_by(|&a, &b| bytes[a].cmp(&bytes[b]));
+        let mut taken: Vec<Option<(Value, NodePtr)>> = kv.drain(..).map(Some).collect();
+        for &i in &indices {
+            kv.push(taken[i].take().unwrap());
+        }
+        Ok(())
+    }
+
+    fn index_write_splits(
+        &mut self,
+        root: NodePtr,
+        mut keyed_nodes: Vec<(Value, IndexNode)>,
+        page: NodePtr,
+        parents: &[NodePtr],
+    ) -> Result<(), Error> {
+        if let Some(&parent_page) = parents.last() {
+            let (_right_value, right_node) = keyed_nodes.pop().unwrap();
+            self.pager.write_index_node(page, &right_node)?;
+
+            let IndexNode::Internal(mut parent_internal) =
+                self.pager.owned_index_node(parent_page)?
+            else {
+                panic!("Parent is not an internal node");
+            };
+            for (value, node) in keyed_nodes {
+                let new_page = self.alloc_page()?;
+                self.pager.write_index_node(new_page, &node)?;
+                parent_internal.kv.push((value, new_page));
+            }
+            self.sort_index_internal_kv(&mut parent_internal.kv)?;
+            self.index_split_insert(root, parents, &IndexNode::Internal(parent_internal))
+        } else {
+            let new_entries = keyed_nodes
+                .into_iter()
+                .map(|(value, node)| {
+                    let new_page = self.alloc_page()?;
+                    self.pager.write_index_node(new_page, &node)?;
+                    Ok((value, new_page))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            self.index_split_insert(
+                root,
+                &[root],
+                &IndexNode::Internal(IndexInternal { kv: new_entries }),
+            )
+        }
+    }
+
+    fn index_merge_insert(
+        &mut self,
+        root: NodePtr,
+        path: &[NodePtr],
+        insert: &IndexNode,
+    ) -> Result<(), Error> {
+        let buffer = rkyv::to_bytes(insert)?;
+
+        let page = *path.last().unwrap();
+
+        debug_assert!(buffer.len() <= self.pager.page_content_size());
+
+        if buffer.len() >= self.pager.page_content_size() / 2 || path.len() <= 1 {
+            return self.pager.write_buffer(page, buffer);
+        }
+
+        // Handle empty leaf: remove from parent entirely
+        if let IndexNode::Leaf(leaf) = insert {
+            if leaf.kv.is_empty() {
+                let parents = &path[..path.len() - 1];
+                let parent_page = *parents.last().unwrap();
+                let IndexNode::Internal(mut internal) = self.pager.owned_index_node(parent_page)?
+                else {
+                    panic!("Parent is not an internal node");
+                };
+                internal.kv.retain(|entry| entry.1 != page);
+                self.free_page(page)?;
+                return self.index_merge_insert(root, parents, &IndexNode::Internal(internal));
+            }
+        }
+
+        let parents = &path[..path.len() - 1];
+        if !self.index_try_merge_with_left_sibling(root, page, insert, parents)? {
+            self.pager.write_index_node(page, insert)?;
+        }
+        Ok(())
+    }
+
+    fn index_try_merge_with_left_sibling(
+        &mut self,
+        root: NodePtr,
+        page: NodePtr,
+        insert: &IndexNode,
+        parents: &[NodePtr],
+    ) -> Result<bool, Error> {
+        let parent_page = *parents.last().unwrap();
+        let IndexNode::Internal(mut parent_internal) = self.pager.owned_index_node(parent_page)?
+        else {
+            return Ok(false);
+        };
+
+        let index = parent_internal
+            .kv
+            .iter()
+            .position(|entry| entry.1 == page)
+            .unwrap();
+        if index == 0 {
+            return Ok(false);
+        }
+
+        let left_sibling_page = parent_internal.kv[index - 1].1;
+        let left_sibling_node = self.pager.owned_index_node(left_sibling_page)?;
+
+        let merged = match (left_sibling_node, insert) {
+            (IndexNode::Leaf(mut left), IndexNode::Leaf(right)) => {
+                left.kv.extend(right.kv.iter().cloned());
+                IndexNode::Leaf(left)
+            }
+            (IndexNode::Internal(mut left), IndexNode::Internal(right)) => {
+                left.kv.extend(right.kv.iter().cloned());
+                IndexNode::Internal(left)
+            }
+            _ => return Ok(false),
+        };
+
+        let buffer = rkyv::to_bytes(&merged)?;
+        if buffer.len() <= self.pager.page_content_size() {
+            self.pager.write_buffer(page, buffer)?;
+            parent_internal.kv.remove(index - 1);
+            self.index_merge_insert(root, parents, &IndexNode::Internal(parent_internal))?;
+            self.free_page(left_sibling_page)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Print a human-readable dump of the tree rooted at `root` for debugging.
@@ -851,6 +1349,96 @@ impl Btree {
             let chunk = std::cmp::min(data_per_page, remaining);
             remaining -= chunk;
             current = next;
+        }
+    }
+
+    /// Check for page leaks with an index tree root. Same as [`assert_no_page_leak`]
+    /// but walks an `IndexNode` tree instead of a `Node` tree.
+    #[cfg(test)]
+    pub fn assert_no_page_leak_index(&mut self, root: NodePtr) {
+        use std::collections::BTreeSet;
+
+        let total_pages = self.pager.get_next_page_num();
+
+        let mut tree_pages = BTreeSet::new();
+        tree_pages.insert(root);
+        tree_pages.insert(FREE_LIST_PAGE_NUM);
+        self.collect_index_tree_pages(root, &mut tree_pages);
+
+        let mut free_pages = BTreeSet::new();
+        let mut head = self.read_free_list_head().unwrap();
+        while head != u64::MAX {
+            assert!(
+                free_pages.insert(head),
+                "Free list cycle detected at page {}",
+                head
+            );
+            let buf = self.pager.read_raw_page(head).unwrap();
+            head = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        }
+
+        let overlap: Vec<_> = tree_pages.intersection(&free_pages).collect();
+        assert!(
+            overlap.is_empty(),
+            "Pages in both tree and free list: {:?}",
+            overlap
+        );
+
+        let mut all_pages: BTreeSet<u64> = (0..total_pages).collect();
+        for &p in &tree_pages {
+            all_pages.remove(&p);
+        }
+        for &p in &free_pages {
+            all_pages.remove(&p);
+        }
+        assert!(
+            all_pages.is_empty(),
+            "Leaked pages (not in tree or free list): {:?} (tree={}, free={}, total={})",
+            all_pages,
+            tree_pages.len(),
+            free_pages.len(),
+            total_pages
+        );
+    }
+
+    /// Recursively collect all pages used by the index tree rooted at `page_num`,
+    /// including overflow pages.
+    #[cfg(test)]
+    fn collect_index_tree_pages(
+        &mut self,
+        page_num: NodePtr,
+        pages: &mut std::collections::BTreeSet<u64>,
+    ) {
+        let node = self.pager.owned_index_node(page_num).unwrap();
+        match node {
+            IndexNode::Leaf(leaf) => {
+                for (v, _) in &leaf.kv {
+                    if let Value::Overflow {
+                        start_page,
+                        total_len,
+                    } = v
+                    {
+                        self.collect_overflow_pages(*start_page, *total_len, pages);
+                    }
+                }
+            }
+            IndexNode::Internal(internal) => {
+                for (v, ptr) in &internal.kv {
+                    assert!(
+                        pages.insert(*ptr),
+                        "Page {} referenced multiple times in index tree",
+                        ptr
+                    );
+                    if let Value::Overflow {
+                        start_page,
+                        total_len,
+                    } = v
+                    {
+                        self.collect_overflow_pages(*start_page, *total_len, pages);
+                    }
+                    self.collect_index_tree_pages(*ptr, pages);
+                }
+            }
         }
     }
 }
@@ -1504,5 +2092,394 @@ mod tests {
         // Remove everything
         btree.remove_range(root, ..).unwrap();
         btree.assert_no_page_leak(root);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Index tree tests
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Create an initialized btree with an index tree root.
+    fn new_index_btree(page_size: usize) -> (Btree, NodePtr) {
+        let file = tempfile::tempfile().unwrap();
+        let pager = Pager::new(file, page_size);
+        let mut btree = Btree::new(pager);
+        btree.init().unwrap();
+        let root = btree.init_index().unwrap();
+        (btree, root)
+    }
+
+    /// Helper: read a key from the index tree by value.
+    fn index_read_key(btree: &mut Btree, root: NodePtr, value: &[u8]) -> Option<Key> {
+        let v = Value::Inline(value.to_vec());
+        btree.index_read(root, &v, |k| k).unwrap()
+    }
+
+    #[test]
+    fn test_index_insert_and_read() {
+        let (mut btree, root) = new_index_btree(4096);
+        assert!(btree.index_insert(root, 42, b"hello".to_vec()).unwrap());
+        assert_eq!(index_read_key(&mut btree, root, b"hello"), Some(42));
+    }
+
+    #[test]
+    fn test_index_insert_duplicate_returns_false() {
+        let (mut btree, root) = new_index_btree(4096);
+        assert!(btree.index_insert(root, 1, b"val".to_vec()).unwrap());
+        assert!(!btree.index_insert(root, 1, b"val".to_vec()).unwrap());
+    }
+
+    #[test]
+    fn test_index_same_value_different_keys() {
+        let (mut btree, root) = new_index_btree(4096);
+        assert!(btree.index_insert(root, 1, b"dup".to_vec()).unwrap());
+        assert!(btree.index_insert(root, 2, b"dup".to_vec()).unwrap());
+        assert!(btree.index_insert(root, 3, b"dup".to_vec()).unwrap());
+
+        // index_read returns the first match
+        let key = index_read_key(&mut btree, root, b"dup");
+        assert!(key == Some(1) || key == Some(2) || key == Some(3));
+    }
+
+    #[test]
+    fn test_index_read_absent() {
+        let (mut btree, root) = new_index_btree(4096);
+        btree.index_insert(root, 1, b"exists".to_vec()).unwrap();
+        assert_eq!(index_read_key(&mut btree, root, b"missing"), None);
+    }
+
+    #[test]
+    fn test_index_remove() {
+        let (mut btree, root) = new_index_btree(4096);
+        btree.index_insert(root, 1, b"alpha".to_vec()).unwrap();
+        btree.index_insert(root, 2, b"beta".to_vec()).unwrap();
+
+        let v = Value::Inline(b"alpha".to_vec());
+        assert!(btree.index_remove(root, &v, 1).unwrap());
+        assert_eq!(index_read_key(&mut btree, root, b"alpha"), None);
+        assert_eq!(index_read_key(&mut btree, root, b"beta"), Some(2));
+    }
+
+    #[test]
+    fn test_index_remove_absent() {
+        let (mut btree, root) = new_index_btree(4096);
+        btree.index_insert(root, 1, b"data".to_vec()).unwrap();
+
+        let v = Value::Inline(b"nonexistent".to_vec());
+        assert!(!btree.index_remove(root, &v, 1).unwrap());
+    }
+
+    #[test]
+    fn test_index_remove_wrong_key_same_value() {
+        let (mut btree, root) = new_index_btree(4096);
+        btree.index_insert(root, 1, b"shared".to_vec()).unwrap();
+        btree.index_insert(root, 2, b"shared".to_vec()).unwrap();
+
+        // Remove key=99 which doesn't exist for this value
+        let v = Value::Inline(b"shared".to_vec());
+        assert!(!btree.index_remove(root, &v, 99).unwrap());
+
+        // Both originals still present
+        let key = index_read_key(&mut btree, root, b"shared");
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn test_index_multiple_values_sorted() {
+        let (mut btree, root) = new_index_btree(256);
+        let values: Vec<(&[u8], Key)> = vec![
+            (b"cherry", 3),
+            (b"apple", 1),
+            (b"banana", 2),
+            (b"date", 4),
+            (b"elderberry", 5),
+        ];
+        for (v, k) in &values {
+            btree.index_insert(root, *k, v.to_vec()).unwrap();
+        }
+
+        // All values should be findable
+        for (v, k) in &values {
+            assert_eq!(index_read_key(&mut btree, root, v), Some(*k));
+        }
+    }
+
+    #[test]
+    fn test_index_insert_many_and_read() {
+        let (mut btree, root) = new_index_btree(4096);
+        let mut map = HashMap::new();
+
+        for i in 0u64..256 {
+            let value = format!("value-{:04}", i).as_bytes().to_vec();
+            btree.index_insert(root, i, value.clone()).unwrap();
+            map.insert(value, i);
+        }
+
+        for (value, key) in &map {
+            let found = index_read_key(&mut btree, root, value);
+            assert_eq!(found, Some(*key), "Failed to find value {:?}", value);
+        }
+    }
+
+    #[test]
+    fn test_index_insert_remove_seq() {
+        const LEN: u64 = 200;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(77);
+        let (mut btree, root) = new_index_btree(256);
+
+        let mut entries: Vec<(u64, Vec<u8>)> = (0..LEN)
+            .map(|i| (i, format!("val-{:04}", i).into_bytes()))
+            .collect();
+        entries.shuffle(&mut rng);
+
+        for (k, v) in &entries {
+            assert!(btree.index_insert(root, *k, v.clone()).unwrap());
+        }
+
+        // Verify all present
+        for (k, v) in &entries {
+            assert_eq!(index_read_key(&mut btree, root, v), Some(*k));
+        }
+
+        entries.shuffle(&mut rng);
+        for (k, v) in &entries {
+            let val = Value::Inline(v.clone());
+            assert!(btree.index_remove(root, &val, *k).unwrap());
+            assert_eq!(index_read_key(&mut btree, root, v), None);
+        }
+    }
+
+    #[test]
+    fn test_index_read_range() {
+        let (mut btree, root) = new_index_btree(4096);
+
+        btree.index_insert(root, 1, b"aaa".to_vec()).unwrap();
+        btree.index_insert(root, 2, b"bbb".to_vec()).unwrap();
+        btree.index_insert(root, 3, b"ccc".to_vec()).unwrap();
+        btree.index_insert(root, 4, b"ddd".to_vec()).unwrap();
+        btree.index_insert(root, 5, b"eee".to_vec()).unwrap();
+
+        let mut results = Vec::new();
+        btree
+            .index_read_range(root, b"bbb".to_vec()..=b"ddd".to_vec(), |v, k| {
+                results.push((v.to_vec(), k))
+            })
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().any(|(v, k)| v == b"bbb" && *k == 2));
+        assert!(results.iter().any(|(v, k)| v == b"ccc" && *k == 3));
+        assert!(results.iter().any(|(v, k)| v == b"ddd" && *k == 4));
+    }
+
+    #[test]
+    fn test_index_read_range_unbounded() {
+        let (mut btree, root) = new_index_btree(4096);
+        for i in 0u64..10 {
+            btree
+                .index_insert(root, i, format!("{:02}", i).into_bytes())
+                .unwrap();
+        }
+
+        let mut results = Vec::new();
+        btree
+            .index_read_range(root, .., |v, k| results.push((v.to_vec(), k)))
+            .unwrap();
+        assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn test_index_read_range_empty() {
+        let (mut btree, root) = new_index_btree(4096);
+        btree.index_insert(root, 1, b"aaa".to_vec()).unwrap();
+
+        let mut results = Vec::new();
+        btree
+            .index_read_range(root, b"zzz".to_vec()..=b"zzzz".to_vec(), |v, k| {
+                results.push((v.to_vec(), k))
+            })
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_index_available_key() {
+        let (mut btree, root) = new_index_btree(4096);
+        assert_eq!(btree.index_available_key(root).unwrap(), 0);
+
+        btree.index_insert(root, 5, b"aaa".to_vec()).unwrap();
+        assert_eq!(btree.index_available_key(root).unwrap(), 6);
+
+        btree.index_insert(root, 10, b"bbb".to_vec()).unwrap();
+        assert_eq!(btree.index_available_key(root).unwrap(), 11);
+
+        btree.index_insert(root, 7, b"ccc".to_vec()).unwrap();
+        assert_eq!(btree.index_available_key(root).unwrap(), 11);
+    }
+
+    #[test]
+    fn test_index_free_tree() {
+        let (mut btree, root) = new_index_btree(256);
+        for i in 0u64..100 {
+            btree
+                .index_insert(root, i, format!("v-{}", i).into_bytes())
+                .unwrap();
+        }
+        let pages_before = btree.pager.get_next_page_num();
+        btree.free_index_tree(root).unwrap();
+
+        // All tree pages should now be in the free list
+        assert_ne!(btree.read_free_list_head().unwrap(), u64::MAX);
+
+        // Reuse: create a new index tree; pages should be reused
+        let root2 = btree.init_index().unwrap();
+        for i in 0u64..100 {
+            btree
+                .index_insert(root2, i, format!("v-{}", i).into_bytes())
+                .unwrap();
+        }
+        assert!(
+            btree.pager.get_next_page_num() <= pages_before + 1,
+            "Pages not reused after free_index_tree"
+        );
+    }
+
+    #[test]
+    fn test_index_big_values() {
+        let (mut btree, root) = new_index_btree(256);
+        let big_value = vec![42u8; 4096];
+        assert!(btree.index_insert(root, 1, big_value.clone()).unwrap());
+
+        let v = Value::Inline(big_value.clone());
+        let found = btree.index_read(root, &v, |k| k).unwrap();
+        assert_eq!(found, Some(1));
+    }
+
+    #[test]
+    fn test_index_big_value_remove() {
+        let (mut btree, root) = new_index_btree(256);
+        let big_value = vec![42u8; 4096];
+        btree.index_insert(root, 1, big_value.clone()).unwrap();
+
+        let v = Value::Inline(big_value);
+        assert!(btree.index_remove(root, &v, 1).unwrap());
+    }
+
+    #[test]
+    fn test_index_no_leak_insert_only() {
+        let (mut btree, root) = new_index_btree(256);
+        for i in 0u64..256 {
+            btree
+                .index_insert(root, i, format!("v-{:04}", i).into_bytes())
+                .unwrap();
+        }
+        btree.assert_no_page_leak_index(root);
+    }
+
+    #[test]
+    fn test_index_no_leak_insert_and_remove_all() {
+        let (mut btree, root) = new_index_btree(256);
+        let entries: Vec<(u64, Vec<u8>)> = (0u64..200)
+            .map(|i| (i, format!("v-{:04}", i).into_bytes()))
+            .collect();
+
+        for (k, v) in &entries {
+            btree.index_insert(root, *k, v.clone()).unwrap();
+        }
+        for (k, v) in &entries {
+            let val = Value::Inline(v.clone());
+            btree.index_remove(root, &val, *k).unwrap();
+        }
+        btree.assert_no_page_leak_index(root);
+    }
+
+    #[test]
+    fn test_index_no_leak_shuffle() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(123);
+        let (mut btree, root) = new_index_btree(256);
+
+        let mut entries: Vec<(u64, Vec<u8>)> = (0u64..300)
+            .map(|i| (i, format!("val-{:04}", i).into_bytes()))
+            .collect();
+        entries.shuffle(&mut rng);
+        for (k, v) in &entries {
+            btree.index_insert(root, *k, v.clone()).unwrap();
+        }
+
+        entries.shuffle(&mut rng);
+        for (k, v) in &entries {
+            let val = Value::Inline(v.clone());
+            btree.index_remove(root, &val, *k).unwrap();
+        }
+        btree.assert_no_page_leak_index(root);
+    }
+
+    #[test]
+    fn test_index_no_leak_big_values() {
+        let (mut btree, root) = new_index_btree(4096);
+        let entries: Vec<(u64, Vec<u8>)> = (0u64..10)
+            .map(|i| (i, vec![i as u8; 8192 + i as usize * 100]))
+            .collect();
+
+        for (k, v) in &entries {
+            btree.index_insert(root, *k, v.clone()).unwrap();
+        }
+        btree.assert_no_page_leak_index(root);
+
+        for (k, v) in &entries {
+            let val = Value::Inline(v.clone());
+            btree.index_remove(root, &val, *k).unwrap();
+        }
+        btree.assert_no_page_leak_index(root);
+    }
+
+    #[test]
+    fn test_index_sorted_order() {
+        let (mut btree, root) = new_index_btree(256);
+
+        // Insert values in reverse order
+        let values: Vec<Vec<u8>> = (0u64..50)
+            .rev()
+            .map(|i| format!("{:04}", i).into_bytes())
+            .collect();
+        for (i, v) in values.iter().enumerate() {
+            btree.index_insert(root, i as u64, v.clone()).unwrap();
+        }
+
+        // Range read should return values in sorted byte order
+        let mut result = Vec::new();
+        btree
+            .index_read_range(root, .., |v, _k| result.push(v.to_vec()))
+            .unwrap();
+
+        let mut sorted = result.clone();
+        sorted.sort();
+        assert_eq!(
+            result, sorted,
+            "Index tree entries should be in sorted value order"
+        );
+    }
+
+    #[test]
+    fn test_index_read_range_many() {
+        let (mut btree, root) = new_index_btree(256);
+
+        for i in 0u64..200 {
+            btree
+                .index_insert(root, i, format!("{:04}", i).into_bytes())
+                .unwrap();
+        }
+
+        let mut results = Vec::new();
+        btree
+            .index_read_range(root, b"0050".to_vec()..b"0150".to_vec(), |v, _k| {
+                results.push(v.to_vec())
+            })
+            .unwrap();
+
+        // Values "0050".."0150" (exclusive end) = 100 entries
+        assert_eq!(results.len(), 100);
+        for v in &results {
+            assert!(v.as_slice() >= b"0050".as_slice() && v.as_slice() < b"0150".as_slice());
+        }
     }
 }

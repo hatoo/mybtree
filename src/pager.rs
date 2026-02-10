@@ -5,6 +5,7 @@ use rkyv::{
 };
 use std::io;
 
+use crate::types::IndexNode;
 use crate::types::Node;
 
 #[cfg(unix)]
@@ -150,6 +151,36 @@ impl Pager {
     }
 
     pub fn write_node(&self, page_num: u64, node: &Node) -> Result<(), Error> {
+        let buffer = rkyv::to_bytes(node)?;
+        self.write_buffer(page_num, buffer)
+    }
+
+    pub fn read_index_node<T>(
+        &self,
+        page_num: u64,
+        f: impl FnOnce(&rkyv::Archived<IndexNode>) -> T,
+    ) -> Result<T, Error> {
+        let mut buffer = AlignedVec::<16>::with_capacity(self.page_size);
+        buffer.resize(self.page_size, 0);
+        read_exact_at(&self.file, &mut buffer, page_num * self.page_size as u64)
+            .map_err(Error::new)?;
+        let buffer = self.from_page(&buffer);
+        let archived = high::access::<rkyv::Archived<IndexNode>, Error>(&buffer)?;
+        Ok(f(archived))
+    }
+
+    pub fn owned_index_node(&self, page_num: u64) -> Result<IndexNode, Error> {
+        let mut buffer = AlignedVec::<16>::with_capacity(self.page_size);
+        buffer.resize(self.page_size, 0);
+        read_exact_at(&self.file, &mut buffer, page_num * self.page_size as u64)
+            .map_err(Error::new)?;
+        let buffer = self.from_page(&buffer);
+        let archived = rkyv::access::<rkyv::Archived<IndexNode>, Error>(&buffer)?;
+        let node: IndexNode = rkyv::deserialize(archived)?;
+        Ok(node)
+    }
+
+    pub fn write_index_node(&self, page_num: u64, node: &IndexNode) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(node)?;
         self.write_buffer(page_num, buffer)
     }

@@ -25,3 +25,22 @@ pub enum Node {
     Leaf(Leaf),
     Internal(Internal),
 }
+
+/// Leaf node for an index tree, sorted by value (secondary index).
+#[derive(Archive, Deserialize, Serialize, Debug)]
+pub struct IndexLeaf {
+    pub kv: Vec<(Value, Key)>,
+}
+
+/// Internal node for an index tree, routing by value.
+#[derive(Archive, Deserialize, Serialize, Debug)]
+pub struct IndexInternal {
+    pub kv: Vec<(Value, NodePtr)>,
+}
+
+/// Node type for an index tree (sorted by value).
+#[derive(Archive, Deserialize, Serialize, Debug)]
+pub enum IndexNode {
+    Leaf(IndexLeaf),
+    Internal(IndexInternal),
+}
