@@ -60,20 +60,6 @@ pub enum DatabaseError {
     Internal(#[from] Error),
 }
 
-// ── Row serialisation ───────────────────────────────────────────────
-
-fn serialize_row(row: &Row) -> Vec<u8> {
-    rkyv::to_bytes::<Error>(row)
-        .expect("failed to serialize Row")
-        .to_vec()
-}
-
-fn deserialize_row(data: &[u8]) -> Result<Row, DatabaseError> {
-    let archived = rkyv::access::<rkyv::Archived<Row>, Error>(data)?;
-    let row: Row = rkyv::deserialize::<Row, Error>(archived)?;
-    Ok(row)
-}
-
 // ── Table metadata serialisation ────────────────────────────────────
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
@@ -243,8 +229,9 @@ impl<'a> DbTransaction<'a> {
     pub fn insert(&self, table_name: &str, row: &Row) -> Result<Key, DatabaseError> {
         let meta = self.get_meta(table_name)?;
         validate_row(row, &meta.schema)?;
-        let bytes = serialize_row(row);
-        let key = self.tx.insert(meta.root_page, bytes)?;
+        let key = self
+            .tx
+            .insert(meta.root_page, rkyv::to_bytes::<Error>(row)?.to_vec())?;
         Ok(key)
     }
 
@@ -252,7 +239,10 @@ impl<'a> DbTransaction<'a> {
         let meta = self.get_meta(table_name)?;
         let data = self.tx.read(meta.root_page, key)?;
         match data {
-            Some(bytes) => Ok(Some(deserialize_row(&bytes)?)),
+            Some(bytes) => {
+                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)?;
+                Ok(Some(rkyv::deserialize::<Row, Error>(archived)?))
+            }
             None => Ok(None),
         }
     }
@@ -266,7 +256,8 @@ impl<'a> DbTransaction<'a> {
         let raw = self.tx.read_range(meta.root_page, range)?;
         let mut result = Vec::with_capacity(raw.len());
         for (key, bytes) in raw {
-            result.push((key, deserialize_row(&bytes)?));
+            let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)?;
+            result.push((key, rkyv::deserialize::<Row, Error>(archived)?));
         }
         Ok(result)
     }
@@ -281,8 +272,8 @@ impl<'a> DbTransaction<'a> {
     pub fn update(&self, table_name: &str, key: Key, row: &Row) -> Result<(), DatabaseError> {
         let meta = self.get_meta(table_name)?;
         validate_row(row, &meta.schema)?;
-        let bytes = serialize_row(row);
-        self.tx.write(meta.root_page, key, bytes);
+        self.tx
+            .write(meta.root_page, key, rkyv::to_bytes::<Error>(row)?.to_vec());
         Ok(())
     }
 
