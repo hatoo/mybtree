@@ -93,6 +93,29 @@ impl TransactionStore {
         let mut inner = self.inner.lock().unwrap();
         inner.btree.index_insert(idx_root, key, value)
     }
+
+    pub fn index_remove(&self, idx_root: NodePtr, value: &Value, key: Key) -> Result<bool, Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.btree.index_remove(idx_root, value, key)
+    }
+
+    pub fn index_read(&self, idx_root: NodePtr, value: &Value) -> Result<Option<Key>, Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.btree.index_read(idx_root, value, |k| k)
+    }
+
+    pub fn index_read_range<R: RangeBounds<Vec<u8>>>(
+        &self,
+        idx_root: NodePtr,
+        range: R,
+    ) -> Result<Vec<Key>, Error> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut keys = Vec::new();
+        inner
+            .btree
+            .index_read_range(idx_root, range, |_v, k| keys.push(k))?;
+        Ok(keys)
+    }
 }
 
 impl<'a> Transaction<'a> {
@@ -237,6 +260,11 @@ impl<'a> Transaction<'a> {
     pub fn index_remove(&self, idx_root: NodePtr, value: &Value, key: Key) -> Result<bool, Error> {
         let mut inner = self.store.lock().unwrap();
         inner.btree.index_remove(idx_root, value, key)
+    }
+
+    pub fn index_read(&self, idx_root: NodePtr, value: &Value) -> Result<Option<Key>, Error> {
+        let mut inner = self.store.lock().unwrap();
+        inner.btree.index_read(idx_root, value, |k| k)
     }
 
     pub fn index_read_range<R: RangeBounds<Vec<u8>>>(

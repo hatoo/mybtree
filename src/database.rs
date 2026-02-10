@@ -74,6 +74,8 @@ struct TableMeta {
 // ── Database ────────────────────────────────────────────────────────
 
 const CATALOG_PAGE_NUM: NodePtr = 1;
+/// Index tree on the catalog: table name bytes → catalog key.
+const CATALOG_INDEX_PAGE_NUM: NodePtr = 2;
 
 pub struct Database {
     store: TransactionStore,
@@ -83,7 +85,8 @@ impl Database {
     pub fn create(pager: Pager) -> Result<Self, DatabaseError> {
         let mut btree = Btree::new(pager);
         btree.init()?;
-        btree.init_table()?;
+        btree.init_table()?; // page 1 = catalog
+        btree.init_index()?; // page 2 = catalog name index
 
         Ok(Database {
             store: TransactionStore::new(btree),
@@ -99,14 +102,12 @@ impl Database {
     }
 
     fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
-        let tx = self.store.begin_transaction();
-        let entries = tx.read_range(CATALOG_PAGE_NUM, ..)?;
-        for (_key, value) in &entries {
-            if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
-                if archived.name == name {
-                    let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
-                    return Ok(Some(meta));
-                }
+        let value = Value::Inline(name.as_bytes().to_vec());
+        if let Some(catalog_key) = self.store.index_read(CATALOG_INDEX_PAGE_NUM, &value)? {
+            let tx = self.store.begin_transaction();
+            if let Some(data) = tx.read(CATALOG_PAGE_NUM, catalog_key)? {
+                let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
+                return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
             }
         }
         Ok(None)
@@ -127,39 +128,54 @@ impl Database {
 
         // Persist to catalog via transaction
         let tx = self.store.begin_transaction();
-        tx.insert(CATALOG_PAGE_NUM, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
+        let catalog_key = tx.insert(CATALOG_PAGE_NUM, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
         tx.commit()?;
+
+        // Insert into catalog name index
+        self.store.index_insert(
+            CATALOG_INDEX_PAGE_NUM,
+            catalog_key,
+            name.as_bytes().to_vec(),
+        )?;
 
         Ok(())
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), DatabaseError> {
-        // Find catalog key and root page for this table
-        let tx = self.store.begin_transaction();
-        let entries = tx.read_range(CATALOG_PAGE_NUM, ..)?;
-        let found_meta = entries.iter().find_map(|(key, value)| {
-            let meta = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value).ok()?;
-            if meta.name == name {
-                Some((*key, rkyv::deserialize::<TableMeta, Error>(meta).ok()?))
-            } else {
-                None
-            }
-        });
+        let name_bytes = name.as_bytes().to_vec();
+        let keys = self.store.index_read_range(
+            CATALOG_INDEX_PAGE_NUM,
+            name_bytes.clone()..=name_bytes.clone(),
+        )?;
+        let catalog_key = keys
+            .first()
+            .copied()
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
 
-        match found_meta {
-            Some((key, meta)) => {
-                tx.remove(CATALOG_PAGE_NUM, key);
-                tx.commit()?;
-                // Free all pages belonging to the table's tree
-                self.store.drop_table(meta.root_page)?;
-                // Free all index trees
-                for (_, idx_root) in &meta.index_trees {
-                    self.store.drop_index_tree(*idx_root)?;
-                }
-                Ok(())
-            }
-            None => Err(DatabaseError::TableNotFound(name.to_string())),
+        let tx = self.store.begin_transaction();
+        let value = tx
+            .read(CATALOG_PAGE_NUM, catalog_key)?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+        let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&value)?;
+        let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
+
+        tx.remove(CATALOG_PAGE_NUM, catalog_key);
+        tx.commit()?;
+
+        // Remove from catalog name index
+        self.store.index_remove(
+            CATALOG_INDEX_PAGE_NUM,
+            &Value::Inline(name_bytes),
+            catalog_key,
+        )?;
+
+        // Free all pages belonging to the table's tree
+        self.store.drop_table(meta.root_page)?;
+        // Free all index trees
+        for (_, idx_root) in &meta.index_trees {
+            self.store.drop_index_tree(*idx_root)?;
         }
+        Ok(())
     }
 
     pub fn create_index(&self, table_name: &str, column_name: &str) -> Result<(), DatabaseError> {
@@ -231,22 +247,23 @@ impl Database {
 
     /// Rewrite the catalog entry for `table_name` with the given `meta`.
     fn update_table_meta(&self, table_name: &str, meta: &TableMeta) -> Result<(), DatabaseError> {
+        let name_bytes = table_name.as_bytes().to_vec();
+        let keys = self
+            .store
+            .index_read_range(CATALOG_INDEX_PAGE_NUM, name_bytes.clone()..=name_bytes)?;
+        let catalog_key = keys
+            .first()
+            .copied()
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
         let tx = self.store.begin_transaction();
-        let entries = tx.read_range(CATALOG_PAGE_NUM, ..)?;
-        for (key, value) in &entries {
-            if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
-                if archived.name == table_name {
-                    tx.write(
-                        CATALOG_PAGE_NUM,
-                        *key,
-                        rkyv::to_bytes::<Error>(meta)?.to_vec(),
-                    );
-                    tx.commit()?;
-                    return Ok(());
-                }
-            }
-        }
-        Err(DatabaseError::TableNotFound(table_name.to_string()))
+        tx.write(
+            CATALOG_PAGE_NUM,
+            catalog_key,
+            rkyv::to_bytes::<Error>(meta)?.to_vec(),
+        );
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn begin_transaction(&self) -> DbTransaction<'_> {
@@ -332,15 +349,17 @@ pub struct DbTransaction<'a> {
 
 impl<'a> DbTransaction<'a> {
     fn get_meta(&self, table_name: &str) -> Result<TableMeta, DatabaseError> {
-        let entries = self.tx.read_range(CATALOG_PAGE_NUM, ..)?;
-        for (_key, value) in &entries {
-            if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
-                if archived.name == table_name {
-                    return Ok(rkyv::deserialize::<TableMeta, Error>(archived)?);
-                }
-            }
-        }
-        Err(DatabaseError::TableNotFound(table_name.to_string()))
+        let value = Value::Inline(table_name.as_bytes().to_vec());
+        let catalog_key = self
+            .tx
+            .index_read(CATALOG_INDEX_PAGE_NUM, &value)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+        let data = self
+            .tx
+            .read(CATALOG_PAGE_NUM, catalog_key)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+        let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
+        Ok(rkyv::deserialize::<TableMeta, Error>(archived)?)
     }
 
     pub fn insert(&self, table_name: &str, row: &Row) -> Result<Key, DatabaseError> {
