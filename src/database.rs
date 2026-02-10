@@ -994,6 +994,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_drop_table_with_index_frees_pages() {
+        let temp = NamedTempFile::new().unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        let pager = Pager::new(file, 256);
+        let db = Database::create(pager).unwrap();
+
+        db.create_table("users", users_schema()).unwrap();
+        db.create_index("users", "name").unwrap();
+        db.create_index("users", "age").unwrap();
+
+        // Insert many rows to allocate pages for data + both indexes
+        let tx = db.begin_transaction();
+        for i in 0..100 {
+            tx.insert(
+                "users",
+                &Row {
+                    values: vec![
+                        DbValue::Text(format!("user_{}", i)),
+                        DbValue::Integer(i as i64),
+                    ],
+                },
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let pages_before_drop = db.store.get_next_page_num();
+
+        db.drop_table("users").unwrap();
+
+        // Re-create with indexes and re-insert — should reuse freed pages
+        db.create_table("users2", users_schema()).unwrap();
+        db.create_index("users2", "name").unwrap();
+        db.create_index("users2", "age").unwrap();
+        let tx = db.begin_transaction();
+        for i in 0..100 {
+            tx.insert(
+                "users2",
+                &Row {
+                    values: vec![
+                        DbValue::Text(format!("user_{}", i)),
+                        DbValue::Integer(i as i64),
+                    ],
+                },
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let pages_after_reinsert = db.store.get_next_page_num();
+
+        assert!(
+            pages_after_reinsert <= pages_before_drop + 1,
+            "Pages were not reused after drop_table with indexes: before_drop={}, after_reinsert={}",
+            pages_before_drop,
+            pages_after_reinsert,
+        );
+    }
+
     // ── Index tests ─────────────────────────────────────────────────
 
     #[test]
