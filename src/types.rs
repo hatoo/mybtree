@@ -3,6 +3,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 pub type Key = u64;
 pub type NodePtr = u64;
 pub const ROOT_PAGE_NUM: u64 = 0;
+pub const FREE_LIST_PAGE_NUM: u64 = 1;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum Value {
