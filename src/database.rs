@@ -19,7 +19,7 @@ pub enum ColumnType {
     Bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum DbValue {
     Integer(i64),
     Text(String),
@@ -40,7 +40,7 @@ pub struct Schema {
     pub columns: Vec<Column>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Row {
     pub values: Vec<DbValue>,
 }
@@ -63,85 +63,16 @@ pub enum DatabaseError {
 
 // ── Row serialisation ───────────────────────────────────────────────
 
-const TAG_NULL: u8 = 0x00;
-const TAG_INTEGER: u8 = 0x01;
-const TAG_TEXT: u8 = 0x02;
-const TAG_FLOAT: u8 = 0x03;
-const TAG_BOOL: u8 = 0x04;
-
 fn serialize_row(row: &Row) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for v in &row.values {
-        match v {
-            DbValue::Null => buf.push(TAG_NULL),
-            DbValue::Integer(i) => {
-                buf.push(TAG_INTEGER);
-                buf.extend_from_slice(&i.to_le_bytes());
-            }
-            DbValue::Text(s) => {
-                buf.push(TAG_TEXT);
-                let bytes = s.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(bytes);
-            }
-            DbValue::Float(f) => {
-                buf.push(TAG_FLOAT);
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-            DbValue::Bool(b) => {
-                buf.push(TAG_BOOL);
-                buf.push(if *b { 1 } else { 0 });
-            }
-        }
-    }
-    buf
+    rkyv::to_bytes::<Error>(row)
+        .expect("failed to serialize Row")
+        .to_vec()
 }
 
 fn deserialize_row(data: &[u8]) -> Result<Row, DatabaseError> {
-    let mut values = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        let tag = data[pos];
-        pos += 1;
-        match tag {
-            TAG_NULL => values.push(DbValue::Null),
-            TAG_INTEGER => {
-                let bytes: [u8; 8] = data[pos..pos + 8]
-                    .try_into()
-                    .map_err(|_| DatabaseError::SchemaMismatch("truncated integer".into()))?;
-                values.push(DbValue::Integer(i64::from_le_bytes(bytes)));
-                pos += 8;
-            }
-            TAG_TEXT => {
-                let len_bytes: [u8; 4] = data[pos..pos + 4]
-                    .try_into()
-                    .map_err(|_| DatabaseError::SchemaMismatch("truncated text length".into()))?;
-                let len = u32::from_le_bytes(len_bytes) as usize;
-                pos += 4;
-                let s = std::str::from_utf8(&data[pos..pos + len])
-                    .map_err(|_| DatabaseError::SchemaMismatch("invalid utf-8".into()))?;
-                values.push(DbValue::Text(s.to_string()));
-                pos += len;
-            }
-            TAG_FLOAT => {
-                let bytes: [u8; 8] = data[pos..pos + 8]
-                    .try_into()
-                    .map_err(|_| DatabaseError::SchemaMismatch("truncated float".into()))?;
-                values.push(DbValue::Float(f64::from_le_bytes(bytes)));
-                pos += 8;
-            }
-            TAG_BOOL => {
-                values.push(DbValue::Bool(data[pos] != 0));
-                pos += 1;
-            }
-            _ => {
-                return Err(DatabaseError::SchemaMismatch(format!(
-                    "unknown type tag: {tag:#x}"
-                )));
-            }
-        }
-    }
-    Ok(Row { values })
+    let archived = rkyv::access::<rkyv::Archived<Row>, Error>(data)?;
+    let row: Row = rkyv::deserialize::<Row, Error>(archived)?;
+    Ok(row)
 }
 
 // ── Table metadata serialisation ────────────────────────────────────
