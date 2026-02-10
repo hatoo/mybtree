@@ -250,6 +250,28 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
+    // ── Structural operations (applied directly to btree) ──────────
+
+    pub fn init_table(&self) -> Result<NodePtr, Error> {
+        let mut inner = self.store.lock().unwrap();
+        inner.btree.init_table()
+    }
+
+    pub fn init_index(&self) -> Result<NodePtr, Error> {
+        let mut inner = self.store.lock().unwrap();
+        inner.btree.init_index()
+    }
+
+    pub fn free_tree(&self, root: NodePtr) -> Result<(), Error> {
+        let mut inner = self.store.lock().unwrap();
+        inner.btree.free_tree(root)
+    }
+
+    pub fn free_index_tree(&self, root: NodePtr) -> Result<(), Error> {
+        let mut inner = self.store.lock().unwrap();
+        inner.btree.free_index_tree(root)
+    }
+
     // ── Index tree operations (applied directly to btree) ───────────
 
     pub fn index_insert(&self, idx_root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {

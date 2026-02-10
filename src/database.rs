@@ -101,171 +101,6 @@ impl Database {
         })
     }
 
-    fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
-        let value = Value::Inline(name.as_bytes().to_vec());
-        if let Some(catalog_key) = self.store.index_read(CATALOG_INDEX_PAGE_NUM, &value)? {
-            let tx = self.store.begin_transaction();
-            if let Some(data) = tx.read(CATALOG_PAGE_NUM, catalog_key)? {
-                let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
-                return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn create_table(&self, name: &str, schema: Schema) -> Result<(), DatabaseError> {
-        if self.find_table_meta(name)?.is_some() {
-            return Err(DatabaseError::TableAlreadyExists(name.to_string()));
-        }
-
-        let root_page = self.store.init_table()?;
-        let meta = TableMeta {
-            name: name.to_string(),
-            schema,
-            root_page,
-            index_trees: vec![],
-        };
-
-        // Persist to catalog via transaction
-        let tx = self.store.begin_transaction();
-        let catalog_key = tx.insert(CATALOG_PAGE_NUM, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
-        tx.commit()?;
-
-        // Insert into catalog name index
-        self.store.index_insert(
-            CATALOG_INDEX_PAGE_NUM,
-            catalog_key,
-            name.as_bytes().to_vec(),
-        )?;
-
-        Ok(())
-    }
-
-    pub fn drop_table(&self, name: &str) -> Result<(), DatabaseError> {
-        let name_bytes = name.as_bytes().to_vec();
-        let keys = self.store.index_read_range(
-            CATALOG_INDEX_PAGE_NUM,
-            name_bytes.clone()..=name_bytes.clone(),
-        )?;
-        let catalog_key = keys
-            .first()
-            .copied()
-            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
-
-        let tx = self.store.begin_transaction();
-        let value = tx
-            .read(CATALOG_PAGE_NUM, catalog_key)?
-            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
-        let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&value)?;
-        let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
-
-        tx.remove(CATALOG_PAGE_NUM, catalog_key);
-        tx.commit()?;
-
-        // Remove from catalog name index
-        self.store.index_remove(
-            CATALOG_INDEX_PAGE_NUM,
-            &Value::Inline(name_bytes),
-            catalog_key,
-        )?;
-
-        // Free all pages belonging to the table's tree
-        self.store.drop_table(meta.root_page)?;
-        // Free all index trees
-        for (_, idx_root) in &meta.index_trees {
-            self.store.drop_index_tree(*idx_root)?;
-        }
-        Ok(())
-    }
-
-    pub fn create_index(&self, table_name: &str, column_name: &str) -> Result<(), DatabaseError> {
-        let mut meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-
-        // Validate column exists
-        let col_idx = meta
-            .schema
-            .columns
-            .iter()
-            .position(|c| c.name == column_name)
-            .ok_or_else(|| {
-                DatabaseError::SchemaMismatch(format!("column '{}' not found", column_name))
-            })?;
-
-        // Check not already indexed
-        if meta.index_trees.iter().any(|(c, _)| c == column_name) {
-            return Err(DatabaseError::SchemaMismatch(format!(
-                "index already exists on column '{}'",
-                column_name
-            )));
-        }
-
-        let idx_root = self.store.init_index()?;
-
-        // Back-fill: scan existing rows and insert into index tree
-        {
-            let tx = self.store.begin_transaction();
-            let rows = tx.read_range(meta.root_page, ..)?;
-            drop(tx);
-
-            for (row_key, row_bytes) in &rows {
-                if let Ok(archived) = rkyv::access::<rkyv::Archived<Row>, Error>(row_bytes) {
-                    let row: Row = rkyv::deserialize::<Row, Error>(archived)?;
-                    let col_bytes = db_value_to_bytes(&row.values[col_idx]);
-                    self.store.index_insert(idx_root, *row_key, col_bytes)?;
-                }
-            }
-        }
-
-        // Update catalog: find and replace the table meta entry
-        meta.index_trees.push((column_name.to_string(), idx_root));
-        self.update_table_meta(table_name, &meta)?;
-
-        Ok(())
-    }
-
-    pub fn drop_index(&self, table_name: &str, column_name: &str) -> Result<(), DatabaseError> {
-        let mut meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-
-        let idx_pos = meta
-            .index_trees
-            .iter()
-            .position(|(c, _)| c == column_name)
-            .ok_or_else(|| {
-                DatabaseError::SchemaMismatch(format!("no index on column '{}'", column_name))
-            })?;
-
-        let (_, idx_root) = meta.index_trees.remove(idx_pos);
-        self.store.drop_index_tree(idx_root)?;
-        self.update_table_meta(table_name, &meta)?;
-
-        Ok(())
-    }
-
-    /// Rewrite the catalog entry for `table_name` with the given `meta`.
-    fn update_table_meta(&self, table_name: &str, meta: &TableMeta) -> Result<(), DatabaseError> {
-        let name_bytes = table_name.as_bytes().to_vec();
-        let keys = self
-            .store
-            .index_read_range(CATALOG_INDEX_PAGE_NUM, name_bytes.clone()..=name_bytes)?;
-        let catalog_key = keys
-            .first()
-            .copied()
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-
-        let tx = self.store.begin_transaction();
-        tx.write(
-            CATALOG_PAGE_NUM,
-            catalog_key,
-            rkyv::to_bytes::<Error>(meta)?.to_vec(),
-        );
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn begin_transaction(&self) -> DbTransaction<'_> {
         DbTransaction {
             tx: self.store.begin_transaction(),
@@ -348,18 +183,150 @@ pub struct DbTransaction<'a> {
 }
 
 impl<'a> DbTransaction<'a> {
+    fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
+        let value = Value::Inline(name.as_bytes().to_vec());
+        if let Some(catalog_key) = self.tx.index_read(CATALOG_INDEX_PAGE_NUM, &value)? {
+            if let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)? {
+                let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
+                return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
+            }
+        }
+        Ok(None)
+    }
+
     fn get_meta(&self, table_name: &str) -> Result<TableMeta, DatabaseError> {
+        self.find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))
+    }
+
+    pub fn create_table(&self, name: &str, schema: Schema) -> Result<(), DatabaseError> {
+        if self.find_table_meta(name)?.is_some() {
+            return Err(DatabaseError::TableAlreadyExists(name.to_string()));
+        }
+
+        let root_page = self.tx.init_table()?;
+        let meta = TableMeta {
+            name: name.to_string(),
+            schema,
+            root_page,
+            index_trees: vec![],
+        };
+
+        let catalog_key = self
+            .tx
+            .insert(CATALOG_PAGE_NUM, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
+        self.tx.index_insert(
+            CATALOG_INDEX_PAGE_NUM,
+            catalog_key,
+            name.as_bytes().to_vec(),
+        )?;
+
+        Ok(())
+    }
+
+    pub fn drop_table(&self, name: &str) -> Result<(), DatabaseError> {
+        let value = Value::Inline(name.as_bytes().to_vec());
+        let catalog_key = self
+            .tx
+            .index_read(CATALOG_INDEX_PAGE_NUM, &value)?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+
+        let data = self
+            .tx
+            .read(CATALOG_PAGE_NUM, catalog_key)?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+        let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
+        let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
+
+        self.tx.remove(CATALOG_PAGE_NUM, catalog_key);
+        self.tx
+            .index_remove(CATALOG_INDEX_PAGE_NUM, &value, catalog_key)?;
+
+        // Free all pages belonging to the table's tree
+        self.tx.free_tree(meta.root_page)?;
+        // Free all index trees
+        for (_, idx_root) in &meta.index_trees {
+            self.tx.free_index_tree(*idx_root)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_index(&self, table_name: &str, column_name: &str) -> Result<(), DatabaseError> {
+        let mut meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        // Validate column exists
+        let col_idx = meta
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name == column_name)
+            .ok_or_else(|| {
+                DatabaseError::SchemaMismatch(format!("column '{}' not found", column_name))
+            })?;
+
+        // Check not already indexed
+        if meta.index_trees.iter().any(|(c, _)| c == column_name) {
+            return Err(DatabaseError::SchemaMismatch(format!(
+                "index already exists on column '{}'",
+                column_name
+            )));
+        }
+
+        let idx_root = self.tx.init_index()?;
+
+        // Back-fill: scan existing rows and insert into index tree
+        let rows = self.tx.read_range(meta.root_page, ..)?;
+        for (row_key, row_bytes) in &rows {
+            if let Ok(archived) = rkyv::access::<rkyv::Archived<Row>, Error>(row_bytes) {
+                let row: Row = rkyv::deserialize::<Row, Error>(archived)?;
+                let col_bytes = db_value_to_bytes(&row.values[col_idx]);
+                self.tx.index_insert(idx_root, *row_key, col_bytes)?;
+            }
+        }
+
+        // Update catalog
+        meta.index_trees.push((column_name.to_string(), idx_root));
+        self.update_table_meta(table_name, &meta)?;
+
+        Ok(())
+    }
+
+    pub fn drop_index(&self, table_name: &str, column_name: &str) -> Result<(), DatabaseError> {
+        let mut meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        let idx_pos = meta
+            .index_trees
+            .iter()
+            .position(|(c, _)| c == column_name)
+            .ok_or_else(|| {
+                DatabaseError::SchemaMismatch(format!("no index on column '{}'", column_name))
+            })?;
+
+        let (_, idx_root) = meta.index_trees.remove(idx_pos);
+        self.tx.free_index_tree(idx_root)?;
+        self.update_table_meta(table_name, &meta)?;
+
+        Ok(())
+    }
+
+    /// Rewrite the catalog entry for `table_name` with the given `meta`.
+    fn update_table_meta(&self, table_name: &str, meta: &TableMeta) -> Result<(), DatabaseError> {
         let value = Value::Inline(table_name.as_bytes().to_vec());
         let catalog_key = self
             .tx
             .index_read(CATALOG_INDEX_PAGE_NUM, &value)?
             .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-        let data = self
-            .tx
-            .read(CATALOG_PAGE_NUM, catalog_key)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-        let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
-        Ok(rkyv::deserialize::<TableMeta, Error>(archived)?)
+
+        self.tx.write(
+            CATALOG_PAGE_NUM,
+            catalog_key,
+            rkyv::to_bytes::<Error>(meta)?.to_vec(),
+        );
+        Ok(())
     }
 
     pub fn insert(&self, table_name: &str, row: &Row) -> Result<Key, DatabaseError> {
@@ -558,16 +525,21 @@ mod tests {
     #[test]
     fn test_create_table() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        let meta = db.find_table_meta("users").unwrap().unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        let meta = tx.find_table_meta("users").unwrap().unwrap();
         assert_eq!(meta.schema.columns.len(), 2);
     }
 
     #[test]
     fn test_create_table_already_exists() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        let err = db.create_table("users", users_schema()).unwrap_err();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let err = tx.create_table("users", users_schema()).unwrap_err();
         assert!(matches!(err, DatabaseError::TableAlreadyExists(_)));
     }
 
@@ -575,7 +547,9 @@ mod tests {
     #[test]
     fn test_insert_and_get() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let row = Row {
             values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
@@ -594,7 +568,9 @@ mod tests {
     #[test]
     fn test_schema_mismatch_wrong_type() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let bad_row = Row {
             values: vec![DbValue::Integer(123), DbValue::Integer(30)],
@@ -608,7 +584,9 @@ mod tests {
     #[test]
     fn test_schema_mismatch_wrong_column_count() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let bad_row = Row {
             values: vec![DbValue::Text("Alice".into())],
@@ -623,7 +601,9 @@ mod tests {
     #[test]
     fn test_scan_range() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let k1 = tx
@@ -663,7 +643,9 @@ mod tests {
     #[test]
     fn test_update_row() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let key = tx
@@ -695,7 +677,9 @@ mod tests {
     #[test]
     fn test_delete_row() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let key = tx
@@ -720,8 +704,9 @@ mod tests {
     #[test]
     fn test_multiple_tables() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_table(
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table(
             "products",
             Schema {
                 columns: vec![
@@ -739,6 +724,7 @@ mod tests {
             },
         )
         .unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let uk = tx
@@ -770,7 +756,9 @@ mod tests {
     #[test]
     fn test_rollback_on_drop() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let key = tx
@@ -790,7 +778,9 @@ mod tests {
     #[test]
     fn test_commit_persists() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let key = tx
@@ -811,7 +801,8 @@ mod tests {
     #[test]
     fn test_nullable_column() {
         let (db, _tmp) = open_db();
-        db.create_table(
+        let tx = db.begin_transaction();
+        tx.create_table(
             "events",
             Schema {
                 columns: vec![
@@ -829,6 +820,7 @@ mod tests {
             },
         )
         .unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let key = tx
@@ -849,7 +841,9 @@ mod tests {
     #[test]
     fn test_non_nullable_rejects_null() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let err = tx
@@ -867,15 +861,23 @@ mod tests {
     #[test]
     fn test_drop_table() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.drop_table("users").unwrap();
-        assert!(db.find_table_meta("users").unwrap().is_none());
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        tx.drop_table("users").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        assert!(tx.find_table_meta("users").unwrap().is_none());
     }
 
     #[test]
     fn test_drop_nonexistent_table() {
         let (db, _tmp) = open_db();
-        let err = db.drop_table("nope").unwrap_err();
+        let tx = db.begin_transaction();
+        let err = tx.drop_table("nope").unwrap_err();
         assert!(matches!(err, DatabaseError::TableNotFound(_)));
     }
 
@@ -892,7 +894,8 @@ mod tests {
     #[test]
     fn test_bool_column() {
         let (db, _tmp) = open_db();
-        db.create_table(
+        let tx = db.begin_transaction();
+        tx.create_table(
             "flags",
             Schema {
                 columns: vec![Column {
@@ -903,6 +906,7 @@ mod tests {
             },
         )
         .unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let k1 = tx
@@ -945,7 +949,9 @@ mod tests {
         let pager = Pager::new(file, 256);
         let db = Database::create(pager).unwrap();
 
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         // Insert many rows to allocate several pages
         let tx = db.begin_transaction();
@@ -965,10 +971,15 @@ mod tests {
 
         let pages_before_drop = db.store.get_next_page_num();
 
-        db.drop_table("users").unwrap();
+        let tx = db.begin_transaction();
+        tx.drop_table("users").unwrap();
+        tx.commit().unwrap();
 
         // Re-create and re-insert — should reuse freed pages
-        db.create_table("users2", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users2", users_schema()).unwrap();
+        tx.commit().unwrap();
+
         let tx = db.begin_transaction();
         for i in 0..100 {
             tx.insert(
@@ -1005,9 +1016,11 @@ mod tests {
         let pager = Pager::new(file, 256);
         let db = Database::create(pager).unwrap();
 
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
-        db.create_index("users", "age").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.create_index("users", "age").unwrap();
+        tx.commit().unwrap();
 
         // Insert many rows to allocate pages for data + both indexes
         let tx = db.begin_transaction();
@@ -1027,12 +1040,17 @@ mod tests {
 
         let pages_before_drop = db.store.get_next_page_num();
 
-        db.drop_table("users").unwrap();
+        let tx = db.begin_transaction();
+        tx.drop_table("users").unwrap();
+        tx.commit().unwrap();
 
         // Re-create with indexes and re-insert — should reuse freed pages
-        db.create_table("users2", users_schema()).unwrap();
-        db.create_index("users2", "name").unwrap();
-        db.create_index("users2", "age").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users2", users_schema()).unwrap();
+        tx.create_index("users2", "name").unwrap();
+        tx.create_index("users2", "age").unwrap();
+        tx.commit().unwrap();
+
         let tx = db.begin_transaction();
         for i in 0..100 {
             tx.insert(
@@ -1063,10 +1081,11 @@ mod tests {
     #[test]
     fn test_create_index() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
 
-        let meta = db.find_table_meta("users").unwrap().unwrap();
+        let meta = tx.find_table_meta("users").unwrap().unwrap();
         assert_eq!(meta.index_trees.len(), 1);
         assert_eq!(meta.index_trees[0].0, "name");
     }
@@ -1074,44 +1093,50 @@ mod tests {
     #[test]
     fn test_create_index_nonexistent_column() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        let err = db.create_index("users", "email").unwrap_err();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        let err = tx.create_index("users", "email").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_create_index_duplicate() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
-        let err = db.create_index("users", "name").unwrap_err();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        let err = tx.create_index("users", "name").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_drop_index() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
-        db.drop_index("users", "name").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.drop_index("users", "name").unwrap();
 
-        let meta = db.find_table_meta("users").unwrap().unwrap();
+        let meta = tx.find_table_meta("users").unwrap().unwrap();
         assert!(meta.index_trees.is_empty());
     }
 
     #[test]
     fn test_drop_index_nonexistent() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        let err = db.drop_index("users", "name").unwrap_err();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        let err = tx.drop_index("users", "name").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_scan_by_index() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         tx.insert(
@@ -1150,7 +1175,9 @@ mod tests {
     #[test]
     fn test_scan_by_index_no_index() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let err = tx
@@ -1162,8 +1189,10 @@ mod tests {
     #[test]
     fn test_index_maintained_on_insert() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         tx.insert(
@@ -1186,8 +1215,10 @@ mod tests {
     #[test]
     fn test_index_maintained_on_delete() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let key = tx
@@ -1214,8 +1245,10 @@ mod tests {
     #[test]
     fn test_index_maintained_on_update() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let key = tx
@@ -1258,7 +1291,9 @@ mod tests {
     #[test]
     fn test_create_index_backfills_existing_data() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
 
         // Insert rows before creating the index
         let tx = db.begin_transaction();
@@ -1279,7 +1314,9 @@ mod tests {
         tx.commit().unwrap();
 
         // Create index after data exists
-        db.create_index("users", "name").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
 
         // The back-filled data should be queryable
         let tx = db.begin_transaction();
@@ -1292,8 +1329,10 @@ mod tests {
     #[test]
     fn test_drop_table_with_index() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         tx.insert(
@@ -1305,16 +1344,22 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        db.drop_table("users").unwrap();
-        assert!(db.find_table_meta("users").unwrap().is_none());
+        let tx = db.begin_transaction();
+        tx.drop_table("users").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        assert!(tx.find_table_meta("users").unwrap().is_none());
     }
 
     #[test]
     fn test_multiple_indexes_on_table() {
         let (db, _tmp) = open_db();
-        db.create_table("users", users_schema()).unwrap();
-        db.create_index("users", "name").unwrap();
-        db.create_index("users", "age").unwrap();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.create_index("users", "age").unwrap();
+        tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         tx.insert(
