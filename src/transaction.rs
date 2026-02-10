@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Bound, RangeBounds},
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 
 use rkyv::rancor::{Error, fail};
@@ -21,11 +21,11 @@ struct TransactionStoreInner {
 }
 
 pub struct TransactionStore {
-    inner: Arc<Mutex<TransactionStoreInner>>,
+    inner: Mutex<TransactionStoreInner>,
 }
 
-pub struct Transaction {
-    store: Arc<Mutex<TransactionStoreInner>>,
+pub struct Transaction<'a> {
+    store: &'a Mutex<TransactionStoreInner>,
     tx_id: usize,
 }
 
@@ -38,15 +38,15 @@ pub struct Operation {
 impl TransactionStore {
     pub fn new(btree: Btree) -> Self {
         TransactionStore {
-            inner: Arc::new(Mutex::new(TransactionStoreInner {
+            inner: Mutex::new(TransactionStoreInner {
                 btree,
                 next_tx_id: 0,
                 active_transactions: BTreeMap::new(),
-            })),
+            }),
         }
     }
 
-    pub fn begin_transaction(&self) -> Transaction {
+    pub fn begin_transaction(&self) -> Transaction<'_> {
         let mut inner = self.inner.lock().unwrap();
         let tx_id = inner.next_tx_id;
         inner.next_tx_id = inner.next_tx_id.wrapping_add(1);
@@ -59,13 +59,13 @@ impl TransactionStore {
             },
         );
         Transaction {
-            store: Arc::clone(&self.inner),
+            store: &self.inner,
             tx_id,
         }
     }
 }
 
-impl Transaction {
+impl<'a> Transaction<'a> {
     pub fn read(&self, key: Key) -> Result<Option<Vec<u8>>, Error> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
@@ -231,7 +231,7 @@ impl Transaction {
     }
 }
 
-impl Drop for Transaction {
+impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
         let mut inner = self.store.lock().unwrap();
         inner.active_transactions.remove(&self.tx_id);

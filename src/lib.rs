@@ -8,4 +8,4 @@ mod util;
 pub use pager::Pager;
 pub use transaction::{Transaction, TransactionError, TransactionStore};
 pub use tree::Btree;
-pub use types::{Internal, Key, Leaf, Node, NodePtr, ROOT_PAGE_NUM, FREE_LIST_PAGE_NUM, Value};
+pub use types::{FREE_LIST_PAGE_NUM, Internal, Key, Leaf, Node, NodePtr, ROOT_PAGE_NUM, Value};
