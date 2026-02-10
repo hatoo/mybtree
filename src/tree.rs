@@ -32,7 +32,7 @@ impl Btree {
             .write_node(ROOT_PAGE_NUM, &Node::Leaf(root_leaf))?;
 
         // Initialize free list head to u64::MAX (empty)
-        self.write_free_list_head(u64::MAX);
+        self.write_free_list_head(u64::MAX)?;
         Ok(())
     }
 
@@ -84,7 +84,7 @@ impl Btree {
                             } else {
                                 self.merge_insert(&path, &Node::Leaf(leaf))?;
                             }
-                            self.free_value_pages(&old_value_entry);
+                            self.free_value_pages(&old_value_entry)?;
                             return Ok(Some(old_bytes));
                         }
                         Err(index) => {
@@ -104,7 +104,7 @@ impl Btree {
                     };
 
                     if internal.kv.is_empty() {
-                        let new_leaf_page = self.alloc_page();
+                        let new_leaf_page = self.alloc_page()?;
                         let new_value = self.make_value(value)?;
                         let new_leaf = Leaf {
                             kv: vec![(key, new_value)],
@@ -171,7 +171,7 @@ impl Btree {
             };
             let mut kv_map: BTreeMap<_, _> = parent_internal.kv.into_iter().collect();
             for (key, node) in keyed_nodes {
-                let new_page = self.alloc_page();
+                let new_page = self.alloc_page()?;
                 self.pager.write_node(new_page, &node)?;
                 kv_map.insert(key, new_page);
             }
@@ -181,7 +181,7 @@ impl Btree {
             let new_entries = keyed_nodes
                 .into_iter()
                 .map(|(key, node)| {
-                    let new_page = self.alloc_page();
+                    let new_page = self.alloc_page()?;
                     self.pager.write_node(new_page, &node)?;
                     Ok((key, new_page))
                 })
@@ -225,7 +225,7 @@ impl Btree {
                     let old_value_entry = leaf.kv.remove(index).1;
                     self.merge_insert(&path, &Node::Leaf(leaf))?;
                     let old_bytes = self.resolve_value(&old_value_entry)?;
-                    self.free_value_pages(&old_value_entry);
+                    self.free_value_pages(&old_value_entry)?;
                     return Ok(Some(old_bytes));
                 }
                 Some(Some(next_page)) => current = next_page,
@@ -257,7 +257,7 @@ impl Btree {
                 leaf.kv.retain(|(k, _)| !range.contains(k));
                 self.merge_insert(&[node_ptr], &Node::Leaf(leaf))?;
                 for v in &removed {
-                    self.free_value_pages(v);
+                    self.free_value_pages(v)?;
                 }
             }
             Node::Internal(internal) => {
@@ -294,7 +294,7 @@ impl Btree {
                     panic!("Parent is not an internal node");
                 };
                 internal.kv.retain(|&(_, ptr)| ptr != page);
-                self.free_page(page);
+                self.free_page(page)?;
                 return self.merge_insert(parents, &Node::Internal(internal));
             }
         }
@@ -348,7 +348,7 @@ impl Btree {
             self.pager.write_buffer(page, buffer)?;
             parent_internal.kv.remove(index - 1);
             self.merge_insert(parents, &Node::Internal(parent_internal))?;
-            self.free_page(left_sibling_page);
+            self.free_page(left_sibling_page)?;
             Ok(true)
         } else {
             Ok(false)
@@ -516,7 +516,9 @@ impl Btree {
         let num_pages = (data.len() + data_per_page - 1) / data_per_page;
         assert!(num_pages > 0);
 
-        let pages: Vec<u64> = (0..num_pages).map(|_| self.alloc_page()).collect();
+        let pages: Vec<u64> = (0..num_pages)
+            .map(|_| self.alloc_page())
+            .collect::<Result<_, _>>()?;
 
         for (i, &page_num) in pages.iter().enumerate() {
             let start = i * data_per_page;
@@ -532,7 +534,7 @@ impl Btree {
             let mut buffer = vec![0u8; 8 + chunk.len()];
             buffer[..8].copy_from_slice(&next_page.to_le_bytes());
             buffer[8..].copy_from_slice(chunk);
-            self.pager.write_raw_page(page_num, &buffer);
+            self.pager.write_raw_page(page_num, &buffer)?;
         }
 
         Ok(pages[0])
@@ -546,7 +548,7 @@ impl Btree {
         let mut remaining = total_len as usize;
 
         while remaining > 0 {
-            let buffer = self.pager.read_raw_page(current_page);
+            let buffer = self.pager.read_raw_page(current_page)?;
             let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
             let chunk_len = std::cmp::min(data_per_page, remaining);
             result.extend_from_slice(&buffer[8..8 + chunk_len]);
@@ -563,68 +565,70 @@ impl Btree {
     }
 
     /// Free pages used by a `Value`, if it is an overflow value.
-    fn free_value_pages(&mut self, value: &Value) {
+    fn free_value_pages(&mut self, value: &Value) -> Result<(), Error> {
         if let Value::Overflow {
             start_page,
             total_len,
         } = value
         {
-            self.free_overflow_pages(*start_page, *total_len);
+            self.free_overflow_pages(*start_page, *total_len)?;
         }
+        Ok(())
     }
 
     /// Free all overflow pages for a chain starting at `start_page`.
-    fn free_overflow_pages(&mut self, start_page: u64, total_len: u64) {
+    fn free_overflow_pages(&mut self, start_page: u64, total_len: u64) -> Result<(), Error> {
         let data_per_page = self.overflow_data_per_page();
         let mut current_page = start_page;
         let mut remaining = total_len as usize;
 
         while remaining > 0 {
-            let buffer = self.pager.read_raw_page(current_page);
+            let buffer = self.pager.read_raw_page(current_page)?;
             let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
-            self.free_page(current_page);
+            self.free_page(current_page)?;
             let chunk_len = std::cmp::min(data_per_page, remaining);
             remaining -= chunk_len;
             current_page = next_page;
         }
+        Ok(())
     }
 
     // ---- Persisted free page list (linked list in file) ----
 
     /// Read the free list head pointer from the free list metadata page.
-    fn read_free_list_head(&mut self) -> u64 {
-        let buf = self.pager.read_raw_page(FREE_LIST_PAGE_NUM);
-        u64::from_le_bytes(buf[..8].try_into().unwrap())
+    fn read_free_list_head(&mut self) -> Result<u64, Error> {
+        let buf = self.pager.read_raw_page(FREE_LIST_PAGE_NUM)?;
+        Ok(u64::from_le_bytes(buf[..8].try_into().unwrap()))
     }
 
     /// Write the free list head pointer to the free list metadata page.
-    fn write_free_list_head(&mut self, head: u64) {
+    fn write_free_list_head(&mut self, head: u64) -> Result<(), Error> {
         let mut buf = vec![0u8; 8];
         buf[..8].copy_from_slice(&head.to_le_bytes());
-        self.pager.write_raw_page(FREE_LIST_PAGE_NUM, &buf);
+        self.pager.write_raw_page(FREE_LIST_PAGE_NUM, &buf)
     }
 
     /// Allocate a page, reusing a freed page if available, otherwise extending the file.
-    fn alloc_page(&mut self) -> u64 {
-        let head = self.read_free_list_head();
+    fn alloc_page(&mut self) -> Result<u64, Error> {
+        let head = self.read_free_list_head()?;
         if head == u64::MAX {
-            return self.pager.next_page_num();
+            return Ok(self.pager.next_page_num());
         }
         // Read the next pointer from the free page
-        let buf = self.pager.read_raw_page(head);
+        let buf = self.pager.read_raw_page(head)?;
         let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        self.write_free_list_head(next);
-        head
+        self.write_free_list_head(next)?;
+        Ok(head)
     }
 
     /// Return a page to the persisted free list.
-    fn free_page(&mut self, page_num: u64) {
-        let head = self.read_free_list_head();
+    fn free_page(&mut self, page_num: u64) -> Result<(), Error> {
+        let head = self.read_free_list_head()?;
         // Write the current head into the freed page
         let mut buf = vec![0u8; 8];
         buf[..8].copy_from_slice(&head.to_le_bytes());
-        self.pager.write_raw_page(page_num, &buf);
-        self.write_free_list_head(page_num);
+        self.pager.write_raw_page(page_num, &buf)?;
+        self.write_free_list_head(page_num)
     }
 
     #[cfg(test)]
@@ -684,14 +688,14 @@ impl Btree {
 
         // Collect all pages in the free list
         let mut free_pages = BTreeSet::new();
-        let mut head = self.read_free_list_head();
+        let mut head = self.read_free_list_head().unwrap();
         while head != u64::MAX {
             assert!(
                 free_pages.insert(head),
                 "Free list cycle detected at page {}",
                 head
             );
-            let buf = self.pager.read_raw_page(head);
+            let buf = self.pager.read_raw_page(head).unwrap();
             head = u64::from_le_bytes(buf[..8].try_into().unwrap());
         }
 
@@ -772,7 +776,7 @@ impl Btree {
                 "Overflow page {} referenced multiple times",
                 current
             );
-            let buf = self.pager.read_raw_page(current);
+            let buf = self.pager.read_raw_page(current).unwrap();
             let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
             let chunk = std::cmp::min(data_per_page, remaining);
             remaining -= chunk;
@@ -1195,7 +1199,7 @@ mod tests {
         }
         // Free list head should not be empty
         assert_ne!(
-            btree.read_free_list_head(),
+            btree.read_free_list_head().unwrap(),
             u64::MAX,
             "Expected free pages after removal"
         );
@@ -1221,7 +1225,7 @@ mod tests {
 
         btree.remove(1).unwrap();
         assert_ne!(
-            btree.read_free_list_head(),
+            btree.read_free_list_head().unwrap(),
             u64::MAX,
             "Overflow pages should be freed on remove"
         );
@@ -1245,7 +1249,7 @@ mod tests {
         // Replace with small value — overflow pages should be freed
         btree.insert(1, b"small".to_vec()).unwrap();
         assert_ne!(
-            btree.read_free_list_head(),
+            btree.read_free_list_head().unwrap(),
             u64::MAX,
             "Old overflow pages should be freed on update"
         );
@@ -1281,7 +1285,7 @@ mod tests {
             for i in 0u64..50 {
                 btree.remove(i).unwrap();
             }
-            assert_ne!(btree.read_free_list_head(), u64::MAX);
+            assert_ne!(btree.read_free_list_head().unwrap(), u64::MAX);
         }
 
         // Reopen the file — free list should still be available
@@ -1296,7 +1300,7 @@ mod tests {
             let pages_before = btree.pager.next_page_num;
 
             assert_ne!(
-                btree.read_free_list_head(),
+                btree.read_free_list_head().unwrap(),
                 u64::MAX,
                 "Free list lost after reopen"
             );

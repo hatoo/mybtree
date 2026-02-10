@@ -1,7 +1,67 @@
-use rkyv::{api::high, rancor::Error, util::AlignedVec};
-use std::os::unix::fs::FileExt;
+use rkyv::{
+    api::high,
+    rancor::{Error, Source},
+    util::AlignedVec,
+};
+use std::io;
 
 use crate::types::Node;
+
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 
 pub struct Pager {
     pub page_size: usize,
@@ -52,9 +112,8 @@ impl Pager {
     ) -> Result<T, Error> {
         let mut buffer = AlignedVec::<16>::with_capacity(self.page_size);
         buffer.resize(self.page_size, 0);
-        self.file
-            .read_exact_at(&mut buffer, page_num * self.page_size as u64)
-            .unwrap();
+        read_exact_at(&self.file, &mut buffer, page_num * self.page_size as u64)
+            .map_err(Error::new)?;
         let buffer = self.from_page(&buffer);
         let archived = high::access::<rkyv::Archived<Node>, Error>(&buffer)?;
         Ok(f(archived))
@@ -63,9 +122,8 @@ impl Pager {
     pub fn owned_node(&self, page_num: u64) -> Result<Node, Error> {
         let mut buffer = AlignedVec::<16>::with_capacity(self.page_size);
         buffer.resize(self.page_size, 0);
-        self.file
-            .read_exact_at(&mut buffer, page_num * self.page_size as u64)
-            .unwrap();
+        read_exact_at(&self.file, &mut buffer, page_num * self.page_size as u64)
+            .map_err(Error::new)?;
         let buffer = self.from_page(&buffer);
         let archived = rkyv::access::<rkyv::Archived<Node>, Error>(&buffer)?;
         let node: Node = rkyv::deserialize(archived)?;
@@ -74,9 +132,7 @@ impl Pager {
 
     pub fn write_buffer(&self, page_num: u64, mut buffer: AlignedVec<16>) -> Result<(), Error> {
         self.to_page(&mut buffer);
-        self.file
-            .write_all_at(&buffer, page_num * self.page_size as u64)
-            .unwrap();
+        write_all_at(&self.file, &buffer, page_num * self.page_size as u64).map_err(Error::new)?;
         Ok(())
     }
 
@@ -85,23 +141,21 @@ impl Pager {
         self.write_buffer(page_num, buffer)
     }
 
-    pub fn write_raw_page(&self, page_num: u64, data: &[u8]) {
+    pub fn write_raw_page(&self, page_num: u64, data: &[u8]) -> Result<(), Error> {
         assert!(data.len() <= self.page_size);
         let offset = page_num * self.page_size as u64;
-        self.file.write_all_at(data, offset).unwrap();
+        write_all_at(&self.file, data, offset).map_err(Error::new)?;
         if data.len() < self.page_size {
             let padding = vec![0u8; self.page_size - data.len()];
-            self.file
-                .write_all_at(&padding, offset + data.len() as u64)
-                .unwrap();
+            write_all_at(&self.file, &padding, offset + data.len() as u64).map_err(Error::new)?;
         }
+        Ok(())
     }
 
-    pub fn read_raw_page(&self, page_num: u64) -> Vec<u8> {
+    pub fn read_raw_page(&self, page_num: u64) -> Result<Vec<u8>, Error> {
         let mut buffer = vec![0u8; self.page_size];
-        self.file
-            .read_exact_at(&mut buffer, page_num * self.page_size as u64)
-            .unwrap();
-        buffer
+        read_exact_at(&self.file, &mut buffer, page_num * self.page_size as u64)
+            .map_err(Error::new)?;
+        Ok(buffer)
     }
 }
