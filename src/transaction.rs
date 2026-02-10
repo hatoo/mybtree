@@ -6,7 +6,7 @@ use std::{
 
 use rkyv::rancor::{Error, fail};
 
-use crate::{Btree, Key, NodePtr};
+use crate::{Btree, Key, NodePtr, Value};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransactionError {
@@ -77,6 +77,21 @@ impl TransactionStore {
     pub fn get_next_page_num(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner.btree.pager.get_next_page_num()
+    }
+
+    pub fn init_index(&self) -> Result<NodePtr, Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.btree.init_index()
+    }
+
+    pub fn drop_index_tree(&self, root: NodePtr) -> Result<(), Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.btree.free_index_tree(root)
+    }
+
+    pub fn index_insert(&self, idx_root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.btree.index_insert(idx_root, key, value)
     }
 }
 
@@ -210,6 +225,31 @@ impl<'a> Transaction<'a> {
         }
 
         Ok(())
+    }
+
+    // ── Index tree operations (applied directly to btree) ───────────
+
+    pub fn index_insert(&self, idx_root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
+        let mut inner = self.store.lock().unwrap();
+        inner.btree.index_insert(idx_root, key, value)
+    }
+
+    pub fn index_remove(&self, idx_root: NodePtr, value: &Value, key: Key) -> Result<bool, Error> {
+        let mut inner = self.store.lock().unwrap();
+        inner.btree.index_remove(idx_root, value, key)
+    }
+
+    pub fn index_read_range<R: RangeBounds<Vec<u8>>>(
+        &self,
+        idx_root: NodePtr,
+        range: R,
+    ) -> Result<Vec<Key>, Error> {
+        let mut inner = self.store.lock().unwrap();
+        let mut keys = Vec::new();
+        inner
+            .btree
+            .index_read_range(idx_root, range, |_v, k| keys.push(k))?;
+        Ok(keys)
     }
 
     pub fn commit(self) -> Result<(), Error> {
