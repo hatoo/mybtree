@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ops::RangeBounds;
 
 use rkyv::rancor::Error;
@@ -157,23 +156,9 @@ impl Database {
     }
 
     pub fn begin_transaction(&self) -> DbTransaction<'_> {
-        // Snapshot catalog metadata before starting the data transaction
-        let tx = self.store.begin_transaction();
-        let entries = tx.read_range(self.catalog_root, ..).unwrap_or_default();
-        drop(tx);
-
-        let mut tables = HashMap::new();
-        for (_key, value) in &entries {
-            if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
-                if let Ok(meta) = rkyv::deserialize::<TableMeta, Error>(archived) {
-                    tables.insert(meta.name.clone(), meta);
-                }
-            }
-        }
-
         DbTransaction {
             tx: self.store.begin_transaction(),
-            tables,
+            catalog_root: self.catalog_root,
         }
     }
 }
@@ -239,14 +224,20 @@ fn validate_row(row: &Row, schema: &Schema) -> Result<(), DatabaseError> {
 
 pub struct DbTransaction<'a> {
     tx: crate::Transaction<'a>,
-    tables: HashMap<String, TableMeta>,
+    catalog_root: NodePtr,
 }
 
 impl<'a> DbTransaction<'a> {
-    fn get_meta(&self, table_name: &str) -> Result<&TableMeta, DatabaseError> {
-        self.tables
-            .get(table_name)
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))
+    fn get_meta(&self, table_name: &str) -> Result<TableMeta, DatabaseError> {
+        let entries = self.tx.read_range(self.catalog_root, ..)?;
+        for (_key, value) in &entries {
+            if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
+                if archived.name == table_name {
+                    return Ok(rkyv::deserialize::<TableMeta, Error>(archived)?);
+                }
+            }
+        }
+        Err(DatabaseError::TableNotFound(table_name.to_string()))
     }
 
     pub fn insert(&self, table_name: &str, row: &Row) -> Result<Key, DatabaseError> {
