@@ -71,26 +71,26 @@ struct TableMeta {
 
 // ── Database ────────────────────────────────────────────────────────
 
+const CATALOG_PAGE_NUM: NodePtr = 1;
+
 pub struct Database {
     store: TransactionStore,
-    catalog_root: NodePtr,
 }
 
 impl Database {
     pub fn open(pager: Pager) -> Result<Self, DatabaseError> {
         let mut btree = Btree::new(pager);
         btree.init()?;
-        let catalog_root = btree.init_table()?;
+        btree.init_table()?;
 
         Ok(Database {
             store: TransactionStore::new(btree),
-            catalog_root,
         })
     }
 
     fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
         let tx = self.store.begin_transaction();
-        let entries = tx.read_range(self.catalog_root, ..)?;
+        let entries = tx.read_range(CATALOG_PAGE_NUM, ..)?;
         for (_key, value) in &entries {
             if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
                 if archived.name == name {
@@ -116,7 +116,7 @@ impl Database {
 
         // Persist to catalog via transaction
         let tx = self.store.begin_transaction();
-        tx.insert(self.catalog_root, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
+        tx.insert(CATALOG_PAGE_NUM, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
         tx.commit()?;
 
         Ok(())
@@ -125,7 +125,7 @@ impl Database {
     pub fn drop_table(&self, name: &str) -> Result<(), DatabaseError> {
         // Find catalog key for this table via transaction
         let tx = self.store.begin_transaction();
-        let entries = tx.read_range(self.catalog_root, ..)?;
+        let entries = tx.read_range(CATALOG_PAGE_NUM, ..)?;
         let found_key = entries.iter().find_map(|(key, value)| {
             let meta = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value).ok()?;
             if meta.name == name { Some(*key) } else { None }
@@ -133,7 +133,7 @@ impl Database {
 
         match found_key {
             Some(key) => {
-                tx.remove(self.catalog_root, key);
+                tx.remove(CATALOG_PAGE_NUM, key);
                 tx.commit()?;
                 Ok(())
             }
@@ -144,7 +144,6 @@ impl Database {
     pub fn begin_transaction(&self) -> DbTransaction<'_> {
         DbTransaction {
             tx: self.store.begin_transaction(),
-            catalog_root: self.catalog_root,
         }
     }
 }
@@ -210,12 +209,11 @@ fn validate_row(row: &Row, schema: &Schema) -> Result<(), DatabaseError> {
 
 pub struct DbTransaction<'a> {
     tx: crate::Transaction<'a>,
-    catalog_root: NodePtr,
 }
 
 impl<'a> DbTransaction<'a> {
     fn get_meta(&self, table_name: &str) -> Result<TableMeta, DatabaseError> {
-        let entries = self.tx.read_range(self.catalog_root, ..)?;
+        let entries = self.tx.read_range(CATALOG_PAGE_NUM, ..)?;
         for (_key, value) in &entries {
             if let Ok(archived) = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value) {
                 if archived.name == table_name {
