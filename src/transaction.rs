@@ -92,6 +92,28 @@ impl Transaction {
         }
     }
 
+    pub fn insert(&self, value: Vec<u8>) -> Result<Key, Error> {
+        let mut inner = self.store.lock().unwrap();
+        let mut key = inner.btree.available_key()?;
+
+        // Also consider keys from all active transactions' writes
+        for op in inner.active_transactions.values() {
+            if let Some(&max_write_key) = op.writes.keys().rev().find(|&&k| op.writes[&k].is_some())
+            {
+                let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
+                if candidate > key {
+                    key = candidate;
+                }
+            }
+        }
+
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            op.writes.insert(key, Some(value));
+        }
+
+        Ok(key)
+    }
+
     pub fn read_range(&self, range: impl RangeBounds<Key>) -> Result<Vec<(Key, Vec<u8>)>, Error> {
         let mut inner = self.store.lock().unwrap();
 
@@ -804,5 +826,71 @@ mod tests {
 
         // tx1 commits: its range_reads cover 1..=10, tx2 writes to 5 which is in range -> conflict
         assert!(tx1.commit().is_err());
+    }
+
+    #[test]
+    fn test_insert_returns_unique_key() {
+        let (store, _temp) = setup_transaction_store();
+
+        let tx = store.begin_transaction();
+        let k1 = tx.insert(vec![1]).unwrap();
+        let k2 = tx.insert(vec![2]).unwrap();
+        let k3 = tx.insert(vec![3]).unwrap();
+
+        assert_ne!(k1, k2);
+        assert_ne!(k2, k3);
+        assert_eq!(tx.read(k1).unwrap(), Some(vec![1]));
+        assert_eq!(tx.read(k2).unwrap(), Some(vec![2]));
+        assert_eq!(tx.read(k3).unwrap(), Some(vec![3]));
+    }
+
+    #[test]
+    fn test_insert_after_existing_keys() {
+        let (store, _temp) = setup_transaction_store();
+
+        {
+            let tx = store.begin_transaction();
+            tx.write(10, vec![10]);
+            assert!(tx.commit().is_ok());
+        }
+
+        let tx = store.begin_transaction();
+        let key = tx.insert(vec![42]).unwrap();
+        assert!(key > 10);
+        assert_eq!(tx.read(key).unwrap(), Some(vec![42]));
+        assert!(tx.commit().is_ok());
+    }
+
+    #[test]
+    fn test_insert_concurrent_no_conflict() {
+        let (store, _temp) = setup_transaction_store();
+
+        let tx1 = store.begin_transaction();
+        let tx2 = store.begin_transaction();
+
+        let k1 = tx1.insert(vec![1]).unwrap();
+        let k2 = tx2.insert(vec![2]).unwrap();
+
+        // Keys should be different, so no conflict
+        assert_ne!(k1, k2);
+        assert!(tx1.commit().is_ok());
+        assert!(tx2.commit().is_ok());
+    }
+
+    #[test]
+    fn test_insert_persists_after_commit() {
+        let (store, _temp) = setup_transaction_store();
+
+        let key;
+        {
+            let tx = store.begin_transaction();
+            key = tx.insert(vec![99]).unwrap();
+            assert!(tx.commit().is_ok());
+        }
+
+        {
+            let tx = store.begin_transaction();
+            assert_eq!(tx.read(key).unwrap(), Some(vec![99]));
+        }
     }
 }
