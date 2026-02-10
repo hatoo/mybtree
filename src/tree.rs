@@ -666,6 +666,119 @@ impl Btree {
 
         Ok(())
     }
+
+    /// Check for page leaks. Walks the tree and free list, verifying every page
+    /// in [0, next_page_num) is accounted for exactly once.
+    /// Panics with a detailed message if any leaked or double-used pages are found.
+    #[cfg(test)]
+    pub fn assert_no_page_leak(&mut self) {
+        use std::collections::BTreeSet;
+
+        let total_pages = self.pager.next_page_num;
+
+        // Collect all pages reachable from the tree
+        let mut tree_pages = BTreeSet::new();
+        tree_pages.insert(ROOT_PAGE_NUM);
+        tree_pages.insert(FREE_LIST_PAGE_NUM);
+        self.collect_tree_pages(ROOT_PAGE_NUM, &mut tree_pages);
+
+        // Collect all pages in the free list
+        let mut free_pages = BTreeSet::new();
+        let mut head = self.read_free_list_head();
+        while head != u64::MAX {
+            assert!(
+                free_pages.insert(head),
+                "Free list cycle detected at page {}",
+                head
+            );
+            let buf = self.pager.read_raw_page(head);
+            head = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        }
+
+        // Check for overlap
+        let overlap: Vec<_> = tree_pages.intersection(&free_pages).collect();
+        assert!(
+            overlap.is_empty(),
+            "Pages in both tree and free list: {:?}",
+            overlap
+        );
+
+        // Check all pages are accounted for
+        let mut all_pages: BTreeSet<u64> = (0..total_pages).collect();
+        for &p in &tree_pages {
+            all_pages.remove(&p);
+        }
+        for &p in &free_pages {
+            all_pages.remove(&p);
+        }
+        assert!(
+            all_pages.is_empty(),
+            "Leaked pages (not in tree or free list): {:?} (tree={}, free={}, total={})",
+            all_pages,
+            tree_pages.len(),
+            free_pages.len(),
+            total_pages
+        );
+    }
+
+    /// Recursively collect all pages used by the tree rooted at `page_num`,
+    /// including overflow pages.
+    #[cfg(test)]
+    fn collect_tree_pages(
+        &mut self,
+        page_num: NodePtr,
+        pages: &mut std::collections::BTreeSet<u64>,
+    ) {
+        let node = self.pager.owned_node(page_num).unwrap();
+        match node {
+            Node::Leaf(leaf) => {
+                for (_, v) in &leaf.kv {
+                    if let Value::Overflow {
+                        start_page,
+                        total_len,
+                    } = v
+                    {
+                        self.collect_overflow_pages(*start_page, *total_len, pages);
+                    }
+                }
+            }
+            Node::Internal(internal) => {
+                for (_, ptr) in &internal.kv {
+                    assert!(
+                        pages.insert(*ptr),
+                        "Page {} referenced multiple times in tree",
+                        ptr
+                    );
+                    self.collect_tree_pages(*ptr, pages);
+                }
+            }
+        }
+    }
+
+    /// Collect all overflow pages in a chain.
+    #[cfg(test)]
+    fn collect_overflow_pages(
+        &mut self,
+        start_page: u64,
+        total_len: u64,
+        pages: &mut std::collections::BTreeSet<u64>,
+    ) {
+        let data_per_page = self.overflow_data_per_page();
+        let mut current = start_page;
+        let mut remaining = total_len as usize;
+        while remaining > 0 {
+            assert!(
+                pages.insert(current),
+                "Overflow page {} referenced multiple times",
+                current
+            );
+            let buf = self.pager.read_raw_page(current);
+            let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            let chunk = std::cmp::min(data_per_page, remaining);
+            remaining -= chunk;
+            current = next;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1197,5 +1310,112 @@ mod tests {
                 "File grew after reopen despite free pages"
             );
         }
+    }
+
+    #[test]
+    fn test_no_leak_insert_only() {
+        let mut btree = new_btree(64);
+        for i in 0u64..256 {
+            btree.insert(i, format!("v-{}", i).into_bytes()).unwrap();
+        }
+        btree.assert_no_page_leak();
+    }
+
+    #[test]
+    fn test_no_leak_insert_and_remove_all() {
+        let mut btree = new_btree(64);
+        for i in 0u64..200 {
+            btree.insert(i, vec![0u8; 16]).unwrap();
+        }
+        for i in 0u64..200 {
+            btree.remove(i).unwrap();
+        }
+        btree.assert_no_page_leak();
+    }
+
+    #[test]
+    fn test_no_leak_insert_remove_shuffle() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let mut btree = new_btree(64);
+
+        let mut keys: Vec<u64> = (0..500).collect();
+        keys.shuffle(&mut rng);
+        for &k in &keys {
+            btree.insert(k, format!("val-{}", k).into_bytes()).unwrap();
+        }
+
+        keys.shuffle(&mut rng);
+        for &k in &keys {
+            btree.remove(k).unwrap();
+        }
+        btree.assert_no_page_leak();
+    }
+
+    #[test]
+    fn test_no_leak_remove_range() {
+        let mut btree = build_btree(200);
+        btree.remove_range(50..=150).unwrap();
+        btree.assert_no_page_leak();
+    }
+
+    #[test]
+    fn test_no_leak_remove_range_all() {
+        let mut btree = build_btree(200);
+        btree.remove_range(0..=199).unwrap();
+        btree.assert_no_page_leak();
+    }
+
+    #[test]
+    fn test_no_leak_overflow_insert_remove() {
+        let mut btree = new_btree(256);
+        for i in 0u64..10 {
+            let big = vec![i as u8; 1024 + i as usize * 100];
+            btree.insert(i, big).unwrap();
+        }
+        btree.assert_no_page_leak();
+
+        for i in 0u64..10 {
+            btree.remove(i).unwrap();
+        }
+        btree.assert_no_page_leak();
+    }
+
+    #[test]
+    fn test_no_leak_overflow_update() {
+        let mut btree = new_btree(256);
+        btree.insert(1, vec![42u8; 4096]).unwrap();
+        btree.assert_no_page_leak();
+
+        // Replace overflow with small
+        btree.insert(1, b"small".to_vec()).unwrap();
+        btree.assert_no_page_leak();
+
+        // Replace small with overflow
+        btree.insert(1, vec![99u8; 4096]).unwrap();
+        btree.assert_no_page_leak();
+
+        // Replace overflow with different overflow
+        btree.insert(1, vec![77u8; 8192]).unwrap();
+        btree.assert_no_page_leak();
+    }
+
+    #[test]
+    fn test_no_leak_mixed_operations() {
+        let mut btree = new_btree(128);
+
+        for round in 0..5 {
+            let base = round * 100;
+            for i in 0u64..100 {
+                btree.insert(base + i, vec![0u8; 32]).unwrap();
+            }
+            let start = base + 20;
+            let end = base + 80;
+            btree.remove_range(start..=end).unwrap();
+            btree.assert_no_page_leak();
+        }
+
+        // Remove everything
+        btree.remove_range(..).unwrap();
+        btree.assert_no_page_leak();
     }
 }
