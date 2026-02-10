@@ -36,8 +36,13 @@ impl Btree {
         Ok(())
     }
 
-    pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
-        let mut current = ROOT_PAGE_NUM;
+    pub fn insert(
+        &mut self,
+        root: NodePtr,
+        key: Key,
+        value: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let mut current = root;
         let mut path = vec![];
 
         enum NextNode {
@@ -80,9 +85,9 @@ impl Btree {
                             leaf.kv[index].1 = new_value;
 
                             if grew {
-                                self.split_insert(&path, &Node::Leaf(leaf))?;
+                                self.split_insert(root, &path, &Node::Leaf(leaf))?;
                             } else {
-                                self.merge_insert(&path, &Node::Leaf(leaf))?;
+                                self.merge_insert(root, &path, &Node::Leaf(leaf))?;
                             }
                             self.free_value_pages(&old_value_entry)?;
                             return Ok(Some(old_bytes));
@@ -90,7 +95,7 @@ impl Btree {
                         Err(index) => {
                             let new_value = self.make_value(value)?;
                             leaf.kv.insert(index, (key, new_value));
-                            self.split_insert(&path, &Node::Leaf(leaf))?;
+                            self.split_insert(root, &path, &Node::Leaf(leaf))?;
                             return Ok(None);
                         }
                     }
@@ -128,7 +133,12 @@ impl Btree {
         }
     }
 
-    fn split_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
+    fn split_insert(
+        &mut self,
+        root: NodePtr,
+        path: &[NodePtr],
+        insert: &Node,
+    ) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(insert)?;
 
         let page = *path.last().unwrap();
@@ -151,13 +161,14 @@ impl Btree {
                 .collect(),
         };
 
-        self.write_splits(keyed_nodes, page, parents)
+        self.write_splits(root, keyed_nodes, page, parents)
     }
 
     /// Write split nodes to pages and update the parent.
     /// The last node in `keyed_nodes` is written to `page`; the rest get new pages.
     fn write_splits(
         &mut self,
+        root: NodePtr,
         mut keyed_nodes: Vec<(Key, Node)>,
         page: NodePtr,
         parents: &[NodePtr],
@@ -176,7 +187,7 @@ impl Btree {
                 kv_map.insert(key, new_page);
             }
             parent_internal.kv = kv_map.into_iter().collect();
-            self.split_insert(parents, &Node::Internal(parent_internal))
+            self.split_insert(root, parents, &Node::Internal(parent_internal))
         } else {
             let new_entries = keyed_nodes
                 .into_iter()
@@ -186,15 +197,12 @@ impl Btree {
                     Ok((key, new_page))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
-            self.split_insert(
-                &[ROOT_PAGE_NUM],
-                &Node::Internal(Internal { kv: new_entries }),
-            )
+            self.split_insert(root, &[root], &Node::Internal(Internal { kv: new_entries }))
         }
     }
 
-    pub fn remove(&mut self, key: Key) -> Result<Option<Vec<u8>>, Error> {
-        let mut current = ROOT_PAGE_NUM;
+    pub fn remove(&mut self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, Error> {
+        let mut current = root;
         let mut path = vec![];
 
         loop {
@@ -223,7 +231,7 @@ impl Btree {
                         .binary_search_by_key(&key, |t| t.0)
                         .expect("Key not found in leaf node");
                     let old_value_entry = leaf.kv.remove(index).1;
-                    self.merge_insert(&path, &Node::Leaf(leaf))?;
+                    self.merge_insert(root, &path, &Node::Leaf(leaf))?;
                     let old_bytes = self.resolve_value(&old_value_entry)?;
                     self.free_value_pages(&old_value_entry)?;
                     return Ok(Some(old_bytes));
@@ -234,12 +242,17 @@ impl Btree {
         }
     }
 
-    pub fn remove_range(&mut self, range: impl RangeBounds<Key>) -> Result<(), Error> {
-        self.remove_range_at(ROOT_PAGE_NUM, &range, 0)
+    pub fn remove_range(
+        &mut self,
+        root: NodePtr,
+        range: impl RangeBounds<Key>,
+    ) -> Result<(), Error> {
+        self.remove_range_at(root, root, &range, 0)
     }
 
     fn remove_range_at(
         &mut self,
+        root: NodePtr,
         node_ptr: NodePtr,
         range: &impl RangeBounds<Key>,
         left_key: Key,
@@ -255,7 +268,7 @@ impl Btree {
                     .map(|(_, v)| v.clone())
                     .collect();
                 leaf.kv.retain(|(k, _)| !range.contains(k));
-                self.merge_insert(&[node_ptr], &Node::Leaf(leaf))?;
+                self.merge_insert(root, &[node_ptr], &Node::Leaf(leaf))?;
                 for v in &removed {
                     self.free_value_pages(v)?;
                 }
@@ -264,7 +277,7 @@ impl Btree {
                 let mut left_key = left_key;
                 for (key, ptr) in &internal.kv {
                     if is_overlap(&(left_key..=*key), range) {
-                        self.remove_range_at(*ptr, range, left_key)?;
+                        self.remove_range_at(root, *ptr, range, left_key)?;
                     }
                     left_key = *key;
                 }
@@ -274,7 +287,12 @@ impl Btree {
         Ok(())
     }
 
-    fn merge_insert(&mut self, path: &[NodePtr], insert: &Node) -> Result<(), Error> {
+    fn merge_insert(
+        &mut self,
+        root: NodePtr,
+        path: &[NodePtr],
+        insert: &Node,
+    ) -> Result<(), Error> {
         let buffer = rkyv::to_bytes(insert)?;
 
         let page = *path.last().unwrap();
@@ -295,12 +313,12 @@ impl Btree {
                 };
                 internal.kv.retain(|&(_, ptr)| ptr != page);
                 self.free_page(page)?;
-                return self.merge_insert(parents, &Node::Internal(internal));
+                return self.merge_insert(root, parents, &Node::Internal(internal));
             }
         }
 
         let parents = &path[..path.len() - 1];
-        if !self.try_merge_with_left_sibling(page, insert, parents)? {
+        if !self.try_merge_with_left_sibling(root, page, insert, parents)? {
             self.pager.write_node(page, insert)?;
         }
         Ok(())
@@ -310,6 +328,7 @@ impl Btree {
     /// Returns `true` if the merge was performed, `false` otherwise.
     fn try_merge_with_left_sibling(
         &mut self,
+        root: NodePtr,
         page: NodePtr,
         insert: &Node,
         parents: &[NodePtr],
@@ -347,7 +366,7 @@ impl Btree {
         if buffer.len() <= self.pager.page_content_size() {
             self.pager.write_buffer(page, buffer)?;
             parent_internal.kv.remove(index - 1);
-            self.merge_insert(parents, &Node::Internal(parent_internal))?;
+            self.merge_insert(root, parents, &Node::Internal(parent_internal))?;
             self.free_page(left_sibling_page)?;
             Ok(true)
         } else {
@@ -355,14 +374,19 @@ impl Btree {
         }
     }
 
-    pub fn read<T>(&mut self, key: Key, f: impl FnOnce(Option<&[u8]>) -> T) -> Result<T, Error> {
+    pub fn read<T>(
+        &mut self,
+        root: NodePtr,
+        key: Key,
+        f: impl FnOnce(Option<&[u8]>) -> T,
+    ) -> Result<T, Error> {
         enum ReadAction<T> {
             Done(T),
             Next(NodePtr),
             Overflow { start_page: u64, total_len: u64 },
         }
 
-        let mut current = ROOT_PAGE_NUM;
+        let mut current = root;
 
         let mut ff = Some(f);
         let f = &mut ff;
@@ -412,10 +436,11 @@ impl Btree {
 
     pub fn read_range<R: RangeBounds<Key>>(
         &mut self,
+        root: NodePtr,
         range: R,
         mut f: impl FnMut(Key, &[u8]),
     ) -> Result<(), Error> {
-        self.read_range_at(ROOT_PAGE_NUM, &range, &mut (f), 0)
+        self.read_range_at(root, &range, &mut (f), 0)
     }
 
     fn read_range_at<R: RangeBounds<Key>>(
@@ -458,9 +483,9 @@ impl Btree {
         Ok(())
     }
 
-    pub fn available_key(&mut self) -> Result<Key, Error> {
+    pub fn available_key(&mut self, root: NodePtr) -> Result<Key, Error> {
         self.pager
-            .read_node(ROOT_PAGE_NUM, |archived_node| match archived_node {
+            .read_node(root, |archived_node| match archived_node {
                 Archived::<Node>::Leaf(leaf) => {
                     if let Some(t) = leaf.kv.last() {
                         t.0.to_native().checked_add(1).unwrap_or(u64::MAX)
@@ -808,24 +833,30 @@ mod tests {
         for i in 0..count {
             let mut value = vec![0u8; 64];
             value[0..8].copy_from_slice(&i.to_le_bytes());
-            btree.insert(i, value).unwrap();
+            btree.insert(ROOT_PAGE_NUM, i, value).unwrap();
         }
         btree
     }
 
     fn read_range_keys<R: RangeBounds<Key>>(btree: &mut Btree, range: R) -> Vec<Key> {
         let mut keys = Vec::new();
-        btree.read_range(range, |k, _| keys.push(k)).unwrap();
+        btree
+            .read_range(ROOT_PAGE_NUM, range, |k, _| keys.push(k))
+            .unwrap();
         keys
     }
 
     fn read_value(btree: &mut Btree, key: Key) -> Option<Vec<u8>> {
-        btree.read(key, |v| v.map(|b| b.to_vec())).unwrap()
+        btree
+            .read(ROOT_PAGE_NUM, key, |v| v.map(|b| b.to_vec()))
+            .unwrap()
     }
 
     fn assert_read_eq(btree: &mut Btree, key: Key, expected: &[u8]) {
         assert!(
-            btree.read(key, |v| v == Some(expected)).unwrap(),
+            btree
+                .read(ROOT_PAGE_NUM, key, |v| v == Some(expected))
+                .unwrap(),
             "Key {} value mismatch",
             key
         );
@@ -833,7 +864,7 @@ mod tests {
 
     fn assert_key_exists(btree: &mut Btree, key: Key) {
         assert!(
-            btree.read(key, |v| v.is_some()).unwrap(),
+            btree.read(ROOT_PAGE_NUM, key, |v| v.is_some()).unwrap(),
             "Key {} should exist",
             key
         );
@@ -841,7 +872,7 @@ mod tests {
 
     fn assert_key_absent(btree: &mut Btree, key: Key) {
         assert!(
-            btree.read(key, |v| v.is_none()).unwrap(),
+            btree.read(ROOT_PAGE_NUM, key, |v| v.is_none()).unwrap(),
             "Key {} should be absent",
             key
         );
@@ -862,7 +893,7 @@ mod tests {
     #[test]
     fn test_insert() {
         let mut btree = new_btree(4096);
-        btree.insert(1, b"one".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, b"one".to_vec()).unwrap();
     }
 
     #[test]
@@ -883,7 +914,9 @@ mod tests {
     #[test]
     fn test_insert_and_read() {
         let mut btree = new_btree(4096);
-        btree.insert(42, b"forty-two".to_vec()).unwrap();
+        btree
+            .insert(ROOT_PAGE_NUM, 42, b"forty-two".to_vec())
+            .unwrap();
         assert_read_eq(&mut btree, 42, b"forty-two");
     }
 
@@ -894,7 +927,7 @@ mod tests {
 
         for i in 0u64..256 {
             let value = format!("value-{}", i).as_bytes().to_vec();
-            btree.insert(i, value.clone()).unwrap();
+            btree.insert(ROOT_PAGE_NUM, i, value.clone()).unwrap();
             map.insert(i, value);
 
             for j in 0u64..=i {
@@ -908,15 +941,18 @@ mod tests {
     fn test_remove() {
         let mut btree = new_btree(64);
 
-        btree.insert(1, b"one".to_vec()).unwrap();
-        btree.insert(2, b"two".to_vec()).unwrap();
-        btree.insert(3, b"three".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, b"one".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 2, b"two".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 3, b"three".to_vec()).unwrap();
 
-        assert_eq!(btree.remove(2).unwrap(), Some(b"two".to_vec()));
+        assert_eq!(
+            btree.remove(ROOT_PAGE_NUM, 2).unwrap(),
+            Some(b"two".to_vec())
+        );
         assert_key_absent(&mut btree, 2);
         assert_read_eq(&mut btree, 1, b"one");
         assert_read_eq(&mut btree, 3, b"three");
-        assert_eq!(btree.remove(999).unwrap(), None);
+        assert_eq!(btree.remove(ROOT_PAGE_NUM, 999).unwrap(), None);
     }
 
     #[test]
@@ -933,13 +969,13 @@ mod tests {
 
         for i in insert {
             btree
-                .insert(i, format!("value-{}", i).as_bytes().to_vec())
+                .insert(ROOT_PAGE_NUM, i, format!("value-{}", i).as_bytes().to_vec())
                 .unwrap();
         }
 
         for i in remove {
             assert_eq!(
-                btree.remove(i).unwrap(),
+                btree.remove(ROOT_PAGE_NUM, i).unwrap(),
                 Some(format!("value-{}", i).as_bytes().to_vec()),
                 "Failed to remove key {}",
                 i
@@ -991,7 +1027,7 @@ mod tests {
     #[test]
     fn test_remove_range_inclusive() {
         let mut btree = build_btree(100);
-        btree.remove_range(10..=20).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 10..=20).unwrap();
 
         assert_keys_absent(&mut btree, 10..=20);
         assert_keys_exist(&mut btree, 0..10);
@@ -1002,7 +1038,7 @@ mod tests {
     fn test_remove_range_exclusive_start() {
         let mut btree = build_btree(100);
         btree
-            .remove_range((Bound::Excluded(10), Bound::Included(20)))
+            .remove_range(ROOT_PAGE_NUM, (Bound::Excluded(10), Bound::Included(20)))
             .unwrap();
 
         assert_key_exists(&mut btree, 10);
@@ -1014,7 +1050,7 @@ mod tests {
     #[test]
     fn test_remove_range_unbounded_end() {
         let mut btree = build_btree(100);
-        btree.remove_range(80..).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 80..).unwrap();
 
         assert_keys_absent(&mut btree, 80..100);
         assert_keys_exist(&mut btree, 0..80);
@@ -1023,7 +1059,7 @@ mod tests {
     #[test]
     fn test_remove_range_unbounded_start() {
         let mut btree = build_btree(100);
-        btree.remove_range(..=20).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, ..=20).unwrap();
 
         assert_keys_absent(&mut btree, 0..=20);
         assert_keys_exist(&mut btree, 21..100);
@@ -1032,21 +1068,21 @@ mod tests {
     #[test]
     fn test_remove_range_nonexistent() {
         let mut btree = build_btree(100);
-        btree.remove_range(200..=300).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 200..=300).unwrap();
         assert_keys_exist(&mut btree, 0..100);
     }
 
     #[test]
     fn test_remove_range_empty() {
         let mut btree = build_btree(100);
-        btree.remove_range(50..50).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 50..50).unwrap();
         assert_keys_exist(&mut btree, 0..100);
     }
 
     #[test]
     fn test_remove_range_all_keys() {
         let mut btree = build_btree(100);
-        btree.remove_range(0..=99).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 0..=99).unwrap();
         assert_keys_absent(&mut btree, 0..100);
     }
 
@@ -1054,10 +1090,10 @@ mod tests {
     fn test_remove_range_multiple_calls() {
         let mut btree = build_btree(100);
 
-        btree.remove_range(10..=20).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 10..=20).unwrap();
         assert_keys_absent(&mut btree, 10..=20);
 
-        btree.remove_range(50..=60).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 50..=60).unwrap();
         assert_keys_absent(&mut btree, 10..=20);
         assert_keys_absent(&mut btree, 50..=60);
         assert_keys_exist(&mut btree, 0..10);
@@ -1068,7 +1104,7 @@ mod tests {
     #[test]
     fn test_remove_range_verify_read_range() {
         let mut btree = build_btree(100);
-        btree.remove_range(30..=70).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 30..=70).unwrap();
 
         let keys = read_range_keys(&mut btree, 0..=99);
         let mut expected = (0..30).collect::<Vec<_>>();
@@ -1079,7 +1115,7 @@ mod tests {
     #[test]
     fn test_remove_range_large_dataset() {
         let mut btree = build_btree(1000);
-        btree.remove_range(250..=750).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 250..=750).unwrap();
 
         assert_keys_absent(&mut btree, 250..=750);
         assert_keys_exist(&mut btree, 0..250);
@@ -1090,7 +1126,7 @@ mod tests {
     fn test_big_value_insert_and_read() {
         let mut btree = new_btree(256);
         let big_value = vec![42u8; 4096];
-        btree.insert(1, big_value.clone()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, big_value.clone()).unwrap();
         assert_eq!(read_value(&mut btree, 1), Some(big_value));
     }
 
@@ -1098,10 +1134,14 @@ mod tests {
     fn test_big_value_with_small_values() {
         let mut btree = new_btree(256);
 
-        btree.insert(0, b"small-before".to_vec()).unwrap();
+        btree
+            .insert(ROOT_PAGE_NUM, 0, b"small-before".to_vec())
+            .unwrap();
         let big_value = vec![42u8; 4096];
-        btree.insert(1, big_value.clone()).unwrap();
-        btree.insert(2, b"small-after".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, big_value.clone()).unwrap();
+        btree
+            .insert(ROOT_PAGE_NUM, 2, b"small-after".to_vec())
+            .unwrap();
 
         assert_read_eq(&mut btree, 0, b"small-before");
         assert_eq!(read_value(&mut btree, 1), Some(big_value));
@@ -1113,10 +1153,12 @@ mod tests {
         let mut btree = new_btree(256);
 
         let big_value = vec![42u8; 4096];
-        btree.insert(1, big_value.clone()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, big_value.clone()).unwrap();
 
         let bigger_value = vec![99u8; 8192];
-        let old = btree.insert(1, bigger_value.clone()).unwrap();
+        let old = btree
+            .insert(ROOT_PAGE_NUM, 1, bigger_value.clone())
+            .unwrap();
         assert_eq!(old, Some(big_value));
         assert_eq!(read_value(&mut btree, 1), Some(bigger_value));
     }
@@ -1126,9 +1168,9 @@ mod tests {
         let mut btree = new_btree(256);
 
         let big_value = vec![42u8; 4096];
-        btree.insert(1, big_value.clone()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, big_value.clone()).unwrap();
 
-        assert_eq!(btree.remove(1).unwrap(), Some(big_value));
+        assert_eq!(btree.remove(ROOT_PAGE_NUM, 1).unwrap(), Some(big_value));
         assert_key_absent(&mut btree, 1);
     }
 
@@ -1136,14 +1178,16 @@ mod tests {
     fn test_big_value_read_range() {
         let mut btree = new_btree(256);
 
-        btree.insert(0, b"small".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 0, b"small".to_vec()).unwrap();
         let big_value = vec![42u8; 2048];
-        btree.insert(1, big_value.clone()).unwrap();
-        btree.insert(2, b"also-small".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, big_value.clone()).unwrap();
+        btree
+            .insert(ROOT_PAGE_NUM, 2, b"also-small".to_vec())
+            .unwrap();
 
         let mut results = Vec::new();
         btree
-            .read_range(0..=2, |k, v| results.push((k, v.to_vec())))
+            .read_range(ROOT_PAGE_NUM, 0..=2, |k, v| results.push((k, v.to_vec())))
             .unwrap();
 
         assert_eq!(results.len(), 3);
@@ -1159,7 +1203,7 @@ mod tests {
         let mut expected = HashMap::new();
         for i in 0u64..20 {
             let big_value = vec![i as u8; 1024 + (i as usize * 100)];
-            btree.insert(i, big_value.clone()).unwrap();
+            btree.insert(ROOT_PAGE_NUM, i, big_value.clone()).unwrap();
             expected.insert(i, big_value);
         }
 
@@ -1178,9 +1222,9 @@ mod tests {
         let mut btree = new_btree(256);
 
         let big_value = vec![42u8; 4096];
-        btree.insert(1, big_value.clone()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, big_value.clone()).unwrap();
 
-        let old = btree.insert(1, b"tiny".to_vec()).unwrap();
+        let old = btree.insert(ROOT_PAGE_NUM, 1, b"tiny".to_vec()).unwrap();
         assert_eq!(old, Some(big_value));
         assert_read_eq(&mut btree, 1, b"tiny");
     }
@@ -1189,13 +1233,13 @@ mod tests {
     fn test_free_pages_reused_after_remove() {
         let mut btree = new_btree(4096);
         for i in 0u64..100 {
-            btree.insert(i, vec![0u8; 64]).unwrap();
+            btree.insert(ROOT_PAGE_NUM, i, vec![0u8; 64]).unwrap();
         }
         let pages_after_insert = btree.pager.next_page_num;
 
         // Remove all keys — freed pages should accumulate
         for i in 0u64..100 {
-            btree.remove(i).unwrap();
+            btree.remove(ROOT_PAGE_NUM, i).unwrap();
         }
         // Free list head should not be empty
         assert_ne!(
@@ -1206,7 +1250,7 @@ mod tests {
 
         // Re-insert — file should not grow (pages reused)
         for i in 0u64..100 {
-            btree.insert(i, vec![0u8; 64]).unwrap();
+            btree.insert(ROOT_PAGE_NUM, i, vec![0u8; 64]).unwrap();
         }
         assert!(
             btree.pager.next_page_num <= pages_after_insert + 1,
@@ -1220,10 +1264,10 @@ mod tests {
     fn test_free_overflow_pages_on_remove() {
         let mut btree = new_btree(256);
         let big_value = vec![42u8; 4096];
-        btree.insert(1, big_value).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, big_value).unwrap();
         let pages_before = btree.pager.next_page_num;
 
-        btree.remove(1).unwrap();
+        btree.remove(ROOT_PAGE_NUM, 1).unwrap();
         assert_ne!(
             btree.read_free_list_head().unwrap(),
             u64::MAX,
@@ -1232,7 +1276,7 @@ mod tests {
 
         // Re-insert a big value — should reuse freed overflow pages
         let big_value2 = vec![99u8; 4096];
-        btree.insert(2, big_value2).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 2, big_value2).unwrap();
         assert!(
             btree.pager.next_page_num <= pages_before + 1,
             "Overflow pages were not reused"
@@ -1243,11 +1287,11 @@ mod tests {
     fn test_free_overflow_pages_on_update() {
         let mut btree = new_btree(256);
         let big_value = vec![42u8; 4096];
-        btree.insert(1, big_value).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, big_value).unwrap();
         let pages_before = btree.pager.next_page_num;
 
         // Replace with small value — overflow pages should be freed
-        btree.insert(1, b"small".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, b"small".to_vec()).unwrap();
         assert_ne!(
             btree.read_free_list_head().unwrap(),
             u64::MAX,
@@ -1256,7 +1300,7 @@ mod tests {
 
         // Allocating a big value again should reuse pages
         let big_value2 = vec![99u8; 4096];
-        btree.insert(2, big_value2).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 2, big_value2).unwrap();
         assert!(
             btree.pager.next_page_num <= pages_before + 1,
             "Old overflow pages were not reused on update"
@@ -1280,10 +1324,10 @@ mod tests {
             btree.init().unwrap();
 
             for i in 0u64..50 {
-                btree.insert(i, vec![0u8; 64]).unwrap();
+                btree.insert(ROOT_PAGE_NUM, i, vec![0u8; 64]).unwrap();
             }
             for i in 0u64..50 {
-                btree.remove(i).unwrap();
+                btree.remove(ROOT_PAGE_NUM, i).unwrap();
             }
             assert_ne!(btree.read_free_list_head().unwrap(), u64::MAX);
         }
@@ -1307,7 +1351,7 @@ mod tests {
 
             // New inserts should reuse freed pages
             for i in 0u64..50 {
-                btree.insert(i, vec![0u8; 64]).unwrap();
+                btree.insert(ROOT_PAGE_NUM, i, vec![0u8; 64]).unwrap();
             }
             assert!(
                 btree.pager.next_page_num <= pages_before,
@@ -1320,7 +1364,9 @@ mod tests {
     fn test_no_leak_insert_only() {
         let mut btree = new_btree(64);
         for i in 0u64..256 {
-            btree.insert(i, format!("v-{}", i).into_bytes()).unwrap();
+            btree
+                .insert(ROOT_PAGE_NUM, i, format!("v-{}", i).into_bytes())
+                .unwrap();
         }
         btree.assert_no_page_leak();
     }
@@ -1329,10 +1375,10 @@ mod tests {
     fn test_no_leak_insert_and_remove_all() {
         let mut btree = new_btree(64);
         for i in 0u64..200 {
-            btree.insert(i, vec![0u8; 16]).unwrap();
+            btree.insert(ROOT_PAGE_NUM, i, vec![0u8; 16]).unwrap();
         }
         for i in 0u64..200 {
-            btree.remove(i).unwrap();
+            btree.remove(ROOT_PAGE_NUM, i).unwrap();
         }
         btree.assert_no_page_leak();
     }
@@ -1345,12 +1391,14 @@ mod tests {
         let mut keys: Vec<u64> = (0..500).collect();
         keys.shuffle(&mut rng);
         for &k in &keys {
-            btree.insert(k, format!("val-{}", k).into_bytes()).unwrap();
+            btree
+                .insert(ROOT_PAGE_NUM, k, format!("val-{}", k).into_bytes())
+                .unwrap();
         }
 
         keys.shuffle(&mut rng);
         for &k in &keys {
-            btree.remove(k).unwrap();
+            btree.remove(ROOT_PAGE_NUM, k).unwrap();
         }
         btree.assert_no_page_leak();
     }
@@ -1358,14 +1406,14 @@ mod tests {
     #[test]
     fn test_no_leak_remove_range() {
         let mut btree = build_btree(200);
-        btree.remove_range(50..=150).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 50..=150).unwrap();
         btree.assert_no_page_leak();
     }
 
     #[test]
     fn test_no_leak_remove_range_all() {
         let mut btree = build_btree(200);
-        btree.remove_range(0..=199).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, 0..=199).unwrap();
         btree.assert_no_page_leak();
     }
 
@@ -1374,12 +1422,12 @@ mod tests {
         let mut btree = new_btree(256);
         for i in 0u64..10 {
             let big = vec![i as u8; 1024 + i as usize * 100];
-            btree.insert(i, big).unwrap();
+            btree.insert(ROOT_PAGE_NUM, i, big).unwrap();
         }
         btree.assert_no_page_leak();
 
         for i in 0u64..10 {
-            btree.remove(i).unwrap();
+            btree.remove(ROOT_PAGE_NUM, i).unwrap();
         }
         btree.assert_no_page_leak();
     }
@@ -1387,19 +1435,19 @@ mod tests {
     #[test]
     fn test_no_leak_overflow_update() {
         let mut btree = new_btree(256);
-        btree.insert(1, vec![42u8; 4096]).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, vec![42u8; 4096]).unwrap();
         btree.assert_no_page_leak();
 
         // Replace overflow with small
-        btree.insert(1, b"small".to_vec()).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, b"small".to_vec()).unwrap();
         btree.assert_no_page_leak();
 
         // Replace small with overflow
-        btree.insert(1, vec![99u8; 4096]).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, vec![99u8; 4096]).unwrap();
         btree.assert_no_page_leak();
 
         // Replace overflow with different overflow
-        btree.insert(1, vec![77u8; 8192]).unwrap();
+        btree.insert(ROOT_PAGE_NUM, 1, vec![77u8; 8192]).unwrap();
         btree.assert_no_page_leak();
     }
 
@@ -1410,16 +1458,18 @@ mod tests {
         for round in 0..5 {
             let base = round * 100;
             for i in 0u64..100 {
-                btree.insert(base + i, vec![0u8; 32]).unwrap();
+                btree
+                    .insert(ROOT_PAGE_NUM, base + i, vec![0u8; 32])
+                    .unwrap();
             }
             let start = base + 20;
             let end = base + 80;
-            btree.remove_range(start..=end).unwrap();
+            btree.remove_range(ROOT_PAGE_NUM, start..=end).unwrap();
             btree.assert_no_page_leak();
         }
 
         // Remove everything
-        btree.remove_range(..).unwrap();
+        btree.remove_range(ROOT_PAGE_NUM, ..).unwrap();
         btree.assert_no_page_leak();
     }
 }
