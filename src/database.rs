@@ -3,10 +3,10 @@ use std::ops::RangeBounds;
 
 use rkyv::rancor::Error;
 
+use crate::Pager;
 use crate::transaction::{TransactionError, TransactionStore};
 use crate::tree::Btree;
 use crate::types::{Key, NodePtr};
-use crate::Pager;
 
 // ── Column types ────────────────────────────────────────────────────
 
@@ -282,10 +282,11 @@ impl Database {
         let id = self.next_table_id;
         self.next_table_id += 1;
 
-        // Persist to catalog
+        // Persist to catalog via transaction
         let serialized = serialize_table_meta(&meta);
-        self.store
-            .with_btree_mut(|btree| btree.insert(self.catalog_root, id, serialized))?;
+        let tx = self.store.begin_transaction();
+        tx.write(id, serialized);
+        tx.commit(self.catalog_root)?;
 
         self.tables.insert(name.to_string(), meta);
         Ok(())
@@ -296,22 +297,23 @@ impl Database {
             return Err(DatabaseError::TableNotFound(name.to_string()));
         }
 
-        // Find catalog key for this table
-        let mut found_key = None;
-        self.store.with_btree_mut(|btree| {
-            btree.read_range(self.catalog_root, .., |key, value| {
-                if let Ok(meta) = deserialize_table_meta(value)
-                    && meta.name == name
-                {
-                    found_key = Some(key);
-                }
-            })
-        })?;
+        // Find catalog key for this table via transaction
+        let tx = self.store.begin_transaction();
+        let entries = tx.read_range(self.catalog_root, ..)?;
+        let found_key = entries.iter().find_map(|(key, value)| {
+            if let Ok(meta) = deserialize_table_meta(value)
+                && meta.name == name
+            {
+                Some(*key)
+            } else {
+                None
+            }
+        });
 
         if let Some(key) = found_key {
-            self.store
-                .with_btree_mut(|btree| btree.remove(self.catalog_root, key))?;
+            tx.remove(key);
         }
+        tx.commit(self.catalog_root)?;
 
         self.tables.remove(name);
         Ok(())
@@ -817,9 +819,7 @@ mod tests {
     fn test_table_not_found() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        let err = tx
-            .get("missing", 0)
-            .unwrap_err();
+        let err = tx.get("missing", 0).unwrap_err();
         assert!(matches!(err, DatabaseError::TableNotFound(_)));
     }
 

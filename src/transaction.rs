@@ -46,11 +46,6 @@ impl TransactionStore {
         }
     }
 
-    pub fn with_btree_mut<T>(&self, f: impl FnOnce(&mut Btree) -> T) -> T {
-        let mut inner = self.inner.lock().unwrap();
-        f(&mut inner.btree)
-    }
-
     pub fn begin_transaction(&self) -> Transaction<'_> {
         let mut inner = self.inner.lock().unwrap();
         let tx_id = inner.next_tx_id;
