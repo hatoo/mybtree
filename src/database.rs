@@ -78,10 +78,18 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn open(pager: Pager) -> Result<Self, DatabaseError> {
+    pub fn create(pager: Pager) -> Result<Self, DatabaseError> {
         let mut btree = Btree::new(pager);
         btree.init()?;
         btree.init_table()?;
+
+        Ok(Database {
+            store: TransactionStore::new(btree),
+        })
+    }
+
+    pub fn open(pager: Pager) -> Result<Self, DatabaseError> {
+        let btree = Btree::new(pager);
 
         Ok(Database {
             store: TransactionStore::new(btree),
@@ -297,7 +305,7 @@ mod tests {
             .open(temp.path())
             .unwrap();
         let pager = Pager::new(file, 256);
-        let db = Database::open(pager).unwrap();
+        let db = Database::create(pager).unwrap();
         (db, temp)
     }
 
