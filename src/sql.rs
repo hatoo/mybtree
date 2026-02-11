@@ -1,5 +1,6 @@
 use sqlparser::ast::{
-    ColumnOption, DataType, Expr, SetExpr, Statement, UnaryOperator, Value,
+    BinaryOperator, ColumnOption, DataType, Expr, SelectItem, SetExpr, Statement, TableFactor,
+    UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -66,9 +67,120 @@ fn expr_to_dbvalue(expr: &Expr) -> Result<DbValue, SqlError> {
     }
 }
 
-pub fn execute(tx: &DbTransaction, sql: &str) -> Result<(), SqlError> {
+fn resolve_column(name: &str, schema: &Schema) -> Result<usize, SqlError> {
+    schema
+        .columns
+        .iter()
+        .position(|c| c.name == name)
+        .ok_or_else(|| {
+            SqlError::Database(DatabaseError::SchemaMismatch(format!(
+                "column '{}' not found",
+                name
+            )))
+        })
+}
+
+fn resolve_projection(
+    projection: &[SelectItem],
+    schema: &Schema,
+) -> Result<Vec<usize>, SqlError> {
+    let mut indices = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                indices.extend(0..schema.columns.len());
+            }
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                indices.push(resolve_column(&ident.value, schema)?);
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(ident),
+                ..
+            } => {
+                indices.push(resolve_column(&ident.value, schema)?);
+            }
+            other => {
+                return Err(SqlError::UnsupportedExpression(other.to_string()));
+            }
+        }
+    }
+    Ok(indices)
+}
+
+fn eval_expr(expr: &Expr, row: &Row, schema: &Schema) -> Result<DbValue, SqlError> {
+    match expr {
+        Expr::Identifier(ident) => {
+            let idx = resolve_column(&ident.value, schema)?;
+            Ok(row.values[idx].clone())
+        }
+        other => expr_to_dbvalue(other),
+    }
+}
+
+fn compare_dbvalues(a: &DbValue, b: &DbValue) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (DbValue::Null, _) | (_, DbValue::Null) => None,
+        (DbValue::Integer(a), DbValue::Integer(b)) => a.partial_cmp(b),
+        (DbValue::Float(a), DbValue::Float(b)) => a.partial_cmp(b),
+        (DbValue::Integer(a), DbValue::Float(b)) => (*a as f64).partial_cmp(b),
+        (DbValue::Float(a), DbValue::Integer(b)) => a.partial_cmp(&(*b as f64)),
+        (DbValue::Text(a), DbValue::Text(b)) => Some(a.cmp(b)),
+        (DbValue::Bool(a), DbValue::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
+fn eval_where(expr: &Expr, row: &Row, schema: &Schema) -> Result<bool, SqlError> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                Ok(eval_where(left, row, schema)? && eval_where(right, row, schema)?)
+            }
+            BinaryOperator::Or => {
+                Ok(eval_where(left, row, schema)? || eval_where(right, row, schema)?)
+            }
+            _ => {
+                let lval = eval_expr(left, row, schema)?;
+                let rval = eval_expr(right, row, schema)?;
+                let ord = compare_dbvalues(&lval, &rval);
+                let result = match op {
+                    BinaryOperator::Eq => ord == Some(std::cmp::Ordering::Equal),
+                    BinaryOperator::NotEq => {
+                        ord.is_some() && ord != Some(std::cmp::Ordering::Equal)
+                    }
+                    BinaryOperator::Lt => ord == Some(std::cmp::Ordering::Less),
+                    BinaryOperator::LtEq => matches!(
+                        ord,
+                        Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+                    ),
+                    BinaryOperator::Gt => ord == Some(std::cmp::Ordering::Greater),
+                    BinaryOperator::GtEq => matches!(
+                        ord,
+                        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+                    ),
+                    _ => return Err(SqlError::UnsupportedExpression(format!("{}", op))),
+                };
+                Ok(result)
+            }
+        },
+        Expr::IsNull(inner) => {
+            let val = eval_expr(inner, row, schema)?;
+            Ok(val == DbValue::Null)
+        }
+        Expr::IsNotNull(inner) => {
+            let val = eval_expr(inner, row, schema)?;
+            Ok(val != DbValue::Null)
+        }
+        Expr::Nested(inner) => eval_where(inner, row, schema),
+        _ => Err(SqlError::UnsupportedExpression(expr.to_string())),
+    }
+}
+
+pub fn execute(tx: &DbTransaction, sql: &str) -> Result<Vec<Row>, SqlError> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)?;
+
+    let mut result = Vec::new();
 
     for stmt in statements {
         match stmt {
@@ -140,11 +252,42 @@ pub fn execute(tx: &DbTransaction, sql: &str) -> Result<(), SqlError> {
                     tx.insert(&table_name, &row)?;
                 }
             }
+            Statement::Query(query) => {
+                let select = match query.body.as_ref() {
+                    SetExpr::Select(select) => select,
+                    _ => return Err(SqlError::UnsupportedStatement),
+                };
+
+                if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+                    return Err(SqlError::UnsupportedStatement);
+                }
+                let table_name = match &select.from[0].relation {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return Err(SqlError::UnsupportedStatement),
+                };
+
+                let schema = tx.get_schema(&table_name)?;
+                let col_indices = resolve_projection(&select.projection, &schema)?;
+                let all_rows = tx.scan(&table_name, ..)?;
+
+                for (_, row) in &all_rows {
+                    let matches = match &select.selection {
+                        Some(where_expr) => eval_where(where_expr, row, &schema)?,
+                        None => true,
+                    };
+                    if matches {
+                        let projected = Row {
+                            values: col_indices.iter().map(|&i| row.values[i].clone()).collect(),
+                        };
+                        result.push(projected);
+                    }
+                }
+            }
             _ => return Err(SqlError::UnsupportedStatement),
         }
     }
 
-    Ok(())
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -434,8 +577,123 @@ mod tests {
     fn test_unsupported_statement() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        let err = execute(&tx, "SELECT 1").unwrap_err();
+        let err = execute(&tx, "DELETE FROM t WHERE id = 1").unwrap_err();
         assert!(matches!(err, SqlError::UnsupportedStatement));
+    }
+
+    #[test]
+    fn test_select_star() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)").unwrap();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values.len(), 2);
+    }
+
+    #[test]
+    fn test_select_columns() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER, active BOOLEAN)").unwrap();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30, true)").unwrap();
+
+        let rows = execute(&tx, "SELECT age, name FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Integer(30));
+        assert_eq!(rows[0].values[1], DbValue::Text("Alice".into()));
+    }
+
+    #[test]
+    fn test_select_where_eq() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 30)").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM users WHERE age = 30").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_select_where_comparison() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (10), (20), (30), (40)").unwrap();
+
+        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x > 20").unwrap().len(), 2);
+        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x >= 20").unwrap().len(), 3);
+        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x < 20").unwrap().len(), 1);
+        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x <= 20").unwrap().len(), 2);
+        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x <> 20").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_select_where_and_or() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t WHERE a >= 2 AND b <= 20").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Integer(2));
+
+        let rows = execute(&tx, "SELECT * FROM t WHERE a = 1 OR a = 3").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_select_where_is_null() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1, 'hello'), (2, NULL), (NULL, 'world')").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t WHERE b IS NULL").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Integer(2));
+
+        let rows = execute(&tx, "SELECT * FROM t WHERE a IS NOT NULL").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_select_where_null_comparison() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (a INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1), (NULL)").unwrap();
+
+        // NULL = NULL should be false (SQL semantics)
+        let rows = execute(&tx, "SELECT * FROM t WHERE a = NULL").unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_select_where_string() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (name TEXT)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES ('Alice'), ('Bob'), ('Charlie')").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t WHERE name = 'Bob'").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Text("Bob".into()));
+    }
+
+    #[test]
+    fn test_select_empty_result() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (a INTEGER)").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
