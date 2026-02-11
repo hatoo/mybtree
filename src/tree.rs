@@ -1,5 +1,5 @@
 use rkyv::Archived;
-use rkyv::rancor::Error;
+use rkyv::rancor::{Error, fail};
 use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 
@@ -9,6 +9,13 @@ use crate::types::{
     Value,
 };
 use crate::util::{is_overlap, split_index_internal, split_index_leaf, split_internal, split_leaf};
+
+#[derive(Debug, thiserror::Error)]
+pub enum TreeError {
+    #[error("unexpected node type: expected {expected}")]
+    UnexpectedNodeType { expected: &'static str },
+}
+
 
 /// Find the child page for `key` in an archived internal node.
 fn find_child_page(internal: &Archived<Internal>, key: Key) -> Option<NodePtr> {
@@ -103,7 +110,7 @@ impl Btree {
             match next {
                 NextNode::Leaf => {
                     let Node::Leaf(mut leaf) = self.pager.owned_node(current)? else {
-                        panic!("Expected leaf node");
+                        fail!(TreeError::UnexpectedNodeType { expected: "leaf" });
                     };
                     match leaf.kv.binary_search_by_key(&key, |t| t.0) {
                         Ok(index) => {
@@ -141,7 +148,7 @@ impl Btree {
                 }
                 NextNode::NeedAlloc => {
                     let Node::Internal(mut internal) = self.pager.owned_node(current)? else {
-                        panic!("Expected internal node");
+                        fail!(TreeError::UnexpectedNodeType { expected: "internal" });
                     };
 
                     if internal.kv.is_empty() {
@@ -214,7 +221,7 @@ impl Btree {
             self.pager.write_node(page, &right_node)?;
 
             let Node::Internal(mut parent_internal) = self.pager.owned_node(parent_page)? else {
-                panic!("Parent is not an internal node");
+                fail!(TreeError::UnexpectedNodeType { expected: "internal parent" });
             };
             let mut kv_map: BTreeMap<_, _> = parent_internal.kv.into_iter().collect();
             for (key, node) in keyed_nodes {
@@ -262,7 +269,7 @@ impl Btree {
                 None => {
                     // Key found in current leaf
                     let Node::Leaf(mut leaf) = self.pager.owned_node(current)? else {
-                        panic!("Expected leaf node");
+                        fail!(TreeError::UnexpectedNodeType { expected: "leaf" });
                     };
                     let index = leaf
                         .kv
@@ -348,7 +355,7 @@ impl Btree {
                 let parents = &path[..path.len() - 1];
                 let parent_page = *parents.last().unwrap();
                 let Node::Internal(mut internal) = self.pager.owned_node(parent_page)? else {
-                    panic!("Parent is not an internal node");
+                    fail!(TreeError::UnexpectedNodeType { expected: "internal parent" });
                 };
                 internal.kv.retain(|&(_, ptr)| ptr != page);
                 self.free_page(page)?;
@@ -1084,7 +1091,7 @@ impl Btree {
             let IndexNode::Internal(mut parent_internal) =
                 self.pager.owned_index_node(parent_page)?
             else {
-                panic!("Parent is not an internal node");
+                fail!(TreeError::UnexpectedNodeType { expected: "internal parent" });
             };
             for (value, node) in keyed_nodes {
                 let new_page = self.alloc_page()?;
@@ -1133,7 +1140,7 @@ impl Btree {
                 let parent_page = *parents.last().unwrap();
                 let IndexNode::Internal(mut internal) = self.pager.owned_index_node(parent_page)?
                 else {
-                    panic!("Parent is not an internal node");
+                    fail!(TreeError::UnexpectedNodeType { expected: "internal parent" });
                 };
                 internal.kv.retain(|entry| entry.1 != page);
                 self.free_page(page)?;
