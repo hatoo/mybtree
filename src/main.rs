@@ -45,9 +45,17 @@ fn open_db(path: &PathBuf) -> anyhow::Result<Database> {
     }
 }
 
-fn execute_and_print(db: &Database, sql: &str) -> anyhow::Result<()> {
+fn execute_and_print(db: &Database, input: &str) -> anyhow::Result<()> {
+    if input == ".tables" {
+        let tx = db.begin_transaction();
+        for name in tx.list_tables()? {
+            println!("{name}");
+        }
+        return Ok(());
+    }
+
     let tx = db.begin_transaction();
-    let rows = mybtree::sql::execute(&tx, sql)?;
+    let rows = mybtree::sql::execute(&tx, input)?;
     tx.commit()?;
 
     for row in &rows {

@@ -492,6 +492,18 @@ impl<'a> DbTransaction<'a> {
         Ok(result)
     }
 
+    pub fn list_tables(&self) -> Result<Vec<String>, DatabaseError> {
+        let entries = self.tx.read_range(CATALOG_PAGE_NUM, ..)?;
+        let mut names = Vec::new();
+        for (_, bytes) in &entries {
+            let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(bytes)?;
+            let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
+            names.push(meta.name);
+        }
+        names.sort();
+        Ok(names)
+    }
+
     pub fn commit(self) -> Result<(), DatabaseError> {
         self.tx.commit()?;
         Ok(())
