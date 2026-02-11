@@ -283,6 +283,21 @@ pub fn execute(tx: &DbTransaction, sql: &str) -> Result<Vec<Row>, SqlError> {
                     }
                 }
             }
+            Statement::CreateIndex(ci) => {
+                let table_name = ci.table_name.to_string();
+                if ci.columns.len() != 1 {
+                    return Err(SqlError::UnsupportedExpression(
+                        "only single-column indexes are supported".into(),
+                    ));
+                }
+                let column_name = match &ci.columns[0].expr {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    other => {
+                        return Err(SqlError::UnsupportedExpression(other.to_string()));
+                    }
+                };
+                tx.create_index(&table_name, &column_name)?;
+            }
             _ => return Err(SqlError::UnsupportedStatement),
         }
     }
@@ -579,6 +594,70 @@ mod tests {
         let tx = db.begin_transaction();
         let err = execute(&tx, "DELETE FROM t WHERE id = 1").unwrap_err();
         assert!(matches!(err, SqlError::UnsupportedStatement));
+    }
+
+    #[test]
+    fn test_create_index() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(&tx, "CREATE INDEX idx_name ON users (name)").unwrap();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+
+        // Index should be usable via scan_by_index
+        let rows = tx
+            .scan_by_index("users", "name", b"Alice".to_vec()..=b"Alice".to_vec())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.values[0], DbValue::Text("Alice".into()));
+    }
+
+    #[test]
+    fn test_create_index_backfills() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (10), (20), (30)").unwrap();
+        execute(&tx, "CREATE INDEX idx_x ON t (x)").unwrap();
+
+        let key_20 = 20i64.to_be_bytes().to_vec();
+        let rows = tx
+            .scan_by_index("t", "x", key_20.clone()..=key_20)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.values[0], DbValue::Integer(20));
+    }
+
+    #[test]
+    fn test_create_index_persists_after_commit() {
+        let (db, _tmp) = open_db();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (name TEXT, age INTEGER)").unwrap();
+        execute(&tx, "CREATE INDEX idx_name ON t (name)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES ('Alice', 30)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "INSERT INTO t VALUES ('Bob', 25)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let rows = tx
+            .scan_by_index("t", "name", b"Bob".to_vec()..=b"Bob".to_vec())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.values[1], DbValue::Integer(25));
+    }
+
+    #[test]
+    fn test_create_index_duplicate_error() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&tx, "CREATE INDEX idx1 ON t (x)").unwrap();
+        let err = execute(&tx, "CREATE INDEX idx2 ON t (x)").unwrap_err();
+        assert!(matches!(err, SqlError::Database(_)));
     }
 
     #[test]
