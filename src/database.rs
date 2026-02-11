@@ -194,11 +194,6 @@ impl<'a> DbTransaction<'a> {
         Ok(None)
     }
 
-    fn get_meta(&self, table_name: &str) -> Result<TableMeta, DatabaseError> {
-        self.find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))
-    }
-
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<(), DatabaseError> {
         if self.find_table_meta(name)?.is_some() {
             return Err(DatabaseError::TableAlreadyExists(name.to_string()));
@@ -330,7 +325,8 @@ impl<'a> DbTransaction<'a> {
     }
 
     pub fn insert(&self, table_name: &str, row: &Row) -> Result<Key, DatabaseError> {
-        let meta = self.get_meta(table_name)?;
+        let meta = self.find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
         validate_row(row, &meta.schema)?;
         let key = self
             .tx
@@ -352,7 +348,8 @@ impl<'a> DbTransaction<'a> {
     }
 
     pub fn get(&self, table_name: &str, key: Key) -> Result<Option<Row>, DatabaseError> {
-        let meta = self.get_meta(table_name)?;
+        let meta = self.find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
         let data = self.tx.read(meta.root_page, key)?;
         match data {
             Some(bytes) => {
@@ -368,7 +365,8 @@ impl<'a> DbTransaction<'a> {
         table_name: &str,
         range: impl RangeBounds<Key>,
     ) -> Result<Vec<(Key, Row)>, DatabaseError> {
-        let meta = self.get_meta(table_name)?;
+        let meta = self.find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
         let raw = self.tx.read_range(meta.root_page, range)?;
         let mut result = Vec::with_capacity(raw.len());
         for (key, bytes) in raw {
@@ -379,7 +377,8 @@ impl<'a> DbTransaction<'a> {
     }
 
     pub fn delete(&self, table_name: &str, key: Key) -> Result<(), DatabaseError> {
-        let meta = self.get_meta(table_name)?;
+        let meta = self.find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
         let old_data = self.tx.read(meta.root_page, key)?;
 
         // Remove from index trees
@@ -406,7 +405,8 @@ impl<'a> DbTransaction<'a> {
     }
 
     pub fn update(&self, table_name: &str, key: Key, row: &Row) -> Result<(), DatabaseError> {
-        let meta = self.get_meta(table_name)?;
+        let meta = self.find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
         validate_row(row, &meta.schema)?;
 
         // Remove old values from index trees
@@ -457,7 +457,8 @@ impl<'a> DbTransaction<'a> {
         column_name: &str,
         range: impl RangeBounds<Vec<u8>>,
     ) -> Result<Vec<(Key, Row)>, DatabaseError> {
-        let meta = self.get_meta(table_name)?;
+        let meta = self.find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
         let idx_root = meta
             .index_trees
             .iter()
