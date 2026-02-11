@@ -1996,4 +1996,70 @@ mod tests {
         let by_age = tx.scan_by_index("users", "age", age_25..=age_30).unwrap();
         assert_eq!(by_age.len(), 2);
     }
+
+    #[test]
+    fn test_index_access_multiple_same_key() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        let schema = Schema {
+            columns: vec![
+                Column {
+                    name: "x".into(),
+                    column_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                Column {
+                    name: "y".into(),
+                    column_type: ColumnType::Text,
+                    nullable: false,
+                },
+            ],
+        };
+        tx.create_table("t", schema).unwrap();
+        tx.create_index("t", "x").unwrap();
+        tx.insert(
+            "t",
+            &Row {
+                values: vec![DbValue::Integer(1), DbValue::Text("a".into())],
+            },
+        )
+        .unwrap();
+        tx.insert(
+            "t",
+            &Row {
+                values: vec![DbValue::Integer(1), DbValue::Text("b".into())],
+            },
+        )
+        .unwrap();
+        tx.insert(
+            "t",
+            &Row {
+                values: vec![DbValue::Integer(2), DbValue::Text("c".into())],
+            },
+        )
+        .unwrap();
+        tx.insert(
+            "t",
+            &Row {
+                values: vec![DbValue::Integer(1), DbValue::Text("d".into())],
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let key_1 = 1i64.to_be_bytes().to_vec();
+        let meta = tx.find_table_meta("t").unwrap().unwrap();
+        let _idx_root = meta.index_trees.iter().find(|(c, _)| c == "x").unwrap().1;
+        let rows = tx.scan_by_index("t", "x", key_1.clone()..=key_1).unwrap();
+        let mut values: Vec<String> = rows
+            .iter()
+            .map(|(_, row)| match &row.values[1] {
+                DbValue::Text(s) => s.clone(),
+                _ => panic!("not text"),
+            })
+            .collect();
+        values.sort();
+        assert_eq!(values, vec!["a", "b", "d"]);
+    }
 }

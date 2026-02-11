@@ -38,14 +38,10 @@ fn expr_to_dbvalue(expr: &Expr) -> Result<DbValue, SqlError> {
         Expr::Value(v) => match &v.value {
             Value::Number(s, _) => {
                 if s.contains('.') {
-                    let f: f64 = s
-                        .parse()
-                        .map_err(|_| SqlError::InvalidValue(s.clone()))?;
+                    let f: f64 = s.parse().map_err(|_| SqlError::InvalidValue(s.clone()))?;
                     Ok(DbValue::Float(f))
                 } else {
-                    let i: i64 = s
-                        .parse()
-                        .map_err(|_| SqlError::InvalidValue(s.clone()))?;
+                    let i: i64 = s.parse().map_err(|_| SqlError::InvalidValue(s.clone()))?;
                     Ok(DbValue::Integer(i))
                 }
             }
@@ -56,13 +52,11 @@ fn expr_to_dbvalue(expr: &Expr) -> Result<DbValue, SqlError> {
             Value::Null => Ok(DbValue::Null),
             other => Err(SqlError::UnsupportedExpression(other.to_string())),
         },
-        Expr::UnaryOp { op, expr } if *op == UnaryOperator::Minus => {
-            match expr_to_dbvalue(expr)? {
-                DbValue::Integer(i) => Ok(DbValue::Integer(-i)),
-                DbValue::Float(f) => Ok(DbValue::Float(-f)),
-                other => Err(SqlError::UnsupportedExpression(format!("-{:?}", other))),
-            }
-        }
+        Expr::UnaryOp { op, expr } if *op == UnaryOperator::Minus => match expr_to_dbvalue(expr)? {
+            DbValue::Integer(i) => Ok(DbValue::Integer(-i)),
+            DbValue::Float(f) => Ok(DbValue::Float(-f)),
+            other => Err(SqlError::UnsupportedExpression(format!("-{:?}", other))),
+        },
         other => Err(SqlError::UnsupportedExpression(other.to_string())),
     }
 }
@@ -80,10 +74,7 @@ fn resolve_column(name: &str, schema: &Schema) -> Result<usize, SqlError> {
         })
 }
 
-fn resolve_projection(
-    projection: &[SelectItem],
-    schema: &Schema,
-) -> Result<Vec<usize>, SqlError> {
+fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> Result<Vec<usize>, SqlError> {
     let mut indices = Vec::new();
     for item in projection {
         match item {
@@ -203,10 +194,7 @@ pub fn execute(tx: &DbTransaction, sql: &str) -> Result<Vec<Row>, SqlError> {
             }
             Statement::Insert(ins) => {
                 let table_name = ins.table.to_string();
-                let source = ins
-                    .source
-                    .as_ref()
-                    .ok_or(SqlError::UnsupportedStatement)?;
+                let source = ins.source.as_ref().ok_or(SqlError::UnsupportedStatement)?;
                 let rows_exprs = match source.body.as_ref() {
                     SetExpr::Values(values) => &values.rows,
                     _ => return Err(SqlError::UnsupportedStatement),
@@ -460,11 +448,7 @@ mod tests {
             "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
-        execute(
-            &tx,
-            "INSERT INTO users VALUES ('Alice', 30)",
-        )
-        .unwrap();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30)").unwrap();
 
         let rows = tx.scan("users", ..).unwrap();
         assert_eq!(rows.len(), 1);
@@ -481,11 +465,7 @@ mod tests {
             "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
-        execute(
-            &tx,
-            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)",
-        )
-        .unwrap();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
 
         let rows = tx.scan("users", ..).unwrap();
         assert_eq!(rows.len(), 2);
@@ -522,11 +502,7 @@ mod tests {
             "CREATE TABLE t (i INTEGER, f FLOAT, t TEXT, b BOOLEAN)",
         )
         .unwrap();
-        execute(
-            &tx,
-            "INSERT INTO t VALUES (42, 3.14, 'hello', true)",
-        )
-        .unwrap();
+        execute(&tx, "INSERT INTO t VALUES (42, 3.14, 'hello', true)").unwrap();
 
         let rows = tx.scan("t", ..).unwrap();
         assert_eq!(rows[0].1.values[0], DbValue::Integer(42));
@@ -563,11 +539,7 @@ mod tests {
     fn test_insert_schema_mismatch() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        execute(
-            &tx,
-            "CREATE TABLE t (a INTEGER NOT NULL)",
-        )
-        .unwrap();
+        execute(&tx, "CREATE TABLE t (a INTEGER NOT NULL)").unwrap();
         let err = execute(&tx, "INSERT INTO t VALUES (NULL)").unwrap_err();
         assert!(matches!(err, SqlError::Database(_)));
     }
@@ -621,9 +593,7 @@ mod tests {
         execute(&tx, "CREATE INDEX idx_x ON t (x)").unwrap();
 
         let key_20 = 20i64.to_be_bytes().to_vec();
-        let rows = tx
-            .scan_by_index("t", "x", key_20.clone()..=key_20)
-            .unwrap();
+        let rows = tx.scan_by_index("t", "x", key_20.clone()..=key_20).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[0], DbValue::Integer(20));
     }
@@ -664,7 +634,11 @@ mod tests {
     fn test_select_star() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)").unwrap();
+        execute(
+            &tx,
+            "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)",
+        )
+        .unwrap();
         execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
 
         let rows = execute(&tx, "SELECT * FROM users").unwrap();
@@ -676,7 +650,11 @@ mod tests {
     fn test_select_columns() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER, active BOOLEAN)").unwrap();
+        execute(
+            &tx,
+            "CREATE TABLE users (name TEXT, age INTEGER, active BOOLEAN)",
+        )
+        .unwrap();
         execute(&tx, "INSERT INTO users VALUES ('Alice', 30, true)").unwrap();
 
         let rows = execute(&tx, "SELECT age, name FROM users").unwrap();
@@ -691,7 +669,11 @@ mod tests {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
         execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 30)").unwrap();
+        execute(
+            &tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 30)",
+        )
+        .unwrap();
 
         let rows = execute(&tx, "SELECT * FROM users WHERE age = 30").unwrap();
         assert_eq!(rows.len(), 2);
@@ -704,11 +686,26 @@ mod tests {
         execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
         execute(&tx, "INSERT INTO t VALUES (10), (20), (30), (40)").unwrap();
 
-        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x > 20").unwrap().len(), 2);
-        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x >= 20").unwrap().len(), 3);
-        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x < 20").unwrap().len(), 1);
-        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x <= 20").unwrap().len(), 2);
-        assert_eq!(execute(&tx, "SELECT * FROM t WHERE x <> 20").unwrap().len(), 3);
+        assert_eq!(
+            execute(&tx, "SELECT * FROM t WHERE x > 20").unwrap().len(),
+            2
+        );
+        assert_eq!(
+            execute(&tx, "SELECT * FROM t WHERE x >= 20").unwrap().len(),
+            3
+        );
+        assert_eq!(
+            execute(&tx, "SELECT * FROM t WHERE x < 20").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            execute(&tx, "SELECT * FROM t WHERE x <= 20").unwrap().len(),
+            2
+        );
+        assert_eq!(
+            execute(&tx, "SELECT * FROM t WHERE x <> 20").unwrap().len(),
+            3
+        );
     }
 
     #[test]
@@ -731,7 +728,11 @@ mod tests {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
         execute(&tx, "CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1, 'hello'), (2, NULL), (NULL, 'world')").unwrap();
+        execute(
+            &tx,
+            "INSERT INTO t VALUES (1, 'hello'), (2, NULL), (NULL, 'world')",
+        )
+        .unwrap();
 
         let rows = execute(&tx, "SELECT * FROM t WHERE b IS NULL").unwrap();
         assert_eq!(rows.len(), 1);
@@ -871,11 +872,11 @@ mod tests {
                 "t",
                 &Row {
                     values: vec![
-                        DbValue::Integer(42),  // BIGINT → Integer
+                        DbValue::Integer(42),       // BIGINT → Integer
                         DbValue::Text("hi".into()), // CHAR → Text
-                        DbValue::Float(1.0),   // DOUBLE → Float
-                        DbValue::Float(2.0),   // REAL → Float
-                        DbValue::Bool(false),   // BOOL → Bool
+                        DbValue::Float(1.0),        // DOUBLE → Float
+                        DbValue::Float(2.0),        // REAL → Float
+                        DbValue::Bool(false),       // BOOL → Bool
                     ],
                 },
             )
