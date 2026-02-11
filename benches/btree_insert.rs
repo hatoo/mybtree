@@ -20,6 +20,7 @@ fn bench_sequential_insert(c: &mut Criterion) {
                 for i in 0..n as u64 {
                     btree.insert(root, i, value.clone()).unwrap();
                 }
+                // flush on drop
             });
         });
     }
