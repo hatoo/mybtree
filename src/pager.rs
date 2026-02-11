@@ -4,7 +4,7 @@ use rkyv::{
     rancor::{Error, Source},
     util::AlignedVec,
 };
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::io;
 use std::num::NonZeroUsize;
 
@@ -74,7 +74,7 @@ pub struct Pager {
     file: std::fs::File,
     next_page_num: u64,
     cache: LruCache<u64, Vec<u8>>,
-    dirty: HashSet<u64>,
+    dirty: BTreeSet<u64>,
 }
 
 impl Pager {
@@ -90,7 +90,7 @@ impl Pager {
             file,
             next_page_num,
             cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
-            dirty: HashSet::new(),
+            dirty: BTreeSet::new(),
         }
     }
 
@@ -168,7 +168,7 @@ impl Pager {
 
     /// Flush all dirty pages to disk and sync the file.
     pub fn flush(&mut self) -> io::Result<()> {
-        let dirty_pages: Vec<u64> = self.dirty.drain().collect();
+        let dirty_pages = std::mem::take(&mut self.dirty);
         for page_num in dirty_pages {
             if let Some(data) = self.cache.peek(&page_num) {
                 self.flush_page(page_num, &data.clone())?;
