@@ -709,7 +709,7 @@ impl Btree {
     }
 
     /// Return a page to the persisted free list.
-    fn free_page(&mut self, page_num: u64) -> Result<(), Error> {
+    pub(crate) fn free_page(&mut self, page_num: u64) -> Result<(), Error> {
         let head = self.read_free_list_head()?;
         // Write the current head into the freed page
         let mut buf = vec![0u8; 8];

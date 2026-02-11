@@ -42,6 +42,8 @@ pub struct Operation {
     // Deferred structural operations
     deferred_free_trees: Vec<NodePtr>,
     deferred_free_index_trees: Vec<NodePtr>,
+    deferred_init_trees: Vec<NodePtr>,
+    deferred_init_indexes: Vec<NodePtr>,
 }
 
 impl TransactionStore {
@@ -71,6 +73,8 @@ impl TransactionStore {
                 index_ops: BTreeMap::new(),
                 deferred_free_trees: Vec::new(),
                 deferred_free_index_trees: Vec::new(),
+                deferred_init_trees: Vec::new(),
+                deferred_init_indexes: Vec::new(),
             },
         );
         Transaction {
@@ -79,29 +83,9 @@ impl TransactionStore {
         }
     }
 
-    pub fn init_tree(&self) -> Result<NodePtr, Error> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.btree.init_tree()
-    }
-
-    pub fn drop_tree(&self, root: NodePtr) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.btree.free_tree(root)
-    }
-
     pub fn get_next_page_num(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner.btree.pager.get_next_page_num()
-    }
-
-    pub fn init_index(&self) -> Result<NodePtr, Error> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.btree.init_index()
-    }
-
-    pub fn drop_index_tree(&self, root: NodePtr) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.btree.free_index_tree(root)
     }
 
     pub fn index_insert(&self, idx_root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
@@ -269,12 +253,20 @@ impl<'a> Transaction<'a> {
 
     pub fn init_tree(&self) -> Result<NodePtr, Error> {
         let mut inner = self.store.lock().unwrap();
-        inner.btree.init_tree()
+        let page = inner.btree.init_tree()?;
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            op.deferred_init_trees.push(page);
+        }
+        Ok(page)
     }
 
     pub fn init_index(&self) -> Result<NodePtr, Error> {
         let mut inner = self.store.lock().unwrap();
-        inner.btree.init_index()
+        let page = inner.btree.init_index()?;
+        if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
+            op.deferred_init_indexes.push(page);
+        }
+        Ok(page)
     }
 
     pub fn free_tree(&self, root: NodePtr) -> Result<(), Error> {
@@ -479,6 +471,12 @@ impl<'a> Transaction<'a> {
         }
 
         if conflict {
+            for page in current_op.deferred_init_trees {
+                inner.btree.free_page(page)?;
+            }
+            for page in current_op.deferred_init_indexes {
+                inner.btree.free_page(page)?;
+            }
             fail!(TransactionError::Conflict);
         }
 
@@ -516,7 +514,14 @@ impl<'a> Transaction<'a> {
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
         let mut inner = self.store.lock().unwrap();
-        inner.active_transactions.remove(&self.tx_id);
+        if let Some(op) = inner.active_transactions.remove(&self.tx_id) {
+            for page in op.deferred_init_trees {
+                let _ = inner.btree.free_page(page);
+            }
+            for page in op.deferred_init_indexes {
+                let _ = inner.btree.free_page(page);
+            }
+        }
     }
 }
 
