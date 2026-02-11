@@ -150,9 +150,9 @@ impl TransactionStore {
         }
     }
 
-    pub fn get_next_page_num(&self) -> u64 {
+    pub fn get_total_page_count(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
-        inner.btree.pager.get_next_page_num()
+        inner.btree.pager.total_page_count()
     }
 }
 

@@ -100,7 +100,7 @@ impl Pager {
         page_num
     }
 
-    pub fn get_next_page_num(&self) -> u64 {
+    pub fn total_page_count(&self) -> u64 {
         self.next_page_num
     }
 

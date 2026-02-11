@@ -1246,7 +1246,7 @@ impl Btree {
     pub fn assert_no_page_leak(&mut self, root: NodePtr) {
         use std::collections::BTreeSet;
 
-        let total_pages = self.pager.get_next_page_num();
+        let total_pages = self.pager.total_page_count();
 
         // Collect all pages reachable from the tree
         let mut tree_pages = BTreeSet::new();
@@ -1358,7 +1358,7 @@ impl Btree {
     pub fn assert_no_page_leak_index(&mut self, root: NodePtr) {
         use std::collections::BTreeSet;
 
-        let total_pages = self.pager.get_next_page_num();
+        let total_pages = self.pager.total_page_count();
 
         let mut tree_pages = BTreeSet::new();
         tree_pages.insert(root);
@@ -1856,7 +1856,7 @@ mod tests {
         for i in 0u64..100 {
             btree.insert(root, i, vec![0u8; 64]).unwrap();
         }
-        let pages_after_insert = btree.pager.get_next_page_num();
+        let pages_after_insert = btree.pager.total_page_count();
 
         // Remove all keys — freed pages should accumulate
         for i in 0u64..100 {
@@ -1874,9 +1874,9 @@ mod tests {
             btree.insert(root, i, vec![0u8; 64]).unwrap();
         }
         assert!(
-            btree.pager.get_next_page_num() <= pages_after_insert + 1,
+            btree.pager.total_page_count() <= pages_after_insert + 1,
             "File grew unexpectedly: {} > {}",
-            btree.pager.get_next_page_num(),
+            btree.pager.total_page_count(),
             pages_after_insert
         );
     }
@@ -1886,7 +1886,7 @@ mod tests {
         let (mut btree, root) = new_btree(256);
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, big_value).unwrap();
-        let pages_before = btree.pager.get_next_page_num();
+        let pages_before = btree.pager.total_page_count();
 
         btree.remove(root, 1).unwrap();
         assert_ne!(
@@ -1899,7 +1899,7 @@ mod tests {
         let big_value2 = vec![99u8; 4096];
         btree.insert(root, 2, big_value2).unwrap();
         assert!(
-            btree.pager.get_next_page_num() <= pages_before + 1,
+            btree.pager.total_page_count() <= pages_before + 1,
             "Overflow pages were not reused"
         );
     }
@@ -1909,7 +1909,7 @@ mod tests {
         let (mut btree, root) = new_btree(256);
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, big_value).unwrap();
-        let pages_before = btree.pager.get_next_page_num();
+        let pages_before = btree.pager.total_page_count();
 
         // Replace with small value — overflow pages should be freed
         btree.insert(root, 1, b"small".to_vec()).unwrap();
@@ -1923,7 +1923,7 @@ mod tests {
         let big_value2 = vec![99u8; 4096];
         btree.insert(root, 2, big_value2).unwrap();
         assert!(
-            btree.pager.get_next_page_num() <= pages_before + 1,
+            btree.pager.total_page_count() <= pages_before + 1,
             "Old overflow pages were not reused on update"
         );
     }
@@ -1964,7 +1964,7 @@ mod tests {
                 .unwrap();
             let pager = Pager::new(file, 4096);
             let mut btree = Btree::new(pager);
-            let pages_before = btree.pager.get_next_page_num();
+            let pages_before = btree.pager.total_page_count();
 
             assert_ne!(
                 btree.read_free_list_head().unwrap(),
@@ -1977,7 +1977,7 @@ mod tests {
                 btree.insert(root, i, vec![0u8; 64]).unwrap();
             }
             assert!(
-                btree.pager.get_next_page_num() <= pages_before,
+                btree.pager.total_page_count() <= pages_before,
                 "File grew after reopen despite free pages"
             );
         }
@@ -2324,7 +2324,7 @@ mod tests {
                 .index_insert(root, i, format!("v-{}", i).into_bytes())
                 .unwrap();
         }
-        let pages_before = btree.pager.get_next_page_num();
+        let pages_before = btree.pager.total_page_count();
         btree.free_index_tree(root).unwrap();
 
         // All tree pages should now be in the free list
@@ -2338,7 +2338,7 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            btree.pager.get_next_page_num() <= pages_before + 1,
+            btree.pager.total_page_count() <= pages_before + 1,
             "Pages not reused after free_index_tree"
         );
     }

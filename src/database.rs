@@ -976,7 +976,7 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        let pages_before_drop = db.store.get_next_page_num();
+        let pages_before_drop = db.store.get_total_page_count();
 
         let tx = db.begin_transaction();
         tx.drop_table("users").unwrap();
@@ -1002,7 +1002,7 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        let pages_after_reinsert = db.store.get_next_page_num();
+        let pages_after_reinsert = db.store.get_total_page_count();
 
         assert!(
             pages_after_reinsert <= pages_before_drop + 1,
@@ -1045,7 +1045,7 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        let pages_before_drop = db.store.get_next_page_num();
+        let pages_before_drop = db.store.get_total_page_count();
 
         let tx = db.begin_transaction();
         tx.drop_table("users").unwrap();
@@ -1073,7 +1073,7 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        let pages_after_reinsert = db.store.get_next_page_num();
+        let pages_after_reinsert = db.store.get_total_page_count();
 
         assert!(
             pages_after_reinsert <= pages_before_drop + 1,
