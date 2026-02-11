@@ -79,12 +79,12 @@ impl TransactionStore {
         }
     }
 
-    pub fn init_table(&self) -> Result<NodePtr, Error> {
+    pub fn init_tree(&self) -> Result<NodePtr, Error> {
         let mut inner = self.inner.lock().unwrap();
-        inner.btree.init_table()
+        inner.btree.init_tree()
     }
 
-    pub fn drop_table(&self, root: NodePtr) -> Result<(), Error> {
+    pub fn drop_tree(&self, root: NodePtr) -> Result<(), Error> {
         let mut inner = self.inner.lock().unwrap();
         inner.btree.free_tree(root)
     }
@@ -267,9 +267,9 @@ impl<'a> Transaction<'a> {
 
     // ── Structural operations ──────────────────────────────────────
 
-    pub fn init_table(&self) -> Result<NodePtr, Error> {
+    pub fn init_tree(&self) -> Result<NodePtr, Error> {
         let mut inner = self.store.lock().unwrap();
-        inner.btree.init_table()
+        inner.btree.init_tree()
     }
 
     pub fn init_index(&self) -> Result<NodePtr, Error> {
@@ -538,7 +538,7 @@ mod tests {
         let pager = Pager::new(file, 256);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
-        let root = btree.init_table().unwrap();
+        let root = btree.init_tree().unwrap();
 
         let store = TransactionStore::new(btree);
         (store, root, temp_file)

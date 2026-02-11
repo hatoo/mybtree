@@ -85,7 +85,7 @@ impl Database {
     pub fn create(pager: Pager) -> Result<Self, DatabaseError> {
         let mut btree = Btree::new(pager);
         btree.init()?;
-        btree.init_table()?; // page 1 = catalog
+        btree.init_tree()?; // page 1 = catalog
         btree.init_index()?; // page 2 = catalog name index
 
         Ok(Database {
@@ -204,7 +204,7 @@ impl<'a> DbTransaction<'a> {
             return Err(DatabaseError::TableAlreadyExists(name.to_string()));
         }
 
-        let root_page = self.tx.init_table()?;
+        let root_page = self.tx.init_tree()?;
         let meta = TableMeta {
             name: name.to_string(),
             schema,

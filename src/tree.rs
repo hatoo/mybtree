@@ -40,10 +40,10 @@ impl Btree {
         Ok(())
     }
 
-    /// Initialize a new table at the specified page, writing an empty leaf node as its root.
+    /// Initialize a new tree at the specified page, writing an empty leaf node as its root.
     /// The page is allocated via [`alloc_page`] if needed; the caller should use the
     /// returned page number as the root for subsequent operations.
-    pub fn init_table(&mut self) -> Result<NodePtr, Error> {
+    pub fn init_tree(&mut self) -> Result<NodePtr, Error> {
         let page = self.alloc_page()?;
         let root_leaf = Leaf { kv: vec![] };
         self.pager.write_node(page, &Node::Leaf(root_leaf))?;
@@ -1457,7 +1457,7 @@ mod tests {
         let pager = Pager::new(file, page_size);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
-        let root = btree.init_table().unwrap();
+        let root = btree.init_tree().unwrap();
         (btree, root)
     }
 
@@ -1534,7 +1534,7 @@ mod tests {
         let pager = Pager::new(file, 4096);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
-        let root = btree.init_table().unwrap();
+        let root = btree.init_tree().unwrap();
         let root_leaf = Leaf {
             kv: vec![(0, Value::Inline(b"zero".to_vec()))],
         };
@@ -1944,7 +1944,7 @@ mod tests {
             let pager = Pager::new(file, 4096);
             let mut btree = Btree::new(pager);
             btree.init().unwrap();
-            root = btree.init_table().unwrap();
+            root = btree.init_tree().unwrap();
 
             for i in 0u64..50 {
                 btree.insert(root, i, vec![0u8; 64]).unwrap();
