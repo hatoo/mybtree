@@ -35,6 +35,11 @@ impl Btree {
         Btree { pager }
     }
 
+    /// Flush all dirty cached pages to disk.
+    pub fn flush(&mut self) -> Result<(), std::io::Error> {
+        self.pager.flush()
+    }
+
     /// Initialize a fresh database file, setting up the free list.
     /// The pager is reset and the first page is allocated for the free list head.
     pub fn init(&mut self) -> Result<(), Error> {

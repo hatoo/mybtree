@@ -4,7 +4,7 @@ use std::{
     sync::Mutex,
 };
 
-use rkyv::rancor::{Error, fail};
+use rkyv::rancor::{Error, Source, fail};
 
 use crate::{Btree, Key, NodePtr, Value};
 
@@ -475,6 +475,8 @@ impl<'a> Transaction<'a> {
         for root in current_op.deferred_free_index_trees {
             inner.btree.free_index_tree(root)?;
         }
+
+        inner.btree.flush().map_err(Error::new)?;
 
         Ok(())
     }
