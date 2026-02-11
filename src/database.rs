@@ -1771,6 +1771,185 @@ mod tests {
         tx2.commit().unwrap();
     }
 
+    // ── DDL conflict tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_conflict_concurrent_create_table_same_name() {
+        let (db, _tmp) = open_db();
+
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.create_table("users", users_schema()).unwrap();
+        tx2.create_table("users", users_schema()).unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_no_conflict_concurrent_create_table_different_names() {
+        let (db, _tmp) = open_db();
+
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.create_table("users", users_schema()).unwrap();
+        tx2.create_table("products", users_schema()).unwrap();
+
+        tx1.commit().unwrap();
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_concurrent_drop_table_same_name() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.drop_table("users").unwrap();
+        tx2.drop_table("users").unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_create_table_vs_drop_table_same_name() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        // tx1 drops the table, tx2 reads it (via insert)
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.drop_table("users").unwrap();
+        tx2.insert(
+            "users",
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+            },
+        )
+        .unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_create_index_vs_insert() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        // tx1 creates an index (backfills via range read), tx2 inserts a row
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.create_index("users", "name").unwrap();
+        tx2.insert(
+            "users",
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+            },
+        )
+        .unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_concurrent_create_index_same_column() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        // Both try to create an index on the same column
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.create_index("users", "name").unwrap();
+        tx2.create_index("users", "name").unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_drop_index_vs_index_scan() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        tx.insert(
+            "users",
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // tx1 scans the index, tx2 drops it (modifying catalog metadata)
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.scan_by_index("users", "name", b"A".to_vec()..b"Z".to_vec())
+            .unwrap();
+        tx2.drop_index("users", "name").unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_drop_table_vs_read() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let key = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                },
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // tx1 reads a row, tx2 drops the whole table
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.get("users", key).unwrap();
+        tx2.drop_table("users").unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
     #[test]
     fn test_multiple_indexes_on_table() {
         let (db, _tmp) = open_db();
