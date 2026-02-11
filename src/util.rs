@@ -1,8 +1,8 @@
 use rkyv::rancor::Error;
 use std::ops::{Bound, RangeBounds};
 
-use crate::types::{Key, Leaf, Node, NodePtr, Value};
 use crate::types::{IndexInternal, IndexLeaf, IndexNode};
+use crate::types::{Key, Leaf, Node, NodePtr, Value};
 
 pub fn split_leaf(
     kv: Vec<(Key, Value)>,
@@ -115,8 +115,7 @@ pub fn split_index_internal(
         let left = kv[..mid].to_vec();
         let right = kv[mid..].to_vec();
 
-        if rkyv::to_bytes(&IndexNode::Internal(IndexInternal { kv: left.clone() }))?
-            .len()
+        if rkyv::to_bytes(&IndexNode::Internal(IndexInternal { kv: left.clone() }))?.len()
             <= page_content_size
         {
             result.push(left);
@@ -124,10 +123,7 @@ pub fn split_index_internal(
             current.push(left);
         }
 
-        if rkyv::to_bytes(&IndexNode::Internal(IndexInternal {
-            kv: right.clone(),
-        }))?
-        .len()
+        if rkyv::to_bytes(&IndexNode::Internal(IndexInternal { kv: right.clone() }))?.len()
             <= page_content_size
         {
             result.push(right);

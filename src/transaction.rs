@@ -87,7 +87,6 @@ impl TransactionStore {
         let inner = self.inner.lock().unwrap();
         inner.btree.pager.get_next_page_num()
     }
-
 }
 
 impl<'a> Transaction<'a> {
