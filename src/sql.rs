@@ -697,6 +697,78 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_visible_after_commit() {
+        let (db, _tmp) = open_db();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let rows = execute(&tx, "SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Text("Alice".into()));
+        assert_eq!(rows[0].values[1], DbValue::Integer(30));
+        assert_eq!(rows[1].values[0], DbValue::Text("Bob".into()));
+        assert_eq!(rows[1].values[1], DbValue::Integer(25));
+    }
+
+    #[test]
+    fn test_insert_not_visible_after_rollback() {
+        let (db, _tmp) = open_db();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30)").unwrap();
+        drop(tx); // rollback
+
+        let tx = db.begin_transaction();
+        let rows = execute(&tx, "SELECT * FROM users").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_create_table_visible_after_commit() {
+        let (db, _tmp) = open_db();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "INSERT INTO t VALUES (42)").unwrap();
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Integer(42));
+    }
+
+    #[test]
+    fn test_select_across_commits() {
+        let (db, _tmp) = open_db();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "INSERT INTO t VALUES (2)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "INSERT INTO t VALUES (3)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let rows = execute(&tx, "SELECT * FROM t WHERE x >= 2").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
     fn test_type_aliases() {
         use crate::{DbValue, Row};
 
