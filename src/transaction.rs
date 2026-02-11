@@ -46,6 +46,73 @@ pub struct Operation {
     deferred_init_indexes: Vec<NodePtr>,
 }
 
+fn any_write_in_ranges<'a, T: Ord + Clone + 'a>(
+    writes: impl Iterator<Item = &'a (NodePtr, T)>,
+    ranges: &[(NodePtr, Bound<T>, Bound<T>)],
+) -> bool {
+    for (w_root, w_key) in writes {
+        for (rr_root, rr_start, rr_end) in ranges {
+            if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+impl Operation {
+    fn conflicts_with(&self, other: &Operation) -> bool {
+        // Data: other's reads vs self's writes
+        for read_key in &other.reads {
+            if self.writes.contains_key(read_key) {
+                return true;
+            }
+        }
+        // Data: other's writes vs self's reads and writes
+        for write_key in other.writes.keys() {
+            if self.reads.contains(write_key) {
+                return true;
+            }
+            if self.writes.contains_key(write_key) {
+                return true;
+            }
+        }
+        // Data: range reads vs writes (both directions)
+        if any_write_in_ranges(self.writes.keys(), &other.range_reads) {
+            return true;
+        }
+        if any_write_in_ranges(other.writes.keys(), &self.range_reads) {
+            return true;
+        }
+
+        // Index: point read/write conflicts
+        for read_key in &other.index_reads {
+            if self.index_writes.contains(read_key) {
+                return true;
+            }
+        }
+        for read_key in &self.index_reads {
+            if other.index_writes.contains(read_key) {
+                return true;
+            }
+        }
+        for write_key in &other.index_writes {
+            if self.index_writes.contains(write_key) {
+                return true;
+            }
+        }
+        // Index: range reads vs writes (both directions)
+        if any_write_in_ranges(self.index_writes.iter(), &other.index_range_reads) {
+            return true;
+        }
+        if any_write_in_ranges(other.index_writes.iter(), &self.index_range_reads) {
+            return true;
+        }
+
+        false
+    }
+}
+
 impl TransactionStore {
     pub fn new(btree: Btree) -> Self {
         TransactionStore {
@@ -367,80 +434,10 @@ impl<'a> Transaction<'a> {
 
         let current_op = inner.active_transactions.remove(&self.tx_id).unwrap();
 
-        let mut conflict = false;
-        'check: for (other_tx_id, other_op) in &inner.active_transactions {
-            if *other_tx_id == self.tx_id {
-                continue;
-            }
-            for read_key in &other_op.reads {
-                if current_op.writes.contains_key(read_key) {
-                    conflict = true;
-                    break 'check;
-                }
-            }
-            for write_key in other_op.writes.keys() {
-                if current_op.reads.contains(write_key) {
-                    conflict = true;
-                    break 'check;
-                }
-                if current_op.writes.contains_key(write_key) {
-                    conflict = true;
-                    break 'check;
-                }
-            }
-            for (rr_root, rr_start, rr_end) in &other_op.range_reads {
-                for (w_root, w_key) in current_op.writes.keys() {
-                    if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
-                        conflict = true;
-                        break 'check;
-                    }
-                }
-            }
-            for (rr_root, rr_start, rr_end) in &current_op.range_reads {
-                for (w_root, w_key) in other_op.writes.keys() {
-                    if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_key) {
-                        conflict = true;
-                        break 'check;
-                    }
-                }
-            }
-
-            // ── Index conflict detection ──────────────────────
-            for read_key in &other_op.index_reads {
-                if current_op.index_writes.contains(read_key) {
-                    conflict = true;
-                    break 'check;
-                }
-            }
-            for read_key in &current_op.index_reads {
-                if other_op.index_writes.contains(read_key) {
-                    conflict = true;
-                    break 'check;
-                }
-            }
-            for write_key in &other_op.index_writes {
-                if current_op.index_writes.contains(write_key) {
-                    conflict = true;
-                    break 'check;
-                }
-            }
-            for (rr_root, rr_start, rr_end) in &other_op.index_range_reads {
-                for (w_root, w_val) in &current_op.index_writes {
-                    if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_val) {
-                        conflict = true;
-                        break 'check;
-                    }
-                }
-            }
-            for (rr_root, rr_start, rr_end) in &current_op.index_range_reads {
-                for (w_root, w_val) in &other_op.index_writes {
-                    if w_root == rr_root && (rr_start.clone(), rr_end.clone()).contains(w_val) {
-                        conflict = true;
-                        break 'check;
-                    }
-                }
-            }
-        }
+        let conflict = inner
+            .active_transactions
+            .values()
+            .any(|other_op| current_op.conflicts_with(other_op));
 
         if conflict {
             for page in current_op.deferred_init_trees {
