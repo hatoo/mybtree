@@ -133,9 +133,9 @@ impl Btree {
                             leaf.kv[index].1 = new_value;
 
                             if grew {
-                                self.split_insert(root, &path, &Node::Leaf(leaf))?;
+                                self.split_insert(root, &path, Node::Leaf(leaf))?;
                             } else {
-                                self.merge_insert(root, &path, &Node::Leaf(leaf))?;
+                                self.merge_insert(root, &path, Node::Leaf(leaf))?;
                             }
                             self.free_value_pages(&old_value_entry)?;
                             return Ok(Some(old_bytes));
@@ -143,7 +143,7 @@ impl Btree {
                         Err(index) => {
                             let new_value = self.make_value(value)?;
                             leaf.kv.insert(index, (key, new_value));
-                            self.split_insert(root, &path, &Node::Leaf(leaf))?;
+                            self.split_insert(root, &path, Node::Leaf(leaf))?;
                             return Ok(None);
                         }
                     }
@@ -185,9 +185,9 @@ impl Btree {
         &mut self,
         root: NodePtr,
         path: &[NodePtr],
-        insert: &Node,
+        insert: Node,
     ) -> Result<(), Error> {
-        let buffer = rkyv::to_bytes(insert)?;
+        let buffer = rkyv::to_bytes(&insert)?;
 
         let page = *path.last().unwrap();
         let parents = &path[..path.len() - 1];
@@ -199,11 +199,11 @@ impl Btree {
 
         let page_content_size = self.pager.page_content_size();
         let keyed_nodes: Vec<(Key, Node)> = match insert {
-            Node::Leaf(leaf) => split_leaf(leaf.kv.clone(), page_content_size)?
+            Node::Leaf(leaf) => split_leaf(leaf.kv, page_content_size)?
                 .into_iter()
                 .map(|kv| (kv.last().unwrap().0, Node::Leaf(Leaf { kv })))
                 .collect(),
-            Node::Internal(internal) => split_internal(internal.kv.clone(), page_content_size)?
+            Node::Internal(internal) => split_internal(internal.kv, page_content_size)?
                 .into_iter()
                 .map(|kv| (kv.last().unwrap().0, Node::Internal(Internal { kv })))
                 .collect(),
@@ -235,7 +235,7 @@ impl Btree {
                 kv_map.insert(key, new_page);
             }
             parent_internal.kv = kv_map.into_iter().collect();
-            self.split_insert(root, parents, &Node::Internal(parent_internal))
+            self.split_insert(root, parents, Node::Internal(parent_internal))
         } else {
             let new_entries = keyed_nodes
                 .into_iter()
@@ -245,7 +245,7 @@ impl Btree {
                     Ok((key, new_page))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
-            self.split_insert(root, &[root], &Node::Internal(Internal { kv: new_entries }))
+            self.split_insert(root, &[root], Node::Internal(Internal { kv: new_entries }))
         }
     }
 
@@ -281,7 +281,7 @@ impl Btree {
                         .binary_search_by_key(&key, |t| t.0)
                         .expect("Key not found in leaf node");
                     let old_value_entry = leaf.kv.remove(index).1;
-                    self.merge_insert(root, &path, &Node::Leaf(leaf))?;
+                    self.merge_insert(root, &path, Node::Leaf(leaf))?;
                     let old_bytes = self.resolve_value(&old_value_entry)?;
                     self.free_value_pages(&old_value_entry)?;
                     return Ok(Some(old_bytes));
@@ -319,7 +319,7 @@ impl Btree {
                     .map(|(_, v)| v.clone())
                     .collect();
                 leaf.kv.retain(|(k, _)| !range.contains(k));
-                self.merge_insert(root, &[node_ptr], &Node::Leaf(leaf))?;
+                self.merge_insert(root, &[node_ptr], Node::Leaf(leaf))?;
                 for v in &removed {
                     self.free_value_pages(v)?;
                 }
@@ -342,9 +342,9 @@ impl Btree {
         &mut self,
         root: NodePtr,
         path: &[NodePtr],
-        insert: &Node,
+        insert: Node,
     ) -> Result<(), Error> {
-        let buffer = rkyv::to_bytes(insert)?;
+        let buffer = rkyv::to_bytes(&insert)?;
 
         let page = *path.last().unwrap();
 
@@ -355,7 +355,7 @@ impl Btree {
         }
 
         // Handle empty leaf: remove from parent entirely
-        if let Node::Leaf(leaf) = insert {
+        if let Node::Leaf(leaf) = &insert {
             if leaf.kv.is_empty() {
                 let parents = &path[..path.len() - 1];
                 let parent_page = *parents.last().unwrap();
@@ -364,13 +364,13 @@ impl Btree {
                 };
                 internal.kv.retain(|&(_, ptr)| ptr != page);
                 self.free_page(page)?;
-                return self.merge_insert(root, parents, &Node::Internal(internal));
+                return self.merge_insert(root, parents, Node::Internal(internal));
             }
         }
 
         let parents = &path[..path.len() - 1];
-        if !self.try_merge_with_left_sibling(root, page, insert, parents)? {
-            self.pager.write_node(page, insert)?;
+        if !self.try_merge_with_left_sibling(root, page, &insert, parents)? {
+            self.pager.write_buffer(page, buffer)?;
         }
         Ok(())
     }
@@ -417,7 +417,7 @@ impl Btree {
         if buffer.len() <= self.pager.page_content_size() {
             self.pager.write_buffer(page, buffer)?;
             parent_internal.kv.remove(index - 1);
-            self.merge_insert(root, parents, &Node::Internal(parent_internal))?;
+            self.merge_insert(root, parents, Node::Internal(parent_internal))?;
             self.free_page(left_sibling_page)?;
             Ok(true)
         } else {

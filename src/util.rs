@@ -11,11 +11,11 @@ pub fn split_leaf(
     let mut result = vec![];
     let mut current = vec![kv];
 
-    while let Some(kv) = current.pop() {
+    while let Some(mut kv) = current.pop() {
         debug_assert!(kv.len() >= 2);
         let mid = kv.len() / 2;
-        let left = kv[..mid].to_vec();
-        let right = kv[mid..].to_vec();
+        let right = kv.split_off(mid);
+        let left = kv;
 
         if rkyv::to_bytes(&Node::Leaf(Leaf { kv: left.clone() }))?.len() <= page_content_size {
             result.push(left);
@@ -40,11 +40,11 @@ pub fn split_internal(
     let mut result = vec![];
     let mut current = vec![kv];
 
-    while let Some(kv) = current.pop() {
+    while let Some(mut kv) = current.pop() {
         debug_assert!(kv.len() >= 2);
         let mid = kv.len() / 2;
-        let left = kv[..mid].to_vec();
-        let right = kv[mid..].to_vec();
+        let right = kv.split_off(mid);
+        let left = kv;
 
         if rkyv::to_bytes(&Node::Internal(crate::types::Internal { kv: left.clone() }))?.len()
             <= page_content_size
@@ -76,11 +76,11 @@ pub fn split_index_leaf(
     let mut result = vec![];
     let mut current = vec![kv];
 
-    while let Some(kv) = current.pop() {
+    while let Some(mut kv) = current.pop() {
         debug_assert!(kv.len() >= 2);
         let mid = kv.len() / 2;
-        let left = kv[..mid].to_vec();
-        let right = kv[mid..].to_vec();
+        let right = kv.split_off(mid);
+        let left = kv;
 
         if rkyv::to_bytes(&IndexNode::Leaf(IndexLeaf { kv: left.clone() }))?.len()
             <= page_content_size
@@ -109,11 +109,11 @@ pub fn split_index_internal(
     let mut result = vec![];
     let mut current = vec![kv];
 
-    while let Some(kv) = current.pop() {
+    while let Some(mut kv) = current.pop() {
         debug_assert!(kv.len() >= 2);
         let mid = kv.len() / 2;
-        let left = kv[..mid].to_vec();
-        let right = kv[mid..].to_vec();
+        let right = kv.split_off(mid);
+        let left = kv;
 
         if rkyv::to_bytes(&IndexNode::Internal(IndexInternal { kv: left.clone() }))?.len()
             <= page_content_size
