@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 rkyv = "0.8.14"
+sqlparser = "0.55"
 thiserror = "2.0.18"
 
 [dev-dependencies]

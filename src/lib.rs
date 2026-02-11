@@ -1,5 +1,6 @@
 mod database;
 mod pager;
+pub mod sql;
 mod transaction;
 mod tree;
 mod types;
