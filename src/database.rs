@@ -1352,6 +1352,422 @@ mod tests {
         assert!(tx.find_table_meta("users").unwrap().is_none());
     }
 
+    // ── Transaction conflict tests ─────────────────────────────────
+
+    #[test]
+    fn test_conflict_write_write_same_key() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let key = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                },
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // Two concurrent transactions update the same row
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.update(
+            "users",
+            key,
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+            },
+        )
+        .unwrap();
+
+        tx2.update(
+            "users",
+            key,
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(32)],
+            },
+        )
+        .unwrap();
+
+        // First to commit fails — the other active tx has conflicting writes
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        // Second succeeds — conflicting tx is gone
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_read_write() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let key = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                },
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // tx1 reads a row, tx2 writes (updates) the same row
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.get("users", key).unwrap();
+
+        tx2.update(
+            "users",
+            key,
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+            },
+        )
+        .unwrap();
+
+        // First to commit fails — other active tx has conflicting read/write
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_delete_vs_read() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let key = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                },
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // tx1 reads the row, tx2 deletes it
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.get("users", key).unwrap();
+        tx2.delete("users", key).unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_range_scan_vs_insert() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let k1 = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                },
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // tx1 does a range scan, tx2 inserts a row whose key falls in that range
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.scan("users", k1..).unwrap();
+
+        let k2 = tx2
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
+                },
+            )
+            .unwrap();
+        // The new key should be >= k1 so it falls in the scanned range
+        assert!(k2 >= k1);
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_index_scan_vs_insert() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
+
+        // tx1 scans the index, tx2 inserts a row whose indexed value falls in range
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.scan_by_index("users", "name", b"A".to_vec()..b"Z".to_vec())
+            .unwrap();
+
+        tx2.insert(
+            "users",
+            &Row {
+                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
+            },
+        )
+        .unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_index_point_read_vs_insert() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
+
+        // tx1 does a point lookup on index value "Alice", tx2 inserts "Alice"
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.scan_by_index(
+            "users",
+            "name",
+            b"Alice".to_vec()..=b"Alice".to_vec(),
+        )
+        .unwrap();
+
+        tx2.insert(
+            "users",
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+            },
+        )
+        .unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_no_conflict_disjoint_rows() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let k1 = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                },
+            )
+            .unwrap();
+        let k2 = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
+                },
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // tx1 reads row k1, tx2 reads row k2 — no overlap
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.get("users", k1).unwrap();
+        tx2.get("users", k2).unwrap();
+
+        tx1.update(
+            "users",
+            k1,
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+            },
+        )
+        .unwrap();
+
+        tx2.update(
+            "users",
+            k2,
+            &Row {
+                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(26)],
+            },
+        )
+        .unwrap();
+
+        tx1.commit().unwrap();
+        tx2.commit().unwrap(); // should succeed — no conflict
+    }
+
+    #[test]
+    fn test_no_conflict_serial_transactions() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let key = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                },
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // tx1 commits before tx2 starts — no conflict possible
+        let tx1 = db.begin_transaction();
+        tx1.update(
+            "users",
+            key,
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+            },
+        )
+        .unwrap();
+        tx1.commit().unwrap();
+
+        let tx2 = db.begin_transaction();
+        tx2.update(
+            "users",
+            key,
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(32)],
+            },
+        )
+        .unwrap();
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_no_conflict_disjoint_index_ranges() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
+
+        // tx1 scans names A-B, tx2 inserts name starting with Z
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.scan_by_index("users", "name", b"A".to_vec()..b"C".to_vec())
+            .unwrap();
+
+        tx2.insert(
+            "users",
+            &Row {
+                values: vec![DbValue::Text("Zara".into()), DbValue::Integer(20)],
+            },
+        )
+        .unwrap();
+
+        tx2.commit().unwrap();
+        tx1.commit().unwrap(); // should succeed — "Zara" is outside A..C
+    }
+
+    #[test]
+    fn test_conflict_concurrent_inserts_same_index_value() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
+
+        // Both transactions insert with the same indexed column value
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.insert(
+            "users",
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+            },
+        )
+        .unwrap();
+
+        tx2.insert(
+            "users",
+            &Row {
+                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(25)],
+            },
+        )
+        .unwrap();
+
+        // First to commit fails — both wrote to same index value
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
+    #[test]
+    fn test_conflict_update_vs_index_scan() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.create_index("users", "name").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let key = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                },
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        // tx1 scans index range including "Bob", tx2 updates Alice → Bob
+        let tx1 = db.begin_transaction();
+        let tx2 = db.begin_transaction();
+
+        tx1.scan_by_index("users", "name", b"B".to_vec()..b"C".to_vec())
+            .unwrap();
+
+        tx2.update(
+            "users",
+            key,
+            &Row {
+                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(30)],
+            },
+        )
+        .unwrap();
+
+        let err = tx1.commit().unwrap_err();
+        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx2.commit().unwrap();
+    }
+
     #[test]
     fn test_multiple_indexes_on_table() {
         let (db, _tmp) = open_db();
