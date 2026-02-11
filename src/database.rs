@@ -194,6 +194,13 @@ impl<'a> DbTransaction<'a> {
         Ok(None)
     }
 
+    pub fn get_schema(&self, name: &str) -> Result<Schema, DatabaseError> {
+        let meta = self
+            .find_table_meta(name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+        Ok(meta.schema)
+    }
+
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<(), DatabaseError> {
         if self.find_table_meta(name)?.is_some() {
             return Err(DatabaseError::TableAlreadyExists(name.to_string()));

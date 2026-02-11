@@ -1,8 +1,10 @@
-use sqlparser::ast::{ColumnOption, DataType, Statement};
+use sqlparser::ast::{
+    ColumnOption, DataType, Expr, SetExpr, Statement, UnaryOperator, Value,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::database::{Column, ColumnType, DatabaseError, DbTransaction, Schema};
+use crate::database::{Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
@@ -12,6 +14,10 @@ pub enum SqlError {
     UnsupportedType(String),
     #[error("unsupported statement")]
     UnsupportedStatement,
+    #[error("unsupported expression: {0}")]
+    UnsupportedExpression(String),
+    #[error("invalid value: {0}")]
+    InvalidValue(String),
     #[error("database error: {0}")]
     Database(#[from] DatabaseError),
 }
@@ -23,6 +29,40 @@ fn map_data_type(data_type: &DataType) -> Result<ColumnType, SqlError> {
         DataType::Float(_) | DataType::Double(_) | DataType::Real => Ok(ColumnType::Float),
         DataType::Boolean | DataType::Bool => Ok(ColumnType::Bool),
         other => Err(SqlError::UnsupportedType(other.to_string())),
+    }
+}
+
+fn expr_to_dbvalue(expr: &Expr) -> Result<DbValue, SqlError> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) => {
+                if s.contains('.') {
+                    let f: f64 = s
+                        .parse()
+                        .map_err(|_| SqlError::InvalidValue(s.clone()))?;
+                    Ok(DbValue::Float(f))
+                } else {
+                    let i: i64 = s
+                        .parse()
+                        .map_err(|_| SqlError::InvalidValue(s.clone()))?;
+                    Ok(DbValue::Integer(i))
+                }
+            }
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                Ok(DbValue::Text(s.clone()))
+            }
+            Value::Boolean(b) => Ok(DbValue::Bool(*b)),
+            Value::Null => Ok(DbValue::Null),
+            other => Err(SqlError::UnsupportedExpression(other.to_string())),
+        },
+        Expr::UnaryOp { op, expr } if *op == UnaryOperator::Minus => {
+            match expr_to_dbvalue(expr)? {
+                DbValue::Integer(i) => Ok(DbValue::Integer(-i)),
+                DbValue::Float(f) => Ok(DbValue::Float(-f)),
+                other => Err(SqlError::UnsupportedExpression(format!("-{:?}", other))),
+            }
+        }
+        other => Err(SqlError::UnsupportedExpression(other.to_string())),
     }
 }
 
@@ -48,6 +88,57 @@ pub fn execute(tx: &DbTransaction, sql: &str) -> Result<(), SqlError> {
                 }
                 let schema = Schema { columns };
                 tx.create_table(&ct.name.to_string(), schema)?;
+            }
+            Statement::Insert(ins) => {
+                let table_name = ins.table.to_string();
+                let source = ins
+                    .source
+                    .as_ref()
+                    .ok_or(SqlError::UnsupportedStatement)?;
+                let rows_exprs = match source.body.as_ref() {
+                    SetExpr::Values(values) => &values.rows,
+                    _ => return Err(SqlError::UnsupportedStatement),
+                };
+
+                let column_map = if ins.columns.is_empty() {
+                    None
+                } else {
+                    let schema = tx.get_schema(&table_name)?;
+                    let mut map = Vec::with_capacity(ins.columns.len());
+                    for col in &ins.columns {
+                        let pos = schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name == col.value)
+                            .ok_or_else(|| {
+                                DatabaseError::SchemaMismatch(format!(
+                                    "column '{}' not found",
+                                    col.value
+                                ))
+                            })?;
+                        map.push(pos);
+                    }
+                    Some((map, schema.columns.len()))
+                };
+
+                for row_exprs in rows_exprs {
+                    let values: Vec<DbValue> = row_exprs
+                        .iter()
+                        .map(expr_to_dbvalue)
+                        .collect::<Result<_, _>>()?;
+
+                    let row = if let Some((ref map, total)) = column_map {
+                        let mut full = vec![DbValue::Null; total];
+                        for (i, pos) in map.iter().enumerate() {
+                            full[*pos] = values[i].clone();
+                        }
+                        Row { values: full }
+                    } else {
+                        Row { values }
+                    };
+
+                    tx.insert(&table_name, &row)?;
+                }
             }
             _ => return Err(SqlError::UnsupportedStatement),
         }
@@ -200,6 +291,127 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
+    }
+
+    #[test]
+    fn test_insert_basic() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)",
+        )
+        .unwrap();
+        execute(
+            &tx,
+            "INSERT INTO users VALUES ('Alice', 30)",
+        )
+        .unwrap();
+
+        let rows = tx.scan("users", ..).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.values[0], DbValue::Text("Alice".into()));
+        assert_eq!(rows[0].1.values[1], DbValue::Integer(30));
+    }
+
+    #[test]
+    fn test_insert_multiple_rows() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)",
+        )
+        .unwrap();
+        execute(
+            &tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)",
+        )
+        .unwrap();
+
+        let rows = tx.scan("users", ..).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_with_column_list() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE users (name TEXT NOT NULL, age INTEGER, active BOOLEAN)",
+        )
+        .unwrap();
+        execute(
+            &tx,
+            "INSERT INTO users (active, name) VALUES (true, 'Alice')",
+        )
+        .unwrap();
+
+        let rows = tx.scan("users", ..).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.values[0], DbValue::Text("Alice".into()));
+        assert_eq!(rows[0].1.values[1], DbValue::Null); // age omitted
+        assert_eq!(rows[0].1.values[2], DbValue::Bool(true));
+    }
+
+    #[test]
+    fn test_insert_all_types() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE t (i INTEGER, f FLOAT, t TEXT, b BOOLEAN)",
+        )
+        .unwrap();
+        execute(
+            &tx,
+            "INSERT INTO t VALUES (42, 3.14, 'hello', true)",
+        )
+        .unwrap();
+
+        let rows = tx.scan("t", ..).unwrap();
+        assert_eq!(rows[0].1.values[0], DbValue::Integer(42));
+        assert_eq!(rows[0].1.values[1], DbValue::Float(3.14));
+        assert_eq!(rows[0].1.values[2], DbValue::Text("hello".into()));
+        assert_eq!(rows[0].1.values[3], DbValue::Bool(true));
+    }
+
+    #[test]
+    fn test_insert_null() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (NULL, NULL)").unwrap();
+
+        let rows = tx.scan("t", ..).unwrap();
+        assert_eq!(rows[0].1.values[0], DbValue::Null);
+        assert_eq!(rows[0].1.values[1], DbValue::Null);
+    }
+
+    #[test]
+    fn test_insert_negative_numbers() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (i INTEGER, f FLOAT)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (-42, -3.14)").unwrap();
+
+        let rows = tx.scan("t", ..).unwrap();
+        assert_eq!(rows[0].1.values[0], DbValue::Integer(-42));
+        assert_eq!(rows[0].1.values[1], DbValue::Float(-3.14));
+    }
+
+    #[test]
+    fn test_insert_schema_mismatch() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE t (a INTEGER NOT NULL)",
+        )
+        .unwrap();
+        let err = execute(&tx, "INSERT INTO t VALUES (NULL)").unwrap_err();
+        assert!(matches!(err, SqlError::Database(_)));
     }
 
     #[test]
