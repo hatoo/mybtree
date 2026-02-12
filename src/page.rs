@@ -129,3 +129,78 @@ impl<const N: usize> InternalPage<N> {
         new_page
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_page_new_is_empty() {
+        let page = InternalPage::<4096>::new();
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn internal_page_insert_single() {
+        let mut page = InternalPage::<4096>::new();
+        page.insert(10, 100);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.key(0), 10);
+        assert_eq!(page.ptr(0), 100);
+    }
+
+    #[test]
+    fn internal_page_insert_maintains_sorted_order() {
+        let mut page = InternalPage::<4096>::new();
+        page.insert(30, 300);
+        page.insert(10, 100);
+        page.insert(20, 200);
+
+        assert_eq!(page.len(), 3);
+        assert_eq!(page.key(0), 10);
+        assert_eq!(page.key(1), 20);
+        assert_eq!(page.key(2), 30);
+        assert_eq!(page.ptr(0), 100);
+        assert_eq!(page.ptr(1), 200);
+        assert_eq!(page.ptr(2), 300);
+    }
+
+    #[test]
+    fn internal_page_remove_middle() {
+        let mut page = InternalPage::<4096>::new();
+        page.insert(10, 100);
+        page.insert(20, 200);
+        page.insert(30, 300);
+
+        page.remove(1);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.key(0), 10);
+        assert_eq!(page.key(1), 30);
+    }
+
+    #[test]
+    fn internal_page_split_divides_elements() {
+        let mut page = InternalPage::<4096>::new();
+        for i in 0..6 {
+            page.insert(i * 10, i * 100);
+        }
+
+        let right = page.split();
+        assert_eq!(page.len(), 3);
+        assert_eq!(right.len(), 3);
+
+        // left has first half
+        assert_eq!(page.key(0), 0);
+        assert_eq!(page.key(2), 20);
+
+        // right has second half
+        assert_eq!(right.key(0), 30);
+        assert_eq!(right.key(2), 50);
+    }
+
+    #[test]
+    fn internal_page_can_insert_on_new() {
+        let page = InternalPage::<4096>::new();
+        assert!(page.can_insert());
+    }
+}
