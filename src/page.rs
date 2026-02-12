@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use crate::{Key, NodePtr};
+use crate::{Key, NodePtr, Pager};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +155,8 @@ impl<const N: usize> LeafPage<N> {
     const DATA_OFFSET: usize = 6;
     const HEADER_SIZE: usize = 8;
     const SLOT_SIZE: usize = std::mem::size_of::<Key>() + 2 + 2; // key + value_offset + value_len
+    const OVERFLOW_FLAG: u16 = 0x8000;
+    const OVERFLOW_META_SIZE: usize = 16;
 
     pub fn new() -> Self {
         let mut leaf = Self { page: [0; N] };
@@ -189,6 +191,66 @@ impl<const N: usize> LeafPage<N> {
             .copy_from_slice(&(offset as u16).to_le_bytes());
     }
 
+    fn inline_len(value_len: u16) -> usize {
+        (value_len & !Self::OVERFLOW_FLAG) as usize
+    }
+
+    pub fn is_overflow(&self, index: usize) -> bool {
+        debug_assert!(index < self.len());
+        let slot = Self::HEADER_SIZE + index * Self::SLOT_SIZE + std::mem::size_of::<Key>();
+        let value_len = u16::from_le_bytes([self.page[slot + 2], self.page[slot + 3]]);
+        value_len & Self::OVERFLOW_FLAG != 0
+    }
+
+    pub fn needs_overflow(value_len: usize) -> bool {
+        value_len > (N - Self::HEADER_SIZE) / 2
+    }
+
+    fn write_overflow(pager: &mut Pager, data: &[u8]) -> u64 {
+        let data_per_page = pager.page_size() - 8;
+        let num_pages = (data.len() + data_per_page - 1) / data_per_page;
+        assert!(num_pages > 0);
+
+        let pages: Vec<u64> = (0..num_pages).map(|_| pager.next_page_num()).collect();
+
+        for (i, &page_num) in pages.iter().enumerate() {
+            let next_page = if i + 1 < pages.len() {
+                pages[i + 1]
+            } else {
+                u64::MAX
+            };
+            let start = i * data_per_page;
+            let end = std::cmp::min(start + data_per_page, data.len());
+            let chunk = &data[start..end];
+
+            let mut page_data = vec![0u8; pager.page_size()];
+            page_data[0..8].copy_from_slice(&next_page.to_le_bytes());
+            page_data[8..8 + chunk.len()].copy_from_slice(chunk);
+
+            pager.write_raw_page(page_num, &page_data).unwrap();
+        }
+
+        pages[0]
+    }
+
+    pub fn read_overflow(pager: &mut Pager, start_page: u64, total_len: u64) -> Vec<u8> {
+        let data_per_page = pager.page_size() - 8;
+        let mut result = Vec::with_capacity(total_len as usize);
+        let mut current_page = start_page;
+        let mut remaining = total_len as usize;
+
+        while remaining > 0 {
+            let buffer = pager.read_raw_page(current_page).unwrap();
+            let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+            let chunk_len = std::cmp::min(data_per_page, remaining);
+            result.extend_from_slice(&buffer[8..8 + chunk_len]);
+            remaining -= chunk_len;
+            current_page = next_page;
+        }
+
+        result
+    }
+
     pub fn key(&self, index: usize) -> Key {
         debug_assert!(index < self.len());
         let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
@@ -203,7 +265,8 @@ impl<const N: usize> LeafPage<N> {
         debug_assert!(index < self.len());
         let slot = Self::HEADER_SIZE + index * Self::SLOT_SIZE + std::mem::size_of::<Key>();
         let value_offset = u16::from_le_bytes([self.page[slot], self.page[slot + 1]]) as usize;
-        let value_len = u16::from_le_bytes([self.page[slot + 2], self.page[slot + 3]]) as usize;
+        let raw_value_len = u16::from_le_bytes([self.page[slot + 2], self.page[slot + 3]]);
+        let value_len = Self::inline_len(raw_value_len);
         &self.page[value_offset..value_offset + value_len]
     }
 
@@ -248,10 +311,17 @@ impl<const N: usize> LeafPage<N> {
         if left == self.len() { None } else { Some(left) }
     }
 
-    pub fn get(&self, key: Key) -> Option<Cow<'_, [u8]>> {
+    pub fn get(&self, key: Key, pager: &mut Pager) -> Option<Cow<'_, [u8]>> {
         let idx = self.search(key)?;
         if self.key(idx) == key {
-            Some(Cow::Borrowed(self.value(idx)))
+            if self.is_overflow(idx) {
+                let meta = self.value(idx);
+                let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                Some(Cow::Owned(Self::read_overflow(pager, start_page, total_len)))
+            } else {
+                Some(Cow::Borrowed(self.value(idx)))
+            }
         } else {
             None
         }
@@ -265,12 +335,19 @@ impl<const N: usize> LeafPage<N> {
 
     /// Total free space including dead gaps left by removed values.
     fn free_space(&self) -> usize {
-        let used_value_space: usize = (0..self.len()).map(|i| self.read_slot(i).2 as usize).sum();
+        let used_value_space: usize = (0..self.len())
+            .map(|i| Self::inline_len(self.read_slot(i).2))
+            .sum();
         N - Self::HEADER_SIZE - self.len() * Self::SLOT_SIZE - used_value_space
     }
 
     pub fn can_insert(&self, value_len: usize) -> bool {
-        self.free_space() >= Self::SLOT_SIZE + value_len
+        let inline_size = if Self::needs_overflow(value_len) {
+            Self::OVERFLOW_META_SIZE
+        } else {
+            value_len
+        };
+        self.free_space() >= Self::SLOT_SIZE + inline_size
     }
 
     /// Compact the value data region, eliminating dead gaps.
@@ -279,7 +356,7 @@ impl<const N: usize> LeafPage<N> {
         let mut new_data_offset = N;
         for i in 0..len {
             let (k, vo, vl) = self.read_slot(i);
-            let val_len = vl as usize;
+            let val_len = Self::inline_len(vl);
             new_data_offset -= val_len;
             // Copy value to new position (use copy_within to handle overlap)
             self.page
@@ -289,17 +366,19 @@ impl<const N: usize> LeafPage<N> {
         self.set_data_offset(new_data_offset);
     }
 
-    pub fn insert(&mut self, key: Key, value: &[u8]) {
-        debug_assert!(self.can_insert(value.len()));
+    /// Internal insert that stores raw inline bytes with the given raw_value_len
+    /// (which may include OVERFLOW_FLAG).
+    fn insert_raw(&mut self, key: Key, inline_data: &[u8], raw_value_len: u16) {
+        let inline_size = inline_data.len();
 
         // Compact if contiguous free space is insufficient
-        if self.contiguous_free_space() < Self::SLOT_SIZE + value.len() {
+        if self.contiguous_free_space() < Self::SLOT_SIZE + inline_size {
             self.compact();
         }
 
         // Allocate value space from the end
-        let new_data_offset = self.data_offset() - value.len();
-        self.page[new_data_offset..new_data_offset + value.len()].copy_from_slice(value);
+        let new_data_offset = self.data_offset() - inline_size;
+        self.page[new_data_offset..new_data_offset + inline_size].copy_from_slice(inline_data);
         self.set_data_offset(new_data_offset);
 
         let idx = self.search(key).unwrap_or(self.len());
@@ -311,8 +390,22 @@ impl<const N: usize> LeafPage<N> {
             self.write_slot(i + 1, k, vo, vl);
         }
 
-        self.write_slot(idx, key, new_data_offset as u16, value.len() as u16);
+        self.write_slot(idx, key, new_data_offset as u16, raw_value_len);
         self.set_len(len + 1);
+    }
+
+    pub fn insert(&mut self, key: Key, value: &[u8], pager: &mut Pager) {
+        debug_assert!(self.can_insert(value.len()));
+
+        if Self::needs_overflow(value.len()) {
+            let start_page = Self::write_overflow(pager, value);
+            let mut meta = [0u8; 16];
+            meta[0..8].copy_from_slice(&start_page.to_le_bytes());
+            meta[8..16].copy_from_slice(&(value.len() as u64).to_le_bytes());
+            self.insert_raw(key, &meta, Self::OVERFLOW_META_SIZE as u16 | Self::OVERFLOW_FLAG);
+        } else {
+            self.insert_raw(key, value, value.len() as u16);
+        }
     }
 
     pub fn remove(&mut self, index: usize) {
@@ -334,7 +427,8 @@ impl<const N: usize> LeafPage<N> {
         let mid = len / 2;
         let mut new_page = Self::new();
         for i in mid..len {
-            new_page.insert(self.key(i), self.value(i));
+            let (_, _, vl) = self.read_slot(i);
+            new_page.insert_raw(self.key(i), self.value(i), vl);
         }
         self.set_len(mid);
         self.compact();
@@ -355,6 +449,11 @@ impl<const N: usize> fmt::Debug for LeafPage<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pager(page_size: usize) -> Pager {
+        let file = tempfile::tempfile().unwrap();
+        Pager::new(file, page_size)
+    }
 
     #[test]
     fn internal_page_new_is_empty() {
@@ -435,7 +534,8 @@ mod tests {
     #[test]
     fn leaf_page_insert_single() {
         let mut page = LeafPage::<4096>::new();
-        page.insert(10, b"hello");
+        let mut pager = test_pager(4096);
+        page.insert(10, b"hello", &mut pager);
         assert_eq!(page.len(), 1);
         assert_eq!(page.key(0), 10);
         assert_eq!(page.value(0), b"hello");
@@ -444,9 +544,10 @@ mod tests {
     #[test]
     fn leaf_page_insert_maintains_sorted_order() {
         let mut page = LeafPage::<4096>::new();
-        page.insert(30, b"ccc");
-        page.insert(10, b"aaa");
-        page.insert(20, b"bbb");
+        let mut pager = test_pager(4096);
+        page.insert(30, b"ccc", &mut pager);
+        page.insert(10, b"aaa", &mut pager);
+        page.insert(20, b"bbb", &mut pager);
 
         assert_eq!(page.len(), 3);
         assert_eq!(page.key(0), 10);
@@ -466,9 +567,10 @@ mod tests {
     #[test]
     fn leaf_page_remove_middle() {
         let mut page = LeafPage::<4096>::new();
-        page.insert(10, b"aaa");
-        page.insert(20, b"bbb");
-        page.insert(30, b"ccc");
+        let mut pager = test_pager(4096);
+        page.insert(10, b"aaa", &mut pager);
+        page.insert(20, b"bbb", &mut pager);
+        page.insert(30, b"ccc", &mut pager);
 
         page.remove(1);
         assert_eq!(page.len(), 2);
@@ -481,8 +583,9 @@ mod tests {
     #[test]
     fn leaf_page_remove_reclaims_space() {
         let mut page = LeafPage::<4096>::new();
-        page.insert(10, b"aaa");
-        page.insert(20, b"bbb");
+        let mut pager = test_pager(4096);
+        page.insert(10, b"aaa", &mut pager);
+        page.insert(20, b"bbb", &mut pager);
         let free_before = page.free_space();
         page.remove(0);
         let free_after = page.free_space();
@@ -492,24 +595,26 @@ mod tests {
     #[test]
     fn leaf_page_insert_after_remove_compacts() {
         let mut page = LeafPage::<128>::new();
+        let mut pager = test_pager(4096);
         // Fill the page
         for i in 0..5 {
-            page.insert(i, &[i as u8; 10]);
+            page.insert(i, &[i as u8; 10], &mut pager);
         }
         // Remove some entries to create dead space
         page.remove(1);
         page.remove(1);
         // Insert should succeed by compacting dead space
         assert!(page.can_insert(10));
-        page.insert(100, &[0xAA; 10]);
+        page.insert(100, &[0xAA; 10], &mut pager);
         assert_eq!(page.value(page.len() - 1), &[0xAA; 10]);
     }
 
     #[test]
     fn leaf_page_split_divides_elements() {
         let mut page = LeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
         for i in 0u64..6 {
-            page.insert(i * 10, &[i as u8; 5]);
+            page.insert(i * 10, &[i as u8; 5], &mut pager);
         }
 
         let right = page.split();
@@ -525,5 +630,66 @@ mod tests {
         assert_eq!(right.key(2), 50);
         assert_eq!(right.value(0), &[3u8; 5]);
         assert_eq!(right.value(2), &[5u8; 5]);
+    }
+
+    #[test]
+    fn leaf_page_overflow_insert_and_get() {
+        let mut page = LeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        // Value larger than (4096 - 8) / 2 = 2044 triggers overflow
+        let big_value = vec![0xABu8; 2100];
+        assert!(LeafPage::<4096>::needs_overflow(big_value.len()));
+
+        page.insert(42, &big_value, &mut pager);
+        assert_eq!(page.len(), 1);
+        assert!(page.is_overflow(0));
+
+        // get should read back the full value from overflow pages
+        let retrieved = page.get(42, &mut pager).unwrap();
+        assert_eq!(retrieved.as_ref(), &big_value[..]);
+    }
+
+    #[test]
+    fn leaf_page_overflow_mixed_with_inline() {
+        let mut page = LeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        let small_value = b"hello";
+        let big_value = vec![0xCDu8; 2100];
+
+        page.insert(10, small_value, &mut pager);
+        page.insert(20, &big_value, &mut pager);
+        page.insert(30, b"world", &mut pager);
+
+        assert!(!page.is_overflow(0));
+        assert!(page.is_overflow(1));
+        assert!(!page.is_overflow(2));
+
+        assert_eq!(page.get(10, &mut pager).unwrap().as_ref(), b"hello");
+        assert_eq!(page.get(20, &mut pager).unwrap().as_ref(), &big_value[..]);
+        assert_eq!(page.get(30, &mut pager).unwrap().as_ref(), b"world");
+    }
+
+    #[test]
+    fn leaf_page_overflow_split_preserves_data() {
+        let mut page = LeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        // Insert several small values and one overflow
+        for i in 0u64..4 {
+            page.insert(i * 10, &[i as u8; 5], &mut pager);
+        }
+        let big_value = vec![0xEFu8; 2100];
+        page.insert(40, &big_value, &mut pager);
+        page.insert(50, &[5u8; 5], &mut pager);
+
+        let right = page.split();
+
+        // Verify overflow entry is preserved in the right page
+        // mid = 3, so right has keys 30, 40, 50
+        assert!(right.is_overflow(1)); // key 40
+        let retrieved = right.get(40, &mut pager).unwrap();
+        assert_eq!(retrieved.as_ref(), &big_value[..]);
     }
 }
