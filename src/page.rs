@@ -9,6 +9,55 @@ pub enum PageType {
     Leaf,
     Internal,
     IndexInternal,
+    IndexLeaf,
+}
+
+const OVERFLOW_FLAG: u16 = 0x8000;
+const OVERFLOW_META_SIZE: usize = 16;
+
+fn write_overflow(pager: &mut Pager, data: &[u8]) -> u64 {
+    let data_per_page = pager.page_size() - 8;
+    let num_pages = (data.len() + data_per_page - 1) / data_per_page;
+    assert!(num_pages > 0);
+
+    let pages: Vec<u64> = (0..num_pages).map(|_| pager.next_page_num()).collect();
+
+    for (i, &page_num) in pages.iter().enumerate() {
+        let next_page = if i + 1 < pages.len() {
+            pages[i + 1]
+        } else {
+            u64::MAX
+        };
+        let start = i * data_per_page;
+        let end = std::cmp::min(start + data_per_page, data.len());
+        let chunk = &data[start..end];
+
+        let mut page_data = vec![0u8; pager.page_size()];
+        page_data[0..8].copy_from_slice(&next_page.to_le_bytes());
+        page_data[8..8 + chunk.len()].copy_from_slice(chunk);
+
+        pager.write_raw_page(page_num, &page_data).unwrap();
+    }
+
+    pages[0]
+}
+
+pub fn read_overflow(pager: &mut Pager, start_page: u64, total_len: u64) -> Vec<u8> {
+    let data_per_page = pager.page_size() - 8;
+    let mut result = Vec::with_capacity(total_len as usize);
+    let mut current_page = start_page;
+    let mut remaining = total_len as usize;
+
+    while remaining > 0 {
+        let buffer = pager.read_raw_page(current_page).unwrap();
+        let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+        let chunk_len = std::cmp::min(data_per_page, remaining);
+        result.extend_from_slice(&buffer[8..8 + chunk_len]);
+        remaining -= chunk_len;
+        current_page = next_page;
+    }
+
+    result
 }
 
 #[repr(align(4096))]
@@ -26,6 +75,12 @@ pub struct LeafPage<const N: usize> {
 #[repr(align(4096))]
 #[derive(Clone)]
 pub struct IndexInternalPage<const N: usize> {
+    page: [u8; N],
+}
+
+#[repr(align(4096))]
+#[derive(Clone)]
+pub struct IndexLeafPage<const N: usize> {
     page: [u8; N],
 }
 
@@ -162,8 +217,6 @@ impl<const N: usize> LeafPage<N> {
     const DATA_OFFSET: usize = 6;
     const HEADER_SIZE: usize = 8;
     const SLOT_SIZE: usize = std::mem::size_of::<Key>() + 2 + 2; // key + value_offset + value_len
-    const OVERFLOW_FLAG: u16 = 0x8000;
-    const OVERFLOW_META_SIZE: usize = 16;
 
     pub fn new() -> Self {
         let mut leaf = Self { page: [0; N] };
@@ -199,63 +252,18 @@ impl<const N: usize> LeafPage<N> {
     }
 
     fn inline_len(value_len: u16) -> usize {
-        (value_len & !Self::OVERFLOW_FLAG) as usize
+        (value_len & !OVERFLOW_FLAG) as usize
     }
 
     pub fn is_overflow(&self, index: usize) -> bool {
         debug_assert!(index < self.len());
         let slot = Self::HEADER_SIZE + index * Self::SLOT_SIZE + std::mem::size_of::<Key>();
         let value_len = u16::from_le_bytes([self.page[slot + 2], self.page[slot + 3]]);
-        value_len & Self::OVERFLOW_FLAG != 0
+        value_len & OVERFLOW_FLAG != 0
     }
 
     pub fn needs_overflow(value_len: usize) -> bool {
         value_len > (N - Self::HEADER_SIZE) / 2
-    }
-
-    fn write_overflow(pager: &mut Pager, data: &[u8]) -> u64 {
-        let data_per_page = pager.page_size() - 8;
-        let num_pages = (data.len() + data_per_page - 1) / data_per_page;
-        assert!(num_pages > 0);
-
-        let pages: Vec<u64> = (0..num_pages).map(|_| pager.next_page_num()).collect();
-
-        for (i, &page_num) in pages.iter().enumerate() {
-            let next_page = if i + 1 < pages.len() {
-                pages[i + 1]
-            } else {
-                u64::MAX
-            };
-            let start = i * data_per_page;
-            let end = std::cmp::min(start + data_per_page, data.len());
-            let chunk = &data[start..end];
-
-            let mut page_data = vec![0u8; pager.page_size()];
-            page_data[0..8].copy_from_slice(&next_page.to_le_bytes());
-            page_data[8..8 + chunk.len()].copy_from_slice(chunk);
-
-            pager.write_raw_page(page_num, &page_data).unwrap();
-        }
-
-        pages[0]
-    }
-
-    pub fn read_overflow(pager: &mut Pager, start_page: u64, total_len: u64) -> Vec<u8> {
-        let data_per_page = pager.page_size() - 8;
-        let mut result = Vec::with_capacity(total_len as usize);
-        let mut current_page = start_page;
-        let mut remaining = total_len as usize;
-
-        while remaining > 0 {
-            let buffer = pager.read_raw_page(current_page).unwrap();
-            let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
-            let chunk_len = std::cmp::min(data_per_page, remaining);
-            result.extend_from_slice(&buffer[8..8 + chunk_len]);
-            remaining -= chunk_len;
-            current_page = next_page;
-        }
-
-        result
     }
 
     pub fn key(&self, index: usize) -> Key {
@@ -325,7 +333,7 @@ impl<const N: usize> LeafPage<N> {
                 let meta = self.value(idx);
                 let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
                 let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                Some(Cow::Owned(Self::read_overflow(pager, start_page, total_len)))
+                Some(Cow::Owned(read_overflow(pager, start_page, total_len)))
             } else {
                 Some(Cow::Borrowed(self.value(idx)))
             }
@@ -350,7 +358,7 @@ impl<const N: usize> LeafPage<N> {
 
     pub fn can_insert(&self, value_len: usize) -> bool {
         let inline_size = if Self::needs_overflow(value_len) {
-            Self::OVERFLOW_META_SIZE
+            OVERFLOW_META_SIZE
         } else {
             value_len
         };
@@ -405,11 +413,11 @@ impl<const N: usize> LeafPage<N> {
         debug_assert!(self.can_insert(value.len()));
 
         if Self::needs_overflow(value.len()) {
-            let start_page = Self::write_overflow(pager, value);
+            let start_page = write_overflow(pager, value);
             let mut meta = [0u8; 16];
             meta[0..8].copy_from_slice(&start_page.to_le_bytes());
             meta[8..16].copy_from_slice(&(value.len() as u64).to_le_bytes());
-            self.insert_raw(key, &meta, Self::OVERFLOW_META_SIZE as u16 | Self::OVERFLOW_FLAG);
+            self.insert_raw(key, &meta, OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG);
         } else {
             self.insert_raw(key, value, value.len() as u16);
         }
@@ -453,160 +461,244 @@ impl<const N: usize> fmt::Debug for LeafPage<N> {
     }
 }
 
-impl<const N: usize> IndexInternalPage<N> {
-    const LEN_OFFSET: usize = 4;
-    const DATA_OFFSET: usize = 6;
-    const HEADER_SIZE: usize = 8;
-    const SLOT_SIZE: usize = 2 + 2 + 8; // key_offset + key_len + ptr
-    const OVERFLOW_FLAG: u16 = 0x8000;
-    const OVERFLOW_META_SIZE: usize = 16;
+/// Shared implementation for bytes-keyed pages (IndexInternalPage / IndexLeafPage).
+///
+/// Layout: `[page_type: u32][len: u16][data_offset: u16][slots...][free...][key_data...]`
+/// Slot: `[key_offset: u16][key_len: u16][value: u64]` (12 bytes)
+macro_rules! impl_bytes_keyed_page {
+    ($name:ident, $page_type:expr) => {
+        impl<const N: usize> $name<N> {
+            const LEN_OFFSET: usize = 4;
+            const DATA_OFFSET: usize = 6;
+            const HEADER_SIZE: usize = 8;
+            const SLOT_SIZE: usize = 2 + 2 + 8; // key_offset + key_len + value(u64)
 
-    pub fn new() -> Self {
-        let mut page = Self { page: [0; N] };
-        page.page[0..4].copy_from_slice(&(PageType::IndexInternal as u32).to_le_bytes());
-        page.set_data_offset(N);
-        page
-    }
+            pub fn new() -> Self {
+                let mut page = Self { page: [0; N] };
+                page.page[0..4].copy_from_slice(&($page_type as u32).to_le_bytes());
+                page.set_data_offset(N);
+                page
+            }
 
-    pub fn len(&self) -> usize {
-        usize::from(u16::from_le_bytes([
-            self.page[Self::LEN_OFFSET],
-            self.page[Self::LEN_OFFSET + 1],
-        ]))
-    }
+            pub fn len(&self) -> usize {
+                usize::from(u16::from_le_bytes([
+                    self.page[Self::LEN_OFFSET],
+                    self.page[Self::LEN_OFFSET + 1],
+                ]))
+            }
 
-    fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= u16::MAX as usize);
-        self.page[Self::LEN_OFFSET..Self::LEN_OFFSET + 2]
-            .copy_from_slice(&(len as u16).to_le_bytes());
-    }
+            fn set_len(&mut self, len: usize) {
+                debug_assert!(len <= u16::MAX as usize);
+                self.page[Self::LEN_OFFSET..Self::LEN_OFFSET + 2]
+                    .copy_from_slice(&(len as u16).to_le_bytes());
+            }
 
-    fn data_offset(&self) -> usize {
-        usize::from(u16::from_le_bytes([
-            self.page[Self::DATA_OFFSET],
-            self.page[Self::DATA_OFFSET + 1],
-        ]))
-    }
+            fn data_offset(&self) -> usize {
+                usize::from(u16::from_le_bytes([
+                    self.page[Self::DATA_OFFSET],
+                    self.page[Self::DATA_OFFSET + 1],
+                ]))
+            }
 
-    fn set_data_offset(&mut self, offset: usize) {
-        debug_assert!(offset <= u16::MAX as usize);
-        self.page[Self::DATA_OFFSET..Self::DATA_OFFSET + 2]
-            .copy_from_slice(&(offset as u16).to_le_bytes());
-    }
+            fn set_data_offset(&mut self, offset: usize) {
+                debug_assert!(offset <= u16::MAX as usize);
+                self.page[Self::DATA_OFFSET..Self::DATA_OFFSET + 2]
+                    .copy_from_slice(&(offset as u16).to_le_bytes());
+            }
 
-    fn inline_len(key_len: u16) -> usize {
-        (key_len & !Self::OVERFLOW_FLAG) as usize
-    }
+            fn inline_len(key_len: u16) -> usize {
+                (key_len & !OVERFLOW_FLAG) as usize
+            }
 
-    pub fn is_overflow(&self, index: usize) -> bool {
-        debug_assert!(index < self.len());
-        let (_, key_len, _) = self.read_slot(index);
-        key_len & Self::OVERFLOW_FLAG != 0
-    }
+            pub fn is_overflow(&self, index: usize) -> bool {
+                debug_assert!(index < self.len());
+                let (_, key_len, _) = self.read_slot(index);
+                key_len & OVERFLOW_FLAG != 0
+            }
 
-    pub fn needs_overflow(key_len: usize) -> bool {
-        key_len > (N - Self::HEADER_SIZE) / 2
-    }
+            pub fn needs_overflow(key_len: usize) -> bool {
+                key_len > (N - Self::HEADER_SIZE) / 2
+            }
 
-    fn write_overflow(pager: &mut Pager, data: &[u8]) -> u64 {
-        let data_per_page = pager.page_size() - 8;
-        let num_pages = (data.len() + data_per_page - 1) / data_per_page;
-        assert!(num_pages > 0);
+            pub fn key(&self, index: usize) -> &[u8] {
+                debug_assert!(index < self.len());
+                let (key_offset, key_len, _) = self.read_slot(index);
+                let len = Self::inline_len(key_len);
+                &self.page[key_offset as usize..key_offset as usize + len]
+            }
 
-        let pages: Vec<u64> = (0..num_pages).map(|_| pager.next_page_num()).collect();
+            fn slot_value(&self, index: usize) -> u64 {
+                debug_assert!(index < self.len());
+                let (_, _, v) = self.read_slot(index);
+                v
+            }
 
-        for (i, &page_num) in pages.iter().enumerate() {
-            let next_page = if i + 1 < pages.len() {
-                pages[i + 1]
-            } else {
-                u64::MAX
-            };
-            let start = i * data_per_page;
-            let end = std::cmp::min(start + data_per_page, data.len());
-            let chunk = &data[start..end];
+            fn write_slot(&mut self, index: usize, key_offset: u16, key_len: u16, value: u64) {
+                let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
+                self.page[offset..offset + 2].copy_from_slice(&key_offset.to_le_bytes());
+                self.page[offset + 2..offset + 4].copy_from_slice(&key_len.to_le_bytes());
+                self.page[offset + 4..offset + 12].copy_from_slice(&value.to_le_bytes());
+            }
 
-            let mut page_data = vec![0u8; pager.page_size()];
-            page_data[0..8].copy_from_slice(&next_page.to_le_bytes());
-            page_data[8..8 + chunk.len()].copy_from_slice(chunk);
+            fn read_slot(&self, index: usize) -> (u16, u16, u64) {
+                let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
+                let ko = u16::from_le_bytes([self.page[offset], self.page[offset + 1]]);
+                let kl = u16::from_le_bytes([self.page[offset + 2], self.page[offset + 3]]);
+                let v = u64::from_le_bytes(
+                    self.page[offset + 4..offset + 12].try_into().unwrap(),
+                );
+                (ko, kl, v)
+            }
 
-            pager.write_raw_page(page_num, &page_data).unwrap();
-        }
+            pub fn resolved_key<'a>(&'a self, index: usize, pager: &mut Pager) -> Cow<'a, [u8]> {
+                if self.is_overflow(index) {
+                    let meta = self.key(index);
+                    let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                    let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                    Cow::Owned(read_overflow(pager, start_page, total_len))
+                } else {
+                    Cow::Borrowed(self.key(index))
+                }
+            }
 
-        pages[0]
-    }
+            fn search(&self, target: &[u8], pager: &mut Pager) -> Option<usize> {
+                let mut left = 0;
+                let mut right = self.len();
+                while left < right {
+                    let mid = (left + right) / 2;
+                    let mid_key = self.resolved_key(mid, pager);
+                    if mid_key.as_ref() < target {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                if left == self.len() { None } else { Some(left) }
+            }
 
-    pub fn read_overflow(pager: &mut Pager, start_page: u64, total_len: u64) -> Vec<u8> {
-        let data_per_page = pager.page_size() - 8;
-        let mut result = Vec::with_capacity(total_len as usize);
-        let mut current_page = start_page;
-        let mut remaining = total_len as usize;
+            fn contiguous_free_space(&self) -> usize {
+                let slots_end = Self::HEADER_SIZE + self.len() * Self::SLOT_SIZE;
+                self.data_offset().saturating_sub(slots_end)
+            }
 
-        while remaining > 0 {
-            let buffer = pager.read_raw_page(current_page).unwrap();
-            let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
-            let chunk_len = std::cmp::min(data_per_page, remaining);
-            result.extend_from_slice(&buffer[8..8 + chunk_len]);
-            remaining -= chunk_len;
-            current_page = next_page;
-        }
+            fn free_space(&self) -> usize {
+                let used_key_space: usize = (0..self.len())
+                    .map(|i| Self::inline_len(self.read_slot(i).1))
+                    .sum();
+                N - Self::HEADER_SIZE - self.len() * Self::SLOT_SIZE - used_key_space
+            }
 
-        result
-    }
+            pub fn can_insert(&self, key_len: usize) -> bool {
+                let inline_size = if Self::needs_overflow(key_len) {
+                    OVERFLOW_META_SIZE
+                } else {
+                    key_len
+                };
+                self.free_space() >= Self::SLOT_SIZE + inline_size
+            }
 
-    pub fn key(&self, index: usize) -> &[u8] {
-        debug_assert!(index < self.len());
-        let (key_offset, key_len, _) = self.read_slot(index);
-        let len = Self::inline_len(key_len);
-        &self.page[key_offset as usize..key_offset as usize + len]
-    }
+            fn compact(&mut self) {
+                let len = self.len();
+                let mut new_data_offset = N;
+                for i in 0..len {
+                    let (ko, kl, v) = self.read_slot(i);
+                    let key_len = Self::inline_len(kl);
+                    new_data_offset -= key_len;
+                    self.page
+                        .copy_within(ko as usize..ko as usize + key_len, new_data_offset);
+                    self.write_slot(i, new_data_offset as u16, kl, v);
+                }
+                self.set_data_offset(new_data_offset);
+            }
 
-    pub fn ptr(&self, index: usize) -> NodePtr {
-        debug_assert!(index < self.len());
-        let (_, _, ptr) = self.read_slot(index);
-        ptr
-    }
+            fn insert_raw(&mut self, key_bytes: &[u8], raw_key_len: u16, value: u64, pager: &mut Pager) {
+                let inline_size = key_bytes.len();
 
-    fn write_slot(&mut self, index: usize, key_offset: u16, key_len: u16, ptr: NodePtr) {
-        let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
-        self.page[offset..offset + 2].copy_from_slice(&key_offset.to_le_bytes());
-        self.page[offset + 2..offset + 4].copy_from_slice(&key_len.to_le_bytes());
-        self.page[offset + 4..offset + 12].copy_from_slice(&ptr.to_le_bytes());
-    }
+                if self.contiguous_free_space() < Self::SLOT_SIZE + inline_size {
+                    self.compact();
+                }
 
-    fn read_slot(&self, index: usize) -> (u16, u16, NodePtr) {
-        let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
-        let ko = u16::from_le_bytes([self.page[offset], self.page[offset + 1]]);
-        let kl = u16::from_le_bytes([self.page[offset + 2], self.page[offset + 3]]);
-        let ptr = NodePtr::from_le_bytes(
-            self.page[offset + 4..offset + 12].try_into().unwrap(),
-        );
-        (ko, kl, ptr)
-    }
+                let new_data_offset = self.data_offset() - inline_size;
+                self.page[new_data_offset..new_data_offset + inline_size].copy_from_slice(key_bytes);
+                self.set_data_offset(new_data_offset);
 
-    pub fn resolved_key<'a>(&'a self, index: usize, pager: &mut Pager) -> Cow<'a, [u8]> {
-        if self.is_overflow(index) {
-            let meta = self.key(index);
-            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-            Cow::Owned(Self::read_overflow(pager, start_page, total_len))
-        } else {
-            Cow::Borrowed(self.key(index))
-        }
-    }
+                let idx = self.search(key_bytes, pager).unwrap_or(self.len());
+                let len = self.len();
 
-    fn search(&self, target: &[u8], pager: &mut Pager) -> Option<usize> {
-        let mut left = 0;
-        let mut right = self.len();
-        while left < right {
-            let mid = (left + right) / 2;
-            let mid_key = self.resolved_key(mid, pager);
-            if mid_key.as_ref() < target {
-                left = mid + 1;
-            } else {
-                right = mid;
+                for i in (idx..len).rev() {
+                    let (ko, kl, v) = self.read_slot(i);
+                    self.write_slot(i + 1, ko, kl, v);
+                }
+
+                self.write_slot(idx, new_data_offset as u16, raw_key_len, value);
+                self.set_len(len + 1);
+            }
+
+            pub fn insert(&mut self, key: &[u8], value: u64, pager: &mut Pager) {
+                debug_assert!(self.can_insert(key.len()));
+
+                if Self::needs_overflow(key.len()) {
+                    let start_page = write_overflow(pager, key);
+                    let mut meta = [0u8; 16];
+                    meta[0..8].copy_from_slice(&start_page.to_le_bytes());
+                    meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
+                    self.insert_raw(
+                        &meta,
+                        OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG,
+                        value,
+                        pager,
+                    );
+                } else {
+                    self.insert_raw(key, key.len() as u16, value, pager);
+                }
+            }
+
+            pub fn remove(&mut self, index: usize) {
+                debug_assert!(index < self.len());
+                let len = self.len();
+
+                for i in index + 1..len {
+                    let (ko, kl, v) = self.read_slot(i);
+                    self.write_slot(i - 1, ko, kl, v);
+                }
+
+                self.set_len(len - 1);
+            }
+
+            pub fn split(&mut self, pager: &mut Pager) -> Self {
+                self.compact();
+                let len = self.len();
+                let mid = len / 2;
+                let mut new_page = Self::new();
+                for i in mid..len {
+                    let (_, kl, v) = self.read_slot(i);
+                    new_page.insert_raw(self.key(i), kl, v, pager);
+                }
+                self.set_len(mid);
+                self.compact();
+                new_page
             }
         }
-        if left == self.len() { None } else { Some(left) }
+
+        impl<const N: usize> fmt::Debug for $name<N> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut list = f.debug_list();
+                for i in 0..self.len() {
+                    list.entry(&(self.key(i), self.slot_value(i)));
+                }
+                list.finish()
+            }
+        }
+    };
+}
+
+impl_bytes_keyed_page!(IndexInternalPage, PageType::IndexInternal);
+impl_bytes_keyed_page!(IndexLeafPage, PageType::IndexLeaf);
+
+// Type-specific accessors for IndexInternalPage
+impl<const N: usize> IndexInternalPage<N> {
+    pub fn ptr(&self, index: usize) -> NodePtr {
+        self.slot_value(index)
     }
 
     pub fn find_child(&self, target: &[u8], pager: &mut Pager) -> Option<NodePtr> {
@@ -615,118 +707,22 @@ impl<const N: usize> IndexInternalPage<N> {
             None => None,
         }
     }
-
-    fn contiguous_free_space(&self) -> usize {
-        let slots_end = Self::HEADER_SIZE + self.len() * Self::SLOT_SIZE;
-        self.data_offset().saturating_sub(slots_end)
-    }
-
-    fn free_space(&self) -> usize {
-        let used_key_space: usize = (0..self.len())
-            .map(|i| Self::inline_len(self.read_slot(i).1))
-            .sum();
-        N - Self::HEADER_SIZE - self.len() * Self::SLOT_SIZE - used_key_space
-    }
-
-    pub fn can_insert(&self, key_len: usize) -> bool {
-        let inline_size = if Self::needs_overflow(key_len) {
-            Self::OVERFLOW_META_SIZE
-        } else {
-            key_len
-        };
-        self.free_space() >= Self::SLOT_SIZE + inline_size
-    }
-
-    fn compact(&mut self) {
-        let len = self.len();
-        let mut new_data_offset = N;
-        for i in 0..len {
-            let (ko, kl, ptr) = self.read_slot(i);
-            let key_len = Self::inline_len(kl);
-            new_data_offset -= key_len;
-            self.page
-                .copy_within(ko as usize..ko as usize + key_len, new_data_offset);
-            self.write_slot(i, new_data_offset as u16, kl, ptr);
-        }
-        self.set_data_offset(new_data_offset);
-    }
-
-    fn insert_raw(&mut self, key_bytes: &[u8], raw_key_len: u16, ptr: NodePtr, pager: &mut Pager) {
-        let inline_size = key_bytes.len();
-
-        if self.contiguous_free_space() < Self::SLOT_SIZE + inline_size {
-            self.compact();
-        }
-
-        let new_data_offset = self.data_offset() - inline_size;
-        self.page[new_data_offset..new_data_offset + inline_size].copy_from_slice(key_bytes);
-        self.set_data_offset(new_data_offset);
-
-        let idx = self.search(key_bytes, pager).unwrap_or(self.len());
-        let len = self.len();
-
-        for i in (idx..len).rev() {
-            let (ko, kl, p) = self.read_slot(i);
-            self.write_slot(i + 1, ko, kl, p);
-        }
-
-        self.write_slot(idx, new_data_offset as u16, raw_key_len, ptr);
-        self.set_len(len + 1);
-    }
-
-    pub fn insert(&mut self, key: &[u8], ptr: NodePtr, pager: &mut Pager) {
-        debug_assert!(self.can_insert(key.len()));
-
-        if Self::needs_overflow(key.len()) {
-            let start_page = Self::write_overflow(pager, key);
-            let mut meta = [0u8; 16];
-            meta[0..8].copy_from_slice(&start_page.to_le_bytes());
-            meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
-            self.insert_raw(
-                &meta,
-                Self::OVERFLOW_META_SIZE as u16 | Self::OVERFLOW_FLAG,
-                ptr,
-                pager,
-            );
-        } else {
-            self.insert_raw(key, key.len() as u16, ptr, pager);
-        }
-    }
-
-    pub fn remove(&mut self, index: usize) {
-        debug_assert!(index < self.len());
-        let len = self.len();
-
-        for i in index + 1..len {
-            let (ko, kl, p) = self.read_slot(i);
-            self.write_slot(i - 1, ko, kl, p);
-        }
-
-        self.set_len(len - 1);
-    }
-
-    pub fn split(&mut self, pager: &mut Pager) -> Self {
-        self.compact();
-        let len = self.len();
-        let mid = len / 2;
-        let mut new_page = Self::new();
-        for i in mid..len {
-            let (_, kl, ptr) = self.read_slot(i);
-            new_page.insert_raw(self.key(i), kl, ptr, pager);
-        }
-        self.set_len(mid);
-        self.compact();
-        new_page
-    }
 }
 
-impl<const N: usize> fmt::Debug for IndexInternalPage<N> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut list = f.debug_list();
-        for i in 0..self.len() {
-            list.entry(&(self.key(i), self.ptr(i)));
+// Type-specific accessors for IndexLeafPage
+impl<const N: usize> IndexLeafPage<N> {
+    pub fn value(&self, index: usize) -> Key {
+        self.slot_value(index)
+    }
+
+    pub fn get(&self, target: &[u8], pager: &mut Pager) -> Option<Key> {
+        let idx = self.search(target, pager)?;
+        let resolved = self.resolved_key(idx, pager);
+        if resolved.as_ref() == target {
+            Some(self.value(idx))
+        } else {
+            None
         }
-        list.finish()
     }
 }
 
@@ -1092,5 +1088,113 @@ mod tests {
         assert_eq!(resolved.as_ref(), &big_key[..]);
 
         assert_eq!(page.find_child(&big_key, &mut pager), Some(42));
+    }
+
+    #[test]
+    fn index_leaf_page_new_is_empty() {
+        let page = IndexLeafPage::<4096>::new();
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn index_leaf_page_insert_single() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+        page.insert(b"hello", 100, &mut pager);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.key(0), b"hello");
+        assert_eq!(page.value(0), 100);
+    }
+
+    #[test]
+    fn index_leaf_page_insert_maintains_sorted_order() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+        page.insert(b"cherry", 300, &mut pager);
+        page.insert(b"apple", 100, &mut pager);
+        page.insert(b"banana", 200, &mut pager);
+
+        assert_eq!(page.len(), 3);
+        assert_eq!(page.key(0), b"apple");
+        assert_eq!(page.key(1), b"banana");
+        assert_eq!(page.key(2), b"cherry");
+        assert_eq!(page.value(0), 100);
+        assert_eq!(page.value(1), 200);
+        assert_eq!(page.value(2), 300);
+    }
+
+    #[test]
+    fn index_leaf_page_get() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+        page.insert(b"aaa", 10, &mut pager);
+        page.insert(b"bbb", 20, &mut pager);
+        page.insert(b"ccc", 30, &mut pager);
+
+        assert_eq!(page.get(b"aaa", &mut pager), Some(10));
+        assert_eq!(page.get(b"bbb", &mut pager), Some(20));
+        assert_eq!(page.get(b"ccc", &mut pager), Some(30));
+        assert_eq!(page.get(b"ddd", &mut pager), None);
+        assert_eq!(page.get(b"ab", &mut pager), None);
+    }
+
+    #[test]
+    fn index_leaf_page_remove() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+        page.insert(b"aaa", 100, &mut pager);
+        page.insert(b"bbb", 200, &mut pager);
+        page.insert(b"ccc", 300, &mut pager);
+
+        page.remove(1);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.key(0), b"aaa");
+        assert_eq!(page.key(1), b"ccc");
+        assert_eq!(page.value(0), 100);
+        assert_eq!(page.value(1), 300);
+    }
+
+    #[test]
+    fn index_leaf_page_split() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+        let keys = [b"aaa", b"bbb", b"ccc", b"ddd", b"eee", b"fff"];
+        for (i, key) in keys.iter().enumerate() {
+            page.insert(*key, (i * 100) as u64, &mut pager);
+        }
+
+        let right = page.split(&mut pager);
+        assert_eq!(page.len(), 3);
+        assert_eq!(right.len(), 3);
+
+        assert_eq!(page.key(0), b"aaa");
+        assert_eq!(page.key(2), b"ccc");
+
+        assert_eq!(right.key(0), b"ddd");
+        assert_eq!(right.key(2), b"fff");
+    }
+
+    #[test]
+    fn index_leaf_page_can_insert() {
+        let page = IndexLeafPage::<4096>::new();
+        assert!(page.can_insert(100));
+    }
+
+    #[test]
+    fn index_leaf_page_overflow_insert_and_get() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        let big_key = vec![0xABu8; 2100];
+        assert!(IndexLeafPage::<4096>::needs_overflow(big_key.len()));
+
+        page.insert(&big_key, 42, &mut pager);
+        assert_eq!(page.len(), 1);
+        assert!(page.is_overflow(0));
+
+        let resolved = page.resolved_key(0, &mut pager);
+        assert_eq!(resolved.as_ref(), &big_key[..]);
+
+        assert_eq!(page.get(&big_key, &mut pager), Some(42));
     }
 }
