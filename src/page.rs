@@ -334,6 +334,16 @@ impl<const N: usize> LeafPage<N> {
     }
 }
 
+impl<const N: usize> fmt::Debug for LeafPage<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for i in 0..self.len() {
+            list.entry(&(self.key(i), self.value(i)));
+        }
+        list.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
