@@ -319,6 +319,19 @@ impl<const N: usize> LeafPage<N> {
 
         self.set_len(len - 1);
     }
+
+    pub fn split(&mut self) -> Self {
+        self.compact();
+        let len = self.len();
+        let mid = len / 2;
+        let mut new_page = Self::new();
+        for i in mid..len {
+            new_page.insert(self.key(i), self.value(i));
+        }
+        self.set_len(mid);
+        self.compact();
+        new_page
+    }
 }
 
 #[cfg(test)]
@@ -472,5 +485,27 @@ mod tests {
         assert!(page.can_insert(10));
         page.insert(100, &[0xAA; 10]);
         assert_eq!(page.value(page.len() - 1), &[0xAA; 10]);
+    }
+
+    #[test]
+    fn leaf_page_split_divides_elements() {
+        let mut page = LeafPage::<4096>::new();
+        for i in 0u64..6 {
+            page.insert(i * 10, &[i as u8; 5]);
+        }
+
+        let right = page.split();
+        assert_eq!(page.len(), 3);
+        assert_eq!(right.len(), 3);
+
+        assert_eq!(page.key(0), 0);
+        assert_eq!(page.key(2), 20);
+        assert_eq!(page.value(0), &[0u8; 5]);
+        assert_eq!(page.value(2), &[2u8; 5]);
+
+        assert_eq!(right.key(0), 30);
+        assert_eq!(right.key(2), 50);
+        assert_eq!(right.value(0), &[3u8; 5]);
+        assert_eq!(right.value(2), &[5u8; 5]);
     }
 }
