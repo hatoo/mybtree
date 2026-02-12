@@ -89,6 +89,84 @@ pub struct IndexLeafPage<const N: usize> {
     page: [u8; N],
 }
 
+impl<const N: usize> From<InternalPage<N>> for AnyPage<N> {
+    fn from(internal: InternalPage<N>) -> Self {
+        Self {
+            page: internal.page,
+        }
+    }
+}
+
+impl<const N: usize> From<LeafPage<N>> for AnyPage<N> {
+    fn from(leaf: LeafPage<N>) -> Self {
+        Self { page: leaf.page }
+    }
+}
+
+impl<const N: usize> From<IndexInternalPage<N>> for AnyPage<N> {
+    fn from(index_internal: IndexInternalPage<N>) -> Self {
+        Self {
+            page: index_internal.page,
+        }
+    }
+}
+
+impl<const N: usize> From<IndexLeafPage<N>> for AnyPage<N> {
+    fn from(index_leaf: IndexLeafPage<N>) -> Self {
+        Self {
+            page: index_leaf.page,
+        }
+    }
+}
+
+impl<const N: usize> TryInto<InternalPage<N>> for AnyPage<N> {
+    type Error = &'static str;
+
+    fn try_into(self) -> Result<InternalPage<N>, Self::Error> {
+        if self.page_type() == PageType::Internal {
+            Ok(InternalPage { page: self.page })
+        } else {
+            Err("Page is not of type Internal")
+        }
+    }
+}
+
+impl<const N: usize> TryInto<LeafPage<N>> for AnyPage<N> {
+    type Error = &'static str;
+
+    fn try_into(self) -> Result<LeafPage<N>, Self::Error> {
+        if self.page_type() == PageType::Leaf {
+            Ok(LeafPage { page: self.page })
+        } else {
+            Err("Page is not of type Leaf")
+        }
+    }
+}
+
+impl<const N: usize> TryInto<IndexInternalPage<N>> for AnyPage<N> {
+    type Error = &'static str;
+
+    fn try_into(self) -> Result<IndexInternalPage<N>, Self::Error> {
+        if self.page_type() == PageType::IndexInternal {
+            Ok(IndexInternalPage { page: self.page })
+        } else {
+            Err("Page is not of type IndexInternal")
+        }
+    }
+}
+
+impl<const N: usize> TryInto<IndexLeafPage<N>> for AnyPage<N> {
+    type Error = &'static str;
+
+    fn try_into(self) -> Result<IndexLeafPage<N>, Self::Error> {
+        if self.page_type() == PageType::IndexLeaf {
+            Ok(IndexLeafPage { page: self.page })
+        } else {
+            Err("Page is not of type IndexLeaf")
+        }
+    }
+}
+
 impl<const N: usize> AnyPage<N> {
     pub fn page_type(&self) -> PageType {
         let pt = u32::from_le_bytes(self.page[0..4].try_into().unwrap());
@@ -99,26 +177,6 @@ impl<const N: usize> AnyPage<N> {
             x if x == PageType::IndexLeaf as u32 => PageType::IndexLeaf,
             _ => panic!("Invalid page type: {}", pt),
         }
-    }
-
-    pub fn as_internal(self) -> InternalPage<N> {
-        debug_assert!(self.page_type() == PageType::Internal);
-        InternalPage { page: self.page }
-    }
-
-    pub fn as_leaf(self) -> LeafPage<N> {
-        debug_assert!(self.page_type() == PageType::Leaf);
-        LeafPage { page: self.page }
-    }
-
-    pub fn as_index_internal(self) -> IndexInternalPage<N> {
-        debug_assert!(self.page_type() == PageType::IndexInternal);
-        IndexInternalPage { page: self.page }
-    }
-
-    pub fn as_index_leaf(self) -> IndexLeafPage<N> {
-        debug_assert!(self.page_type() == PageType::IndexLeaf);
-        IndexLeafPage { page: self.page }
     }
 }
 
@@ -789,7 +847,11 @@ impl<const N: usize> IndexLeafPage<N> {
             let mid = (left + right) / 2;
             let mid_key_bytes = self.resolved_key(mid, pager);
             let mid_value = self.value(mid);
-            match mid_key_bytes.as_ref().cmp(target).then(mid_value.cmp(&target_key)) {
+            match mid_key_bytes
+                .as_ref()
+                .cmp(target)
+                .then(mid_value.cmp(&target_key))
+            {
                 std::cmp::Ordering::Less => left = mid + 1,
                 _ => right = mid,
             }
@@ -820,10 +882,14 @@ impl<const N: usize> IndexLeafPage<N> {
             meta[0..8].copy_from_slice(&start_page.to_le_bytes());
             meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
             let raw_key_len = OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG;
-            let idx = self.search_entry(&meta, entry_key, pager).unwrap_or(self.len());
+            let idx = self
+                .search_entry(&meta, entry_key, pager)
+                .unwrap_or(self.len());
             self.insert_raw_at(idx, &meta, raw_key_len, entry_key);
         } else {
-            let idx = self.search_entry(key, entry_key, pager).unwrap_or(self.len());
+            let idx = self
+                .search_entry(key, entry_key, pager)
+                .unwrap_or(self.len());
             self.insert_raw_at(idx, key, key.len() as u16, entry_key);
         }
     }
