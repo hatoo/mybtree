@@ -59,6 +59,11 @@ pub fn read_overflow(pager: &mut Pager, start_page: u64, total_len: u64) -> Vec<
 
     result
 }
+#[repr(align(4096))]
+#[derive(Clone)]
+pub struct AnyPage<const N: usize> {
+    pub page: [u8; N],
+}
 
 #[repr(align(4096))]
 #[derive(Clone)]
@@ -82,6 +87,39 @@ pub struct IndexInternalPage<const N: usize> {
 #[derive(Clone)]
 pub struct IndexLeafPage<const N: usize> {
     page: [u8; N],
+}
+
+impl<const N: usize> AnyPage<N> {
+    pub fn page_type(&self) -> PageType {
+        let pt = u32::from_le_bytes(self.page[0..4].try_into().unwrap());
+        match pt {
+            x if x == PageType::Leaf as u32 => PageType::Leaf,
+            x if x == PageType::Internal as u32 => PageType::Internal,
+            x if x == PageType::IndexInternal as u32 => PageType::IndexInternal,
+            x if x == PageType::IndexLeaf as u32 => PageType::IndexLeaf,
+            _ => panic!("Invalid page type: {}", pt),
+        }
+    }
+
+    pub fn as_internal(self) -> InternalPage<N> {
+        debug_assert!(self.page_type() == PageType::Internal);
+        InternalPage { page: self.page }
+    }
+
+    pub fn as_leaf(self) -> LeafPage<N> {
+        debug_assert!(self.page_type() == PageType::Leaf);
+        LeafPage { page: self.page }
+    }
+
+    pub fn as_index_internal(self) -> IndexInternalPage<N> {
+        debug_assert!(self.page_type() == PageType::IndexInternal);
+        IndexInternalPage { page: self.page }
+    }
+
+    pub fn as_index_leaf(self) -> IndexLeafPage<N> {
+        debug_assert!(self.page_type() == PageType::IndexLeaf);
+        IndexLeafPage { page: self.page }
+    }
 }
 
 impl<const N: usize> InternalPage<N> {
@@ -544,9 +582,7 @@ macro_rules! impl_bytes_keyed_page {
                 let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
                 let ko = u16::from_le_bytes([self.page[offset], self.page[offset + 1]]);
                 let kl = u16::from_le_bytes([self.page[offset + 2], self.page[offset + 3]]);
-                let v = u64::from_le_bytes(
-                    self.page[offset + 4..offset + 12].try_into().unwrap(),
-                );
+                let v = u64::from_le_bytes(self.page[offset + 4..offset + 12].try_into().unwrap());
                 (ko, kl, v)
             }
 
@@ -611,7 +647,13 @@ macro_rules! impl_bytes_keyed_page {
                 self.set_data_offset(new_data_offset);
             }
 
-            fn insert_raw(&mut self, key_bytes: &[u8], raw_key_len: u16, value: u64, pager: &mut Pager) {
+            fn insert_raw(
+                &mut self,
+                key_bytes: &[u8],
+                raw_key_len: u16,
+                value: u64,
+                pager: &mut Pager,
+            ) {
                 let inline_size = key_bytes.len();
 
                 if self.contiguous_free_space() < Self::SLOT_SIZE + inline_size {
@@ -619,7 +661,8 @@ macro_rules! impl_bytes_keyed_page {
                 }
 
                 let new_data_offset = self.data_offset() - inline_size;
-                self.page[new_data_offset..new_data_offset + inline_size].copy_from_slice(key_bytes);
+                self.page[new_data_offset..new_data_offset + inline_size]
+                    .copy_from_slice(key_bytes);
                 self.set_data_offset(new_data_offset);
 
                 let idx = self.search(key_bytes, pager).unwrap_or(self.len());
