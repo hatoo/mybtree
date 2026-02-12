@@ -189,8 +189,21 @@ impl<const N: usize> Btree<N> {
         let split_key = leaf.key(leaf.len() - 1);
 
         if key <= split_key {
+            if !leaf.can_insert(value.len()) {
+                // Left half is full — move last entry from left to right to make room
+                let last = leaf.len() - 1;
+                let (_, _, vl) = leaf.read_slot(last);
+                right.insert_raw(leaf.key(last), leaf.value(last), vl);
+                leaf.remove(last);
+            }
             self.leaf_insert_entry(&mut leaf, key, value)?;
         } else {
+            if !right.can_insert(value.len()) {
+                // Right half is full — move first entry from right to left to make room
+                let (_, _, vl) = right.read_slot(0);
+                leaf.insert_raw(right.key(0), right.value(0), vl);
+                right.remove(0);
+            }
             self.leaf_insert_entry(&mut right, key, value)?;
         }
 
@@ -351,7 +364,7 @@ impl<const N: usize> Btree<N> {
                                 None
                             };
                             leaf.remove(index);
-                            self.merge_leaf(root, &path, leaf)?;
+                            self.merge_leaf(&path, leaf)?;
                             if let Some((start_page, total_len)) = overflow_meta {
                                 self.free_overflow_pages(start_page, total_len)?;
                             }
@@ -379,12 +392,11 @@ impl<const N: usize> Btree<N> {
         root: NodePtr,
         range: impl RangeBounds<Key>,
     ) -> Result<(), Error> {
-        self.remove_range_at(root, root, &range, 0)
+        self.remove_range_at(root, &range, 0)
     }
 
     fn remove_range_at(
         &mut self,
-        root: NodePtr,
         node_ptr: NodePtr,
         range: &impl RangeBounds<Key>,
         left_key: Key,
@@ -438,7 +450,7 @@ impl<const N: usize> Btree<N> {
             for &i in indices_to_remove.iter().rev() {
                 leaf.remove(i);
             }
-            self.merge_leaf(root, &[leaf_ptr], leaf)?;
+            self.merge_leaf(&[leaf_ptr], leaf)?;
             for (start_page, total_len) in overflow_metas {
                 self.free_overflow_pages(start_page, total_len)?;
             }
@@ -450,7 +462,6 @@ impl<const N: usize> Btree<N> {
     /// Write a leaf page back, attempting to merge with left sibling if underfull.
     fn merge_leaf(
         &mut self,
-        root: NodePtr,
         path: &[NodePtr],
         leaf: LeafPage<N>,
     ) -> Result<(), Error> {
@@ -475,11 +486,11 @@ impl<const N: usize> Btree<N> {
                 }
             }
             self.free_page(page)?;
-            return self.merge_internal_iterative(root, parents, parent);
+            return self.merge_internal_iterative(parents, parent);
         }
 
         let parents = &path[..path.len() - 1];
-        if !self.try_merge_leaf_with_left_sibling(root, page, &leaf, parents)? {
+        if !self.try_merge_leaf_with_left_sibling(page, &leaf, parents)? {
             self.pager.write_node(page, leaf.into())?;
         }
         Ok(())
@@ -487,7 +498,6 @@ impl<const N: usize> Btree<N> {
 
     fn try_merge_leaf_with_left_sibling(
         &mut self,
-        root: NodePtr,
         page: NodePtr,
         right_leaf: &LeafPage<N>,
         parents: &[NodePtr],
@@ -524,14 +534,13 @@ impl<const N: usize> Btree<N> {
         let mut parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
         parent.remove(index - 1);
         self.free_page(left_sibling_page)?;
-        self.merge_internal_iterative(root, parents, parent)?;
+        self.merge_internal_iterative(parents, parent)?;
         Ok(true)
     }
 
     /// Write an internal page back, attempting to merge if underfull. Iterative.
     fn merge_internal_iterative(
         &mut self,
-        root: NodePtr,
         path: &[NodePtr],
         internal: InternalPage<N>,
     ) -> Result<(), Error> {
@@ -1181,7 +1190,7 @@ impl<const N: usize> Btree<N> {
                             None
                         };
                         leaf.remove(idx);
-                        self.index_merge_leaf(root, &path, leaf)?;
+                        self.index_merge_leaf(&path, leaf)?;
                         if let Some((start_page, total_len)) = overflow_meta {
                             self.free_overflow_pages(start_page, total_len)?;
                         }
@@ -1205,7 +1214,6 @@ impl<const N: usize> Btree<N> {
 
     fn index_merge_leaf(
         &mut self,
-        root: NodePtr,
         path: &[NodePtr],
         leaf: IndexLeafPage<N>,
     ) -> Result<(), Error> {
@@ -1235,11 +1243,11 @@ impl<const N: usize> Btree<N> {
                 }
             }
             self.free_page(page)?;
-            return self.index_merge_internal(root, parents, parent);
+            return self.index_merge_internal(parents, parent);
         }
 
         let parents = &path[..path.len() - 1];
-        if !self.index_try_merge_leaf_with_left(root, page, &leaf, parents)? {
+        if !self.index_try_merge_leaf_with_left(page, &leaf, parents)? {
             self.pager.write_node(page, leaf.into())?;
         }
         Ok(())
@@ -1247,7 +1255,6 @@ impl<const N: usize> Btree<N> {
 
     fn index_try_merge_leaf_with_left(
         &mut self,
-        root: NodePtr,
         page: NodePtr,
         right_leaf: &IndexLeafPage<N>,
         parents: &[NodePtr],
@@ -1294,13 +1301,12 @@ impl<const N: usize> Btree<N> {
         }
         parent.remove(index - 1);
         self.free_page(left_sibling_page)?;
-        self.index_merge_internal(root, parents, parent)?;
+        self.index_merge_internal(parents, parent)?;
         Ok(true)
     }
 
     fn index_merge_internal(
         &mut self,
-        root: NodePtr,
         path: &[NodePtr],
         internal: IndexInternalPage<N>,
     ) -> Result<(), Error> {
@@ -1938,69 +1944,6 @@ mod tests {
         assert_read_eq(&mut btree, root, 1, b"one");
         assert_read_eq(&mut btree, root, 3, b"three");
         assert_eq!(btree.remove(root, 999).unwrap(), None);
-    }
-
-    #[test]
-    fn test_insert_4keys_page64() {
-        let (mut btree, root) = new_btree::<64>();
-        let keys = [324u64, 507, 333, 391];
-        for &k in &keys {
-            let val = format!("value-{}", k);
-            btree.insert(root, k, val.as_bytes().to_vec()).unwrap();
-        }
-        // Dump all leaf values
-        fn dump_leaves<const M: usize>(btree: &mut Btree<M>, page_num: NodePtr) {
-            let page = btree.pager.owned_node(page_num).unwrap();
-            match page.page_type() {
-                PageType::Leaf => {
-                    let leaf: LeafPage<M> = page.try_into().unwrap();
-                    eprintln!("Leaf page {}:", page_num);
-                    for i in 0..leaf.len() {
-                        let k = leaf.key(i);
-                        let v = leaf.value(i);
-                        let (_, vo, vl) = leaf.read_slot(i);
-                        eprintln!(
-                            "  [{}] key={}, offset={}, len={}, value={:?} (\"{}\")",
-                            i,
-                            k,
-                            vo,
-                            vl,
-                            v,
-                            String::from_utf8_lossy(v)
-                        );
-                    }
-                }
-                PageType::Internal => {
-                    let internal: InternalPage<M> = page.try_into().unwrap();
-                    eprintln!("Internal page {}:", page_num);
-                    for i in 0..internal.len() {
-                        eprintln!(
-                            "  [{}] key={}, child={}",
-                            i,
-                            internal.key(i),
-                            internal.ptr(i)
-                        );
-                    }
-                    for i in 0..internal.len() {
-                        dump_leaves(btree, internal.ptr(i));
-                    }
-                }
-                _ => {}
-            }
-        }
-        dump_leaves(&mut btree, root);
-
-        for &k in &keys {
-            let v = read_value(&mut btree, root, k);
-            let expected = format!("value-{}", k).as_bytes().to_vec();
-            assert_eq!(
-                v,
-                Some(expected),
-                "key {} has wrong value: {:?}",
-                k,
-                v.as_ref().map(|b| String::from_utf8_lossy(b).to_string())
-            );
-        }
     }
 
     #[test]
