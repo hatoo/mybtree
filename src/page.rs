@@ -647,12 +647,12 @@ macro_rules! impl_bytes_keyed_page {
                 self.set_data_offset(new_data_offset);
             }
 
-            fn insert_raw(
+            fn insert_raw_at(
                 &mut self,
+                idx: usize,
                 key_bytes: &[u8],
                 raw_key_len: u16,
                 value: u64,
-                pager: &mut Pager,
             ) {
                 let inline_size = key_bytes.len();
 
@@ -665,7 +665,6 @@ macro_rules! impl_bytes_keyed_page {
                     .copy_from_slice(key_bytes);
                 self.set_data_offset(new_data_offset);
 
-                let idx = self.search(key_bytes, pager).unwrap_or(self.len());
                 let len = self.len();
 
                 for i in (idx..len).rev() {
@@ -675,6 +674,17 @@ macro_rules! impl_bytes_keyed_page {
 
                 self.write_slot(idx, new_data_offset as u16, raw_key_len, value);
                 self.set_len(len + 1);
+            }
+
+            fn insert_raw(
+                &mut self,
+                key_bytes: &[u8],
+                raw_key_len: u16,
+                value: u64,
+                pager: &mut Pager,
+            ) {
+                let idx = self.search(key_bytes, pager).unwrap_or(self.len());
+                self.insert_raw_at(idx, key_bytes, raw_key_len, value);
             }
 
             pub fn insert(&mut self, key: &[u8], value: u64, pager: &mut Pager) {
@@ -708,14 +718,15 @@ macro_rules! impl_bytes_keyed_page {
                 self.set_len(len - 1);
             }
 
-            pub fn split(&mut self, pager: &mut Pager) -> Self {
+            pub fn split(&mut self) -> Self {
                 self.compact();
                 let len = self.len();
                 let mid = len / 2;
                 let mut new_page = Self::new();
                 for i in mid..len {
                     let (_, kl, v) = self.read_slot(i);
-                    new_page.insert_raw(self.key(i), kl, v, pager);
+                    let end = new_page.len();
+                    new_page.insert_raw_at(end, self.key(i), kl, v);
                 }
                 self.set_len(mid);
                 self.compact();
@@ -765,6 +776,66 @@ impl<const N: usize> IndexLeafPage<N> {
             Some(self.value(idx))
         } else {
             None
+        }
+    }
+
+    /// Binary search using composite `(bytes_key, key)` ordering.
+    /// Returns the index of the first entry >= `(target, target_key)`.
+    /// Returns `None` if all entries are less than the target.
+    pub fn search_entry(&self, target: &[u8], target_key: Key, pager: &mut Pager) -> Option<usize> {
+        let mut left = 0;
+        let mut right = self.len();
+        while left < right {
+            let mid = (left + right) / 2;
+            let mid_key_bytes = self.resolved_key(mid, pager);
+            let mid_value = self.value(mid);
+            match mid_key_bytes.as_ref().cmp(target).then(mid_value.cmp(&target_key)) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                _ => right = mid,
+            }
+        }
+        if left == self.len() { None } else { Some(left) }
+    }
+
+    /// Find the exact entry matching `(target, target_key)`.
+    /// Returns `Some(index)` if found, `None` otherwise.
+    pub fn find_entry(&self, target: &[u8], target_key: Key, pager: &mut Pager) -> Option<usize> {
+        let idx = self.search_entry(target, target_key, pager)?;
+        let resolved = self.resolved_key(idx, pager);
+        if resolved.as_ref() == target && self.value(idx) == target_key {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Insert using composite `(bytes_key, key)` ordering,
+    /// allowing multiple entries with the same byte key but different Key values.
+    pub fn insert_entry(&mut self, key: &[u8], entry_key: Key, pager: &mut Pager) {
+        debug_assert!(self.can_insert(key.len()));
+
+        if Self::needs_overflow(key.len()) {
+            let start_page = write_overflow(pager, key);
+            let mut meta = [0u8; 16];
+            meta[0..8].copy_from_slice(&start_page.to_le_bytes());
+            meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
+            let raw_key_len = OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG;
+            let idx = self.search_entry(&meta, entry_key, pager).unwrap_or(self.len());
+            self.insert_raw_at(idx, &meta, raw_key_len, entry_key);
+        } else {
+            let idx = self.search_entry(key, entry_key, pager).unwrap_or(self.len());
+            self.insert_raw_at(idx, key, key.len() as u16, entry_key);
+        }
+    }
+
+    /// Remove the entry matching `(target, target_key)`.
+    /// Returns `true` if an entry was removed.
+    pub fn remove_entry(&mut self, target: &[u8], target_key: Key, pager: &mut Pager) -> bool {
+        if let Some(idx) = self.find_entry(target, target_key, pager) {
+            self.remove(idx);
+            true
+        } else {
+            false
         }
     }
 }
@@ -1098,7 +1169,7 @@ mod tests {
             page.insert(*key, (i * 100) as u64, &mut pager);
         }
 
-        let right = page.split(&mut pager);
+        let right = page.split();
         assert_eq!(page.len(), 3);
         assert_eq!(right.len(), 3);
 
@@ -1206,7 +1277,7 @@ mod tests {
             page.insert(*key, (i * 100) as u64, &mut pager);
         }
 
-        let right = page.split(&mut pager);
+        let right = page.split();
         assert_eq!(page.len(), 3);
         assert_eq!(right.len(), 3);
 
@@ -1239,5 +1310,97 @@ mod tests {
         assert_eq!(resolved.as_ref(), &big_key[..]);
 
         assert_eq!(page.get(&big_key, &mut pager), Some(42));
+    }
+
+    #[test]
+    fn index_leaf_page_insert_entry_duplicate_keys() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        // Insert multiple entries with the same byte key but different Key values
+        page.insert_entry(b"aaa", 30, &mut pager);
+        page.insert_entry(b"aaa", 10, &mut pager);
+        page.insert_entry(b"aaa", 20, &mut pager);
+
+        assert_eq!(page.len(), 3);
+        // Should be sorted by (bytes, Key)
+        assert_eq!(page.value(0), 10);
+        assert_eq!(page.value(1), 20);
+        assert_eq!(page.value(2), 30);
+    }
+
+    #[test]
+    fn index_leaf_page_insert_entry_mixed_keys() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        page.insert_entry(b"bbb", 2, &mut pager);
+        page.insert_entry(b"aaa", 3, &mut pager);
+        page.insert_entry(b"bbb", 1, &mut pager);
+        page.insert_entry(b"aaa", 1, &mut pager);
+
+        assert_eq!(page.len(), 4);
+        // (aaa,1), (aaa,3), (bbb,1), (bbb,2)
+        assert_eq!(page.key(0), b"aaa");
+        assert_eq!(page.value(0), 1);
+        assert_eq!(page.key(1), b"aaa");
+        assert_eq!(page.value(1), 3);
+        assert_eq!(page.key(2), b"bbb");
+        assert_eq!(page.value(2), 1);
+        assert_eq!(page.key(3), b"bbb");
+        assert_eq!(page.value(3), 2);
+    }
+
+    #[test]
+    fn index_leaf_page_find_entry() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        page.insert_entry(b"aaa", 10, &mut pager);
+        page.insert_entry(b"aaa", 20, &mut pager);
+        page.insert_entry(b"bbb", 10, &mut pager);
+
+        assert_eq!(page.find_entry(b"aaa", 10, &mut pager), Some(0));
+        assert_eq!(page.find_entry(b"aaa", 20, &mut pager), Some(1));
+        assert_eq!(page.find_entry(b"bbb", 10, &mut pager), Some(2));
+        assert_eq!(page.find_entry(b"aaa", 99, &mut pager), None);
+        assert_eq!(page.find_entry(b"ccc", 10, &mut pager), None);
+    }
+
+    #[test]
+    fn index_leaf_page_remove_entry() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        page.insert_entry(b"aaa", 10, &mut pager);
+        page.insert_entry(b"aaa", 20, &mut pager);
+        page.insert_entry(b"aaa", 30, &mut pager);
+
+        assert!(page.remove_entry(b"aaa", 20, &mut pager));
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.value(0), 10);
+        assert_eq!(page.value(1), 30);
+
+        assert!(!page.remove_entry(b"aaa", 99, &mut pager));
+        assert_eq!(page.len(), 2);
+    }
+
+    #[test]
+    fn index_leaf_page_search_entry() {
+        let mut page = IndexLeafPage::<4096>::new();
+        let mut pager = test_pager(4096);
+
+        page.insert_entry(b"aaa", 10, &mut pager);
+        page.insert_entry(b"aaa", 20, &mut pager);
+        page.insert_entry(b"bbb", 5, &mut pager);
+
+        // First entry >= (aaa, 10) is at index 0
+        assert_eq!(page.search_entry(b"aaa", 10, &mut pager), Some(0));
+        // First entry >= (aaa, 15) is at index 1 (aaa,20)
+        assert_eq!(page.search_entry(b"aaa", 15, &mut pager), Some(1));
+        // First entry >= (aaa, 21) is at index 2 (bbb,5)
+        assert_eq!(page.search_entry(b"aaa", 21, &mut pager), Some(2));
+        // All entries are less than (ccc, 0)
+        assert_eq!(page.search_entry(b"ccc", 0, &mut pager), None);
     }
 }
