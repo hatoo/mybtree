@@ -14,4 +14,4 @@ pub use database::{
 pub use pager::Pager;
 pub use transaction::{Transaction, TransactionError, TransactionStore};
 pub use tree::Btree;
-pub use types::{Key, NodePtr, FREE_LIST_PAGE_NUM};
+pub use types::{FREE_LIST_PAGE_NUM, Key, NodePtr};

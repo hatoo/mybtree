@@ -1,5 +1,4 @@
 use lru::LruCache;
-use rkyv::rancor::{Error, Source};
 use std::collections::BTreeSet;
 use std::io;
 use std::num::NonZeroUsize;
@@ -87,8 +86,8 @@ impl<const N: usize> Pager<N> {
         }
     }
 
-    pub fn init(&mut self) -> Result<(), Error> {
-        self.file.set_len(0).map_err(Error::new)?;
+    pub fn init(&mut self) -> io::Result<()> {
+        self.file.set_len(0)?;
         self.cache.clear();
         self.dirty.clear();
         Ok(())
@@ -153,34 +152,34 @@ impl<const N: usize> Pager<N> {
         self.file.sync_all()
     }
 
-    pub fn read_node<T>(&mut self, page_num: u64) -> Result<&AnyPage<N>, Error> {
-        let data = self.cache_read(page_num).map_err(Error::new)?;
+    pub fn read_node<T>(&mut self, page_num: u64) -> io::Result<&AnyPage<N>> {
+        let data = self.cache_read(page_num)?;
         Ok(data)
     }
 
-    pub fn owned_node(&mut self, page_num: u64) -> Result<AnyPage<N>, Error> {
-        let data = self.cache_read(page_num).map_err(Error::new)?;
+    pub fn owned_node(&mut self, page_num: u64) -> io::Result<AnyPage<N>> {
+        let data = self.cache_read(page_num)?;
         Ok(data.clone())
     }
 
-    pub fn write_node(&mut self, page_num: u64, node: AnyPage<N>) -> Result<(), Error> {
-        self.cache_write(page_num, Box::new(node))
-            .map_err(Error::new)
+    pub fn write_node(&mut self, page_num: u64, node: AnyPage<N>) -> io::Result<()> {
+        self.cache_write(page_num, Box::new(node))?;
+        Ok(())
     }
 
     /// Read raw bytes from a page. Returns a reference to the page's raw data.
-    pub fn read_raw_page(&mut self, page_num: u64) -> Result<&[u8; N], Error> {
-        let data = self.cache_read(page_num).map_err(Error::new)?;
+    pub fn read_raw_page(&mut self, page_num: u64) -> io::Result<&[u8; N]> {
+        let data = self.cache_read(page_num)?;
         Ok(&data.page)
     }
 
     /// Write raw bytes to a page. The slice is padded with zeros to fill the page.
-    pub fn write_raw_page(&mut self, page_num: u64, data: &[u8]) -> Result<(), Error> {
+    pub fn write_raw_page(&mut self, page_num: u64, data: &[u8]) -> io::Result<()> {
         let mut page = AnyPage { page: [0u8; N] };
         let len = data.len().min(N);
         page.page[..len].copy_from_slice(&data[..len]);
-        self.cache_write(page_num, Box::new(page))
-            .map_err(Error::new)
+        self.cache_write(page_num, Box::new(page))?;
+        Ok(())
     }
 
     /// Return the page size in bytes.

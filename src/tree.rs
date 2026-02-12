@@ -1,6 +1,5 @@
+use std::io;
 use std::ops::{Bound, RangeBounds};
-
-use rkyv::rancor::{Error, fail};
 
 use crate::page::{
     IndexInternalPage, IndexLeafPage, InternalPage, LeafPage, OVERFLOW_FLAG, OVERFLOW_META_SIZE,
@@ -14,6 +13,8 @@ use crate::util::is_overlap;
 pub enum TreeError {
     #[error("unexpected page type: expected {expected}")]
     UnexpectedPageType { expected: &'static str },
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
 }
 
 pub struct Btree<const N: usize> {
@@ -25,11 +26,11 @@ impl<const N: usize> Btree<N> {
         Btree { pager }
     }
 
-    pub fn flush(&mut self) -> Result<(), std::io::Error> {
+    pub fn flush(&mut self) -> io::Result<()> {
         self.pager.flush()
     }
 
-    pub fn init(&mut self) -> Result<(), Error> {
+    pub fn init(&mut self) -> io::Result<()> {
         self.pager.init()?;
         // Reserve page 0 for the free list
         let fl_page = self.pager.next_page_num();
@@ -42,14 +43,14 @@ impl<const N: usize> Btree<N> {
     //  Primary tree: init / free
     // ────────────────────────────────────────────────────────────────────
 
-    pub fn init_tree(&mut self) -> Result<NodePtr, Error> {
+    pub fn init_tree(&mut self) -> io::Result<NodePtr> {
         let page = self.alloc_page()?;
         let leaf = LeafPage::<N>::new();
         self.pager.write_node(page, leaf.into())?;
         Ok(page)
     }
 
-    pub fn free_tree(&mut self, root: NodePtr) -> Result<(), Error> {
+    pub fn free_tree(&mut self, root: NodePtr) -> Result<(), TreeError> {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             let page = self.pager.owned_node(node)?;
@@ -59,10 +60,8 @@ impl<const N: usize> Btree<N> {
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
                             let meta = leaf.value(i);
-                            let start_page =
-                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len =
-                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
                             self.free_overflow_pages(start_page, total_len)?;
                         }
                     }
@@ -73,9 +72,11 @@ impl<const N: usize> Btree<N> {
                         stack.push(internal.ptr(i));
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "Leaf or Internal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "Leaf or Internal",
+                    });
+                }
             }
             self.free_page(node)?;
         }
@@ -91,7 +92,7 @@ impl<const N: usize> Btree<N> {
         root: NodePtr,
         key: Key,
         value: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    ) -> Result<Option<Vec<u8>>, TreeError> {
         let mut current = root;
         let mut path = vec![];
 
@@ -161,9 +162,11 @@ impl<const N: usize> Btree<N> {
                         }
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "Leaf or Internal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "Leaf or Internal",
+                    });
+                }
             }
         }
     }
@@ -176,7 +179,7 @@ impl<const N: usize> Btree<N> {
         mut leaf: LeafPage<N>,
         key: Key,
         value: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         if leaf.can_insert(value.len()) {
             self.leaf_insert_entry(&mut leaf, key, value)?;
             let page = *path.last().unwrap();
@@ -226,7 +229,7 @@ impl<const N: usize> Btree<N> {
         leaf: &mut LeafPage<N>,
         key: Key,
         value: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         if LeafPage::<N>::needs_overflow(value.len()) {
             let start_page = self.write_overflow(value)?;
             let mut meta = [0u8; OVERFLOW_META_SIZE];
@@ -249,7 +252,7 @@ impl<const N: usize> Btree<N> {
         left_page: NodePtr,
         left_max_key: Key,
         right_page: NodePtr,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         let mut cur_left_page = left_page;
         let mut cur_left_max_key = left_max_key;
         let mut cur_right_page = right_page;
@@ -339,7 +342,7 @@ impl<const N: usize> Btree<N> {
     //  Primary tree: remove
     // ────────────────────────────────────────────────────────────────────
 
-    pub fn remove(&mut self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, Error> {
+    pub fn remove(&mut self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, TreeError> {
         let mut current = root;
         let mut path = vec![];
 
@@ -380,9 +383,11 @@ impl<const N: usize> Btree<N> {
                         None => return Ok(None),
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "Leaf or Internal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "Leaf or Internal",
+                    });
+                }
             }
         }
     }
@@ -391,7 +396,7 @@ impl<const N: usize> Btree<N> {
         &mut self,
         root: NodePtr,
         range: impl RangeBounds<Key>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         self.remove_range_at(root, &range, 0)
     }
 
@@ -400,7 +405,7 @@ impl<const N: usize> Btree<N> {
         node_ptr: NodePtr,
         range: &impl RangeBounds<Key>,
         left_key: Key,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         // Collect leaf nodes to process first, then modify them.
         // Use a stack to avoid recursion.
         let mut visit_stack: Vec<(NodePtr, Key)> = vec![(node_ptr, left_key)];
@@ -424,9 +429,11 @@ impl<const N: usize> Btree<N> {
                         left_key = k;
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "Leaf or Internal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "Leaf or Internal",
+                    });
+                }
             }
         }
 
@@ -460,11 +467,7 @@ impl<const N: usize> Btree<N> {
     }
 
     /// Write a leaf page back, attempting to merge with left sibling if underfull.
-    fn merge_leaf(
-        &mut self,
-        path: &[NodePtr],
-        leaf: LeafPage<N>,
-    ) -> Result<(), Error> {
+    fn merge_leaf(&mut self, path: &[NodePtr], leaf: LeafPage<N>) -> Result<(), TreeError> {
         let page = *path.last().unwrap();
 
         // If at root or leaf is at least half full, just write it
@@ -501,7 +504,7 @@ impl<const N: usize> Btree<N> {
         page: NodePtr,
         right_leaf: &LeafPage<N>,
         parents: &[NodePtr],
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, TreeError> {
         let parent_page = *parents.last().unwrap();
         let parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
@@ -543,7 +546,7 @@ impl<const N: usize> Btree<N> {
         &mut self,
         path: &[NodePtr],
         internal: InternalPage<N>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         let mut cur_path = path;
         let mut cur_internal = internal;
 
@@ -601,7 +604,7 @@ impl<const N: usize> Btree<N> {
         page: NodePtr,
         right_internal: &InternalPage<N>,
         parents: &[NodePtr],
-    ) -> Result<Option<InternalPage<N>>, Error> {
+    ) -> Result<Option<InternalPage<N>>, TreeError> {
         let parent_page = *parents.last().unwrap();
         let parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
@@ -644,7 +647,7 @@ impl<const N: usize> Btree<N> {
         root: NodePtr,
         key: Key,
         f: impl FnOnce(Option<&[u8]>) -> T,
-    ) -> Result<T, Error> {
+    ) -> Result<T, TreeError> {
         let mut current = root;
 
         loop {
@@ -675,9 +678,11 @@ impl<const N: usize> Btree<N> {
                         None => return Ok(f(None)),
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "Leaf or Internal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "Leaf or Internal",
+                    });
+                }
             }
         }
     }
@@ -687,7 +692,7 @@ impl<const N: usize> Btree<N> {
         root: NodePtr,
         range: R,
         mut f: impl FnMut(Key, &[u8]),
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         self.read_range_at(root, &range, &mut f, 0)
     }
 
@@ -697,7 +702,7 @@ impl<const N: usize> Btree<N> {
         range: &R,
         f: &mut impl FnMut(Key, &[u8]),
         left_key: Key,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         // Stack of (node_ptr, left_key)
         let mut stack = vec![(node_ptr, left_key)];
         while let Some((cur, lk)) = stack.pop() {
@@ -710,10 +715,8 @@ impl<const N: usize> Btree<N> {
                         if range.contains(&k) {
                             if leaf.is_overflow(i) {
                                 let meta = leaf.value(i);
-                                let start_page =
-                                    u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                                let total_len =
-                                    u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                                let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                                let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
                                 let data = self.read_overflow(start_page, total_len)?;
                                 f(k, &data);
                             } else {
@@ -739,15 +742,17 @@ impl<const N: usize> Btree<N> {
                         stack.push(child);
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "Leaf or Internal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "Leaf or Internal",
+                    });
+                }
             }
         }
         Ok(())
     }
 
-    pub fn available_key(&mut self, root: NodePtr) -> Result<Key, Error> {
+    pub fn available_key(&mut self, root: NodePtr) -> Result<Key, TreeError> {
         let page = self.pager.owned_node(root)?;
         match page.page_type() {
             PageType::Leaf => {
@@ -769,9 +774,11 @@ impl<const N: usize> Btree<N> {
                     Ok(0)
                 }
             }
-            _ => fail!(TreeError::UnexpectedPageType {
-                expected: "Leaf or Internal"
-            }),
+            _ => {
+                return Err(TreeError::UnexpectedPageType {
+                    expected: "Leaf or Internal",
+                });
+            }
         }
     }
 
@@ -779,12 +786,12 @@ impl<const N: usize> Btree<N> {
     //  Leaf value helpers
     // ────────────────────────────────────────────────────────────────────
 
-    fn read_leaf_value(&mut self, leaf: &LeafPage<N>, index: usize) -> Result<Vec<u8>, Error> {
+    fn read_leaf_value(&mut self, leaf: &LeafPage<N>, index: usize) -> io::Result<Vec<u8>> {
         if leaf.is_overflow(index) {
             let meta = leaf.value(index);
             let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
             let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-            self.read_overflow(start_page, total_len)
+            Ok(self.read_overflow(start_page, total_len)?)
         } else {
             Ok(leaf.value(index).to_vec())
         }
@@ -794,14 +801,14 @@ impl<const N: usize> Btree<N> {
     //  Overflow pages
     // ────────────────────────────────────────────────────────────────────
 
-    fn write_overflow(&mut self, data: &[u8]) -> Result<u64, Error> {
+    fn write_overflow(&mut self, data: &[u8]) -> io::Result<u64> {
         let data_per_page = self.overflow_data_per_page();
         let num_pages = (data.len() + data_per_page - 1) / data_per_page;
         assert!(num_pages > 0);
 
         let pages: Vec<u64> = (0..num_pages)
             .map(|_| self.alloc_page())
-            .collect::<Result<_, _>>()?;
+            .collect::<io::Result<Vec<u64>>>()?;
 
         for (i, &page_num) in pages.iter().enumerate() {
             let start = i * data_per_page;
@@ -823,7 +830,7 @@ impl<const N: usize> Btree<N> {
         Ok(pages[0])
     }
 
-    fn read_overflow(&mut self, start_page: u64, total_len: u64) -> Result<Vec<u8>, Error> {
+    fn read_overflow(&mut self, start_page: u64, total_len: u64) -> io::Result<Vec<u8>> {
         let data_per_page = self.overflow_data_per_page();
         let mut result = Vec::with_capacity(total_len as usize);
         let mut current_page = start_page;
@@ -845,7 +852,7 @@ impl<const N: usize> Btree<N> {
         self.pager.page_size() - 8
     }
 
-    fn free_overflow_pages(&mut self, start_page: u64, total_len: u64) -> Result<(), Error> {
+    fn free_overflow_pages(&mut self, start_page: u64, total_len: u64) -> io::Result<()> {
         let data_per_page = self.overflow_data_per_page();
         let mut current_page = start_page;
         let mut remaining = total_len as usize;
@@ -865,18 +872,18 @@ impl<const N: usize> Btree<N> {
     //  Free page list
     // ────────────────────────────────────────────────────────────────────
 
-    fn read_free_list_head(&mut self) -> Result<u64, Error> {
+    fn read_free_list_head(&mut self) -> io::Result<u64> {
         let buf = self.pager.read_raw_page(FREE_LIST_PAGE_NUM)?;
         Ok(u64::from_le_bytes(buf[..8].try_into().unwrap()))
     }
 
-    fn write_free_list_head(&mut self, head: u64) -> Result<(), Error> {
+    fn write_free_list_head(&mut self, head: u64) -> io::Result<()> {
         let mut buf = vec![0u8; 8];
         buf[..8].copy_from_slice(&head.to_le_bytes());
         self.pager.write_raw_page(FREE_LIST_PAGE_NUM, &buf)
     }
 
-    fn alloc_page(&mut self) -> Result<u64, Error> {
+    fn alloc_page(&mut self) -> io::Result<u64> {
         let head = self.read_free_list_head()?;
         if head == u64::MAX {
             return Ok(self.pager.next_page_num());
@@ -887,7 +894,7 @@ impl<const N: usize> Btree<N> {
         Ok(head)
     }
 
-    pub(crate) fn free_page(&mut self, page_num: u64) -> Result<(), Error> {
+    pub(crate) fn free_page(&mut self, page_num: u64) -> io::Result<()> {
         let head = self.read_free_list_head()?;
         let mut buf = vec![0u8; 8];
         buf[..8].copy_from_slice(&head.to_le_bytes());
@@ -899,14 +906,14 @@ impl<const N: usize> Btree<N> {
     //  Index tree operations
     // ────────────────────────────────────────────────────────────────────
 
-    pub fn init_index(&mut self) -> Result<NodePtr, Error> {
+    pub fn init_index(&mut self) -> io::Result<NodePtr> {
         let page = self.alloc_page()?;
         let leaf = IndexLeafPage::<N>::new();
         self.pager.write_node(page, leaf.into())?;
         Ok(page)
     }
 
-    pub fn free_index_tree(&mut self, root: NodePtr) -> Result<(), Error> {
+    pub fn free_index_tree(&mut self, root: NodePtr) -> Result<(), TreeError> {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             let page = self.pager.owned_node(node)?;
@@ -916,10 +923,8 @@ impl<const N: usize> Btree<N> {
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
                             let meta = leaf.key(i);
-                            let start_page =
-                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len =
-                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
                             self.free_overflow_pages(start_page, total_len)?;
                         }
                     }
@@ -929,25 +934,30 @@ impl<const N: usize> Btree<N> {
                     for i in 0..internal.len() {
                         if internal.is_overflow(i) {
                             let meta = internal.key(i);
-                            let start_page =
-                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len =
-                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
                             self.free_overflow_pages(start_page, total_len)?;
                         }
                         stack.push(internal.ptr(i));
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "IndexLeaf or IndexInternal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "IndexLeaf or IndexInternal",
+                    });
+                }
             }
             self.free_page(node)?;
         }
         Ok(())
     }
 
-    pub fn index_insert(&mut self, root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
+    pub fn index_insert(
+        &mut self,
+        root: NodePtr,
+        key: Key,
+        value: Vec<u8>,
+    ) -> Result<bool, TreeError> {
         let mut current = root;
         let mut path = vec![];
 
@@ -1022,9 +1032,11 @@ impl<const N: usize> Btree<N> {
                         }
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "IndexLeaf or IndexInternal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "IndexLeaf or IndexInternal",
+                    });
+                }
             }
         }
     }
@@ -1036,7 +1048,7 @@ impl<const N: usize> Btree<N> {
         parents: &[NodePtr],
         left_page: NodePtr,
         right_page: NodePtr,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         // Get max key from left page for the parent entry
         let left_any = self.pager.owned_node(left_page)?;
         let left_max_key: Vec<u8> = match left_any.page_type() {
@@ -1167,7 +1179,12 @@ impl<const N: usize> Btree<N> {
         }
     }
 
-    pub fn index_remove(&mut self, root: NodePtr, value: &[u8], key: Key) -> Result<bool, Error> {
+    pub fn index_remove(
+        &mut self,
+        root: NodePtr,
+        value: &[u8],
+        key: Key,
+    ) -> Result<bool, TreeError> {
         let mut current = root;
         let mut path = vec![];
 
@@ -1205,9 +1222,11 @@ impl<const N: usize> Btree<N> {
                         None => return Ok(false),
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "IndexLeaf or IndexInternal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "IndexLeaf or IndexInternal",
+                    });
+                }
             }
         }
     }
@@ -1216,7 +1235,7 @@ impl<const N: usize> Btree<N> {
         &mut self,
         path: &[NodePtr],
         leaf: IndexLeafPage<N>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         let page = *path.last().unwrap();
 
         if path.len() <= 1 || leaf.free_space() <= N / 2 {
@@ -1258,7 +1277,7 @@ impl<const N: usize> Btree<N> {
         page: NodePtr,
         right_leaf: &IndexLeafPage<N>,
         parents: &[NodePtr],
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, TreeError> {
         let parent_page = *parents.last().unwrap();
         let parent: IndexInternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
@@ -1309,7 +1328,7 @@ impl<const N: usize> Btree<N> {
         &mut self,
         path: &[NodePtr],
         internal: IndexInternalPage<N>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         let mut cur_path = path;
         let mut cur_internal = internal;
 
@@ -1371,7 +1390,7 @@ impl<const N: usize> Btree<N> {
         page: NodePtr,
         right_internal: &IndexInternalPage<N>,
         parents: &[NodePtr],
-    ) -> Result<Option<IndexInternalPage<N>>, Error> {
+    ) -> Result<Option<IndexInternalPage<N>>, TreeError> {
         let parent_page = *parents.last().unwrap();
         let parent: IndexInternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
@@ -1420,7 +1439,7 @@ impl<const N: usize> Btree<N> {
         root: NodePtr,
         value: &[u8],
         f: impl FnOnce(Option<Key>) -> T,
-    ) -> Result<T, Error> {
+    ) -> Result<T, TreeError> {
         let mut current = root;
         let mut ff = Some(f);
 
@@ -1441,9 +1460,11 @@ impl<const N: usize> Btree<N> {
                         None => return Ok(ff.take().unwrap()(None)),
                     }
                 }
-                _ => fail!(TreeError::UnexpectedPageType {
-                    expected: "IndexLeaf or IndexInternal"
-                }),
+                _ => {
+                    return Err(TreeError::UnexpectedPageType {
+                        expected: "IndexLeaf or IndexInternal",
+                    });
+                }
             }
         }
     }
@@ -1453,7 +1474,7 @@ impl<const N: usize> Btree<N> {
         root: NodePtr,
         range: R,
         mut f: impl FnMut(&[u8], Key),
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         self.index_read_range_at(root, &range, &mut f)
     }
 
@@ -1462,7 +1483,7 @@ impl<const N: usize> Btree<N> {
         node_ptr: NodePtr,
         range: &R,
         f: &mut impl FnMut(&[u8], Key),
-    ) -> Result<(), Error> {
+    ) -> Result<(), TreeError> {
         let page = self.pager.owned_node(node_ptr)?;
 
         match page.page_type() {
@@ -1505,15 +1526,17 @@ impl<const N: usize> Btree<N> {
                     self.index_read_range_at(ptr, range, f)?;
                 }
             }
-            _ => fail!(TreeError::UnexpectedPageType {
-                expected: "IndexLeaf or IndexInternal"
-            }),
+            _ => {
+                return Err(TreeError::UnexpectedPageType {
+                    expected: "IndexLeaf or IndexInternal",
+                });
+            }
         }
 
         Ok(())
     }
 
-    pub fn index_available_key(&mut self, root: NodePtr) -> Result<Key, Error> {
+    pub fn index_available_key(&mut self, root: NodePtr) -> Result<Key, TreeError> {
         let page = self.pager.owned_node(root)?;
         match page.page_type() {
             PageType::IndexLeaf => {
@@ -1532,9 +1555,11 @@ impl<const N: usize> Btree<N> {
                 }
                 Ok(max_key)
             }
-            _ => fail!(TreeError::UnexpectedPageType {
-                expected: "IndexLeaf or IndexInternal"
-            }),
+            _ => {
+                return Err(TreeError::UnexpectedPageType {
+                    expected: "IndexLeaf or IndexInternal",
+                });
+            }
         }
     }
 
@@ -1543,7 +1568,7 @@ impl<const N: usize> Btree<N> {
     // ────────────────────────────────────────────────────────────────────
 
     #[cfg(test)]
-    pub fn debug(&mut self, root: NodePtr, min: Key, max: Key) -> Result<(), Error> {
+    pub fn debug(&mut self, root: NodePtr, min: Key, max: Key) -> Result<(), TreeError> {
         let page = self.pager.owned_node(root)?;
 
         match page.page_type() {
@@ -1638,11 +1663,7 @@ impl<const N: usize> Btree<N> {
     }
 
     #[cfg(test)]
-    fn collect_tree_pages(
-        &mut self,
-        root: NodePtr,
-        pages: &mut std::collections::BTreeSet<u64>,
-    ) {
+    fn collect_tree_pages(&mut self, root: NodePtr, pages: &mut std::collections::BTreeSet<u64>) {
         let mut stack = vec![root];
         while let Some(page_num) = stack.pop() {
             let page = self.pager.owned_node(page_num).unwrap();
@@ -1652,10 +1673,8 @@ impl<const N: usize> Btree<N> {
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
                             let meta = leaf.value(i);
-                            let start_page =
-                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len =
-                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
                             self.collect_overflow_pages(start_page, total_len, pages);
                         }
                     }
@@ -1761,10 +1780,8 @@ impl<const N: usize> Btree<N> {
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
                             let meta = leaf.key(i);
-                            let start_page =
-                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len =
-                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
                             self.collect_overflow_pages(start_page, total_len, pages);
                         }
                     }
@@ -1779,10 +1796,8 @@ impl<const N: usize> Btree<N> {
                         );
                         if internal.is_overflow(i) {
                             let meta = internal.key(i);
-                            let start_page =
-                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len =
-                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
                             self.collect_overflow_pages(start_page, total_len, pages);
                         }
                         stack.push(internal.ptr(i));

@@ -58,6 +58,11 @@ pub enum DatabaseError {
     Transaction(#[from] TransactionError),
     #[error("internal error: {0}")]
     Internal(#[from] Error),
+
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("tree error: {0}")]
+    TreeError(#[from] crate::tree::TreeError),
 }
 
 // ── Table metadata serialisation ────────────────────────────────────
@@ -184,7 +189,10 @@ pub struct DbTransaction<'a, const N: usize> {
 
 impl<'a, const N: usize> DbTransaction<'a, N> {
     fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
-        if let Some(catalog_key) = self.tx.index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())? {
+        if let Some(catalog_key) = self
+            .tx
+            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
+        {
             if let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)? {
                 let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
                 return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
