@@ -53,7 +53,7 @@ pub fn read_overflow<const N: usize>(
     let mut remaining = total_len as usize;
 
     while remaining > 0 {
-        let page = pager.read_node::<()>(current_page).unwrap();
+        let page = pager.read_node(current_page).unwrap();
         let next_page = u64::from_le_bytes(page.page[..8].try_into().unwrap());
         let chunk_len = std::cmp::min(data_per_page, remaining);
         result.extend_from_slice(&page.page[8..8 + chunk_len]);
@@ -64,33 +64,86 @@ pub fn read_overflow<const N: usize>(
     result
 }
 #[repr(align(4096))]
+#[repr(C)]
 #[derive(Clone)]
 pub struct AnyPage<const N: usize> {
     pub page: [u8; N],
 }
 
 #[repr(align(4096))]
+#[repr(C)]
 #[derive(Clone)]
 pub struct InternalPage<const N: usize> {
     page: [u8; N],
 }
 
 #[repr(align(4096))]
+#[repr(C)]
 #[derive(Clone)]
 pub struct LeafPage<const N: usize> {
     page: [u8; N],
 }
 
 #[repr(align(4096))]
+#[repr(C)]
 #[derive(Clone)]
 pub struct IndexInternalPage<const N: usize> {
     page: [u8; N],
 }
 
 #[repr(align(4096))]
+#[repr(C)]
 #[derive(Clone)]
 pub struct IndexLeafPage<const N: usize> {
     page: [u8; N],
+}
+
+impl<'a, const N: usize> TryFrom<&'a AnyPage<N>> for &'a IndexInternalPage<N> {
+    type Error = &'static str;
+
+    fn try_from(value: &'a AnyPage<N>) -> Result<Self, Self::Error> {
+        if value.page_type() == PageType::IndexInternal {
+            Ok(unsafe { &*(value as *const AnyPage<N> as *const IndexInternalPage<N>) })
+        } else {
+            Err("Page is not of type IndexInternal")
+        }
+    }
+}
+
+impl<'a, const N: usize> TryFrom<&'a AnyPage<N>> for &'a IndexLeafPage<N> {
+    type Error = &'static str;
+
+    fn try_from(value: &'a AnyPage<N>) -> Result<Self, Self::Error> {
+        if value.page_type() == PageType::IndexLeaf {
+            Ok(unsafe { &*(value as *const AnyPage<N> as *const IndexLeafPage<N>) })
+        } else {
+            Err("Page is not of type IndexLeaf")
+        }
+    }
+}
+
+impl<'a, const N: usize> TryFrom<&'a AnyPage<N>> for &'a InternalPage<N> {
+    type Error = &'static str;
+
+    fn try_from(value: &'a AnyPage<N>) -> Result<Self, Self::Error> {
+        if value.page_type() == PageType::Internal {
+            Ok(unsafe { &*(value as *const AnyPage<N> as *const InternalPage<N>) })
+        } else {
+            Err("Page is not of type Internal")
+        }
+    }
+}
+
+impl<'a, const N: usize> TryFrom<&'a AnyPage<N>> for &'a LeafPage<N> {
+    type Error = &'static str;
+
+    fn try_from(value: &'a AnyPage<N>) -> Result<Self, Self::Error> {
+        if value.page_type() == PageType::Leaf {
+            Ok(unsafe { &*(value as *const AnyPage<N> as *const LeafPage<N>) })
+        } else {
+            Err("Page is not of type Leaf")
+        }
+    }
 }
 
 impl<const N: usize> From<InternalPage<N>> for AnyPage<N> {

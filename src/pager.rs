@@ -152,7 +152,7 @@ impl<const N: usize> Pager<N> {
         self.file.sync_all()
     }
 
-    pub fn read_node<T>(&mut self, page_num: u64) -> io::Result<&AnyPage<N>> {
+    pub fn read_node(&mut self, page_num: u64) -> io::Result<&AnyPage<N>> {
         let data = self.cache_read(page_num)?;
         Ok(data)
     }

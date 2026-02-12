@@ -2,8 +2,8 @@ use std::io;
 use std::ops::{Bound, RangeBounds};
 
 use crate::page::{
-    IndexInternalPage, IndexLeafPage, InternalPage, LeafPage, OVERFLOW_FLAG, OVERFLOW_META_SIZE,
-    PageType,
+    AnyPage, IndexInternalPage, IndexLeafPage, InternalPage, LeafPage, OVERFLOW_FLAG,
+    OVERFLOW_META_SIZE, PageType,
 };
 use crate::pager::Pager;
 use crate::types::{FREE_LIST_PAGE_NUM, Key, NodePtr};
@@ -53,21 +53,25 @@ impl<const N: usize> Btree<N> {
     pub fn free_tree(&mut self, root: NodePtr) -> Result<(), TreeError> {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            let page = self.pager.owned_node(node)?;
+            let page: &AnyPage<N> = self.pager.read_node(node)?;
             match page.page_type() {
                 PageType::Leaf => {
-                    let leaf: LeafPage<N> = page.try_into().unwrap();
-                    for i in 0..leaf.len() {
-                        if leaf.is_overflow(i) {
+                    let leaf: &LeafPage<N> = page.try_into().unwrap();
+                    let overflow_pages_to_free = (0..leaf.len())
+                        .filter(|&i| leaf.is_overflow(i))
+                        .map(|i| {
                             let meta = leaf.value(i);
                             let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
                             let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                            self.free_overflow_pages(start_page, total_len)?;
-                        }
+                            (start_page, total_len)
+                        })
+                        .collect::<Vec<_>>();
+                    for (start_page, total_len) in overflow_pages_to_free {
+                        self.free_overflow_pages(start_page, total_len)?;
                     }
                 }
                 PageType::Internal => {
-                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    let internal: &InternalPage<N> = page.try_into().unwrap();
                     for i in 0..internal.len() {
                         stack.push(internal.ptr(i));
                     }
