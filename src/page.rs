@@ -250,18 +250,44 @@ impl<const N: usize> LeafPage<N> {
         if left == self.len() { None } else { Some(left) }
     }
 
-    /// Free space between end of slot array and start of value data.
-    fn free_space(&self) -> usize {
+    /// Contiguous free space between end of slot array and start of value data.
+    fn contiguous_free_space(&self) -> usize {
         let slots_end = Self::HEADER_SIZE + self.len() * Self::SLOT_SIZE;
         self.data_offset().saturating_sub(slots_end)
+    }
+
+    /// Total free space including dead gaps left by removed values.
+    fn free_space(&self) -> usize {
+        let used_value_space: usize = (0..self.len()).map(|i| self.read_slot(i).2 as usize).sum();
+        N - Self::HEADER_SIZE - self.len() * Self::SLOT_SIZE - used_value_space
     }
 
     pub fn can_insert(&self, value_len: usize) -> bool {
         self.free_space() >= Self::SLOT_SIZE + value_len
     }
 
+    /// Compact the value data region, eliminating dead gaps.
+    fn compact(&mut self) {
+        let len = self.len();
+        let mut new_data_offset = N;
+        for i in 0..len {
+            let (k, vo, vl) = self.read_slot(i);
+            let val_len = vl as usize;
+            new_data_offset -= val_len;
+            // Copy value to new position (use copy_within to handle overlap)
+            self.page.copy_within(vo as usize..vo as usize + val_len, new_data_offset);
+            self.write_slot(i, k, new_data_offset as u16, vl);
+        }
+        self.set_data_offset(new_data_offset);
+    }
+
     pub fn insert(&mut self, key: Key, value: &[u8]) {
         debug_assert!(self.can_insert(value.len()));
+
+        // Compact if contiguous free space is insufficient
+        if self.contiguous_free_space() < Self::SLOT_SIZE + value.len() {
+            self.compact();
+        }
 
         // Allocate value space from the end
         let new_data_offset = self.data_offset() - value.len();
@@ -284,27 +310,8 @@ impl<const N: usize> LeafPage<N> {
     pub fn remove(&mut self, index: usize) {
         debug_assert!(index < self.len());
         let len = self.len();
-        let (_, removed_vo, removed_vl) = self.read_slot(index);
-        let removed_offset = removed_vo as usize;
-        let removed_len = removed_vl as usize;
-        let data_offset = self.data_offset();
 
-        // Compact value data: shift values that are below the removed value up
-        self.page.copy_within(data_offset..removed_offset, data_offset + removed_len);
-        self.set_data_offset(data_offset + removed_len);
-
-        // Update value_offsets for slots whose values were shifted
-        for i in 0..len {
-            if i == index {
-                continue;
-            }
-            let (k, vo, vl) = self.read_slot(i);
-            if (vo as usize) < removed_offset {
-                self.write_slot(i, k, vo + removed_vl, vl);
-            }
-        }
-
-        // Shift slots left
+        // Shift slots left (value data becomes dead space)
         for i in index + 1..len {
             let (k, vo, vl) = self.read_slot(i);
             self.write_slot(i - 1, k, vo, vl);
@@ -449,5 +456,21 @@ mod tests {
         page.remove(0);
         let free_after = page.free_space();
         assert!(free_after > free_before);
+    }
+
+    #[test]
+    fn leaf_page_insert_after_remove_compacts() {
+        let mut page = LeafPage::<128>::new();
+        // Fill the page
+        for i in 0..5 {
+            page.insert(i, &[i as u8; 10]);
+        }
+        // Remove some entries to create dead space
+        page.remove(1);
+        page.remove(1);
+        // Insert should succeed by compacting dead space
+        assert!(page.can_insert(10));
+        page.insert(100, &[0xAA; 10]);
+        assert_eq!(page.value(page.len() - 1), &[0xAA; 10]);
     }
 }
