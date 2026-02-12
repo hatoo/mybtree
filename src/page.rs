@@ -280,6 +280,38 @@ impl<const N: usize> LeafPage<N> {
         self.write_slot(idx, key, new_data_offset as u16, value.len() as u16);
         self.set_len(len + 1);
     }
+
+    pub fn remove(&mut self, index: usize) {
+        debug_assert!(index < self.len());
+        let len = self.len();
+        let (_, removed_vo, removed_vl) = self.read_slot(index);
+        let removed_offset = removed_vo as usize;
+        let removed_len = removed_vl as usize;
+        let data_offset = self.data_offset();
+
+        // Compact value data: shift values that are below the removed value up
+        self.page.copy_within(data_offset..removed_offset, data_offset + removed_len);
+        self.set_data_offset(data_offset + removed_len);
+
+        // Update value_offsets for slots whose values were shifted
+        for i in 0..len {
+            if i == index {
+                continue;
+            }
+            let (k, vo, vl) = self.read_slot(i);
+            if (vo as usize) < removed_offset {
+                self.write_slot(i, k, vo + removed_vl, vl);
+            }
+        }
+
+        // Shift slots left
+        for i in index + 1..len {
+            let (k, vo, vl) = self.read_slot(i);
+            self.write_slot(i - 1, k, vo, vl);
+        }
+
+        self.set_len(len - 1);
+    }
 }
 
 #[cfg(test)]
@@ -391,5 +423,31 @@ mod tests {
     fn leaf_page_can_insert() {
         let page = LeafPage::<4096>::new();
         assert!(page.can_insert(100));
+    }
+
+    #[test]
+    fn leaf_page_remove_middle() {
+        let mut page = LeafPage::<4096>::new();
+        page.insert(10, b"aaa");
+        page.insert(20, b"bbb");
+        page.insert(30, b"ccc");
+
+        page.remove(1);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.key(0), 10);
+        assert_eq!(page.key(1), 30);
+        assert_eq!(page.value(0), b"aaa");
+        assert_eq!(page.value(1), b"ccc");
+    }
+
+    #[test]
+    fn leaf_page_remove_reclaims_space() {
+        let mut page = LeafPage::<4096>::new();
+        page.insert(10, b"aaa");
+        page.insert(20, b"bbb");
+        let free_before = page.free_space();
+        page.remove(0);
+        let free_after = page.free_space();
+        assert!(free_after > free_before);
     }
 }
