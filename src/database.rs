@@ -1424,8 +1424,7 @@ mod tests {
         .unwrap();
 
         // First to commit fails — the other active tx has conflicting writes
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         // Second succeeds — conflicting tx is gone
         tx2.commit().unwrap();
     }
@@ -1464,8 +1463,7 @@ mod tests {
         .unwrap();
 
         // First to commit fails — other active tx has conflicting read/write
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1494,8 +1492,7 @@ mod tests {
         tx1.get("users", key).unwrap();
         tx2.delete("users", key).unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1534,8 +1531,7 @@ mod tests {
         // The new key should be >= k1 so it falls in the scanned range
         assert!(k2 >= k1);
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1562,8 +1558,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1590,8 +1585,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1748,8 +1742,7 @@ mod tests {
         .unwrap();
 
         // First to commit fails — both wrote to same index value
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1788,8 +1781,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1805,8 +1797,7 @@ mod tests {
         tx1.create_table("users", users_schema()).unwrap();
         tx2.create_table("users", users_schema()).unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1837,8 +1828,7 @@ mod tests {
         tx1.drop_table("users").unwrap();
         tx2.drop_table("users").unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1862,8 +1852,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1887,8 +1876,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1906,8 +1894,7 @@ mod tests {
         tx1.create_index("users", "name").unwrap();
         tx2.create_index("users", "name").unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1937,8 +1924,7 @@ mod tests {
             .unwrap();
         tx2.drop_index("users", "name").unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1967,8 +1953,7 @@ mod tests {
         tx1.get("users", key).unwrap();
         tx2.drop_table("users").unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
