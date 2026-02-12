@@ -167,7 +167,7 @@ fn eval_where(expr: &Expr, row: &Row, schema: &Schema) -> Result<bool, SqlError>
     }
 }
 
-pub fn execute(tx: &DbTransaction, sql: &str) -> Result<Vec<Row>, SqlError> {
+pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<Vec<Row>, SqlError> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)?;
 
@@ -204,7 +204,7 @@ pub fn execute(tx: &DbTransaction, sql: &str) -> Result<Vec<Row>, SqlError> {
                     None
                 } else {
                     let schema = tx.get_schema(&table_name)?;
-                    let mut map = Vec::with_capacity(ins.columns.len());
+                    let mut map: Vec<usize> = Vec::with_capacity(ins.columns.len());
                     for col in &ins.columns {
                         let pos = schema
                             .columns
@@ -300,14 +300,14 @@ mod tests {
     use std::fs;
     use tempfile::NamedTempFile;
 
-    fn open_db() -> (Database, NamedTempFile) {
+    fn open_db() -> (Database<4096>, NamedTempFile) {
         let temp = NamedTempFile::new().unwrap();
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(temp.path())
             .unwrap();
-        let pager = Pager::new(file, 256);
+        let pager = Pager::<4096>::new(file);
         let db = Database::create(pager).unwrap();
         (db, temp)
     }

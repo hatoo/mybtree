@@ -12,8 +12,8 @@ pub enum PageType {
     IndexLeaf,
 }
 
-const OVERFLOW_FLAG: u16 = 0x8000;
-const OVERFLOW_META_SIZE: usize = 16;
+pub const OVERFLOW_FLAG: u16 = 0x8000;
+pub const OVERFLOW_META_SIZE: usize = 16;
 
 fn write_overflow<const N: usize>(pager: &mut Pager<N>, data: &[u8]) -> u64 {
     let data_per_page = N - 8;
@@ -210,10 +210,10 @@ impl<const N: usize> InternalPage<N> {
     }
 
     pub fn can_insert(&self) -> bool {
-        self.len() * (Self::ELEMENT_SIZE + 1) + Self::HEADER_SIZE <= N
+        (self.len() + 1) * Self::ELEMENT_SIZE + Self::HEADER_SIZE <= N
     }
 
-    fn key(&self, index: usize) -> Key {
+    pub fn key(&self, index: usize) -> Key {
         debug_assert!(index < self.len());
         let offset = Self::HEADER_SIZE + index * Self::ELEMENT_SIZE;
         Key::from_le_bytes(
@@ -223,7 +223,7 @@ impl<const N: usize> InternalPage<N> {
         )
     }
 
-    fn ptr(&self, index: usize) -> NodePtr {
+    pub fn ptr(&self, index: usize) -> NodePtr {
         debug_assert!(index < self.len());
         let offset = Self::HEADER_SIZE + index * Self::ELEMENT_SIZE + std::mem::size_of::<Key>();
         NodePtr::from_le_bytes(
@@ -241,7 +241,7 @@ impl<const N: usize> InternalPage<N> {
             .copy_from_slice(&ptr.to_le_bytes());
     }
 
-    fn search_index(&self, key: Key) -> Option<usize> {
+    pub fn search_index(&self, key: Key) -> Option<usize> {
         let mut left = 0;
         let mut right = self.len();
         while left < right {
@@ -394,7 +394,7 @@ impl<const N: usize> LeafPage<N> {
             .copy_from_slice(&value_len.to_le_bytes());
     }
 
-    fn read_slot(&self, index: usize) -> (Key, u16, u16) {
+    pub fn read_slot(&self, index: usize) -> (Key, u16, u16) {
         let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
         let key = Key::from_le_bytes(
             self.page[offset..offset + std::mem::size_of::<Key>()]
@@ -426,6 +426,16 @@ impl<const N: usize> LeafPage<N> {
         if left == self.len() { None } else { Some(left) }
     }
 
+    /// Binary search for `key`. Returns `Ok(index)` if found, `Err(index)` for insertion point.
+    pub fn search_key(&self, key: Key) -> Result<usize, usize> {
+        let idx = self.search(key).unwrap_or(self.len());
+        if idx < self.len() && self.key(idx) == key {
+            Ok(idx)
+        } else {
+            Err(idx)
+        }
+    }
+
     pub fn get(&self, key: Key, pager: &mut Pager<N>) -> Option<Cow<'_, [u8]>> {
         let idx = self.search(key)?;
         if self.key(idx) == key {
@@ -449,7 +459,7 @@ impl<const N: usize> LeafPage<N> {
     }
 
     /// Total free space including dead gaps left by removed values.
-    fn free_space(&self) -> usize {
+    pub fn free_space(&self) -> usize {
         let used_value_space: usize = (0..self.len())
             .map(|i| Self::inline_len(self.read_slot(i).2))
             .sum();
@@ -468,22 +478,24 @@ impl<const N: usize> LeafPage<N> {
     /// Compact the value data region, eliminating dead gaps.
     fn compact(&mut self) {
         let len = self.len();
+        // Snapshot old page bytes so that moving one value cannot overwrite
+        // another value's source data (overlapping regions across entries).
+        let old = self.page;
         let mut new_data_offset = N;
         for i in 0..len {
             let (k, vo, vl) = self.read_slot(i);
             let val_len = Self::inline_len(vl);
             new_data_offset -= val_len;
-            // Copy value to new position (use copy_within to handle overlap)
-            self.page
-                .copy_within(vo as usize..vo as usize + val_len, new_data_offset);
+            self.page[new_data_offset..new_data_offset + val_len]
+                .copy_from_slice(&old[vo as usize..vo as usize + val_len]);
             self.write_slot(i, k, new_data_offset as u16, vl);
         }
         self.set_data_offset(new_data_offset);
     }
 
-    /// Internal insert that stores raw inline bytes with the given raw_value_len
+    /// Insert that stores raw inline bytes with the given raw_value_len
     /// (which may include OVERFLOW_FLAG).
-    fn insert_raw(&mut self, key: Key, inline_data: &[u8], raw_value_len: u16) {
+    pub fn insert_raw(&mut self, key: Key, inline_data: &[u8], raw_value_len: u16) {
         let inline_size = inline_data.len();
 
         // Compact if contiguous free space is insufficient
@@ -627,7 +639,7 @@ macro_rules! impl_bytes_keyed_page {
                 &self.page[key_offset as usize..key_offset as usize + len]
             }
 
-            fn slot_value(&self, index: usize) -> u64 {
+            pub fn slot_value(&self, index: usize) -> u64 {
                 debug_assert!(index < self.len());
                 let (_, _, v) = self.read_slot(index);
                 v
@@ -640,7 +652,7 @@ macro_rules! impl_bytes_keyed_page {
                 self.page[offset + 4..offset + 12].copy_from_slice(&value.to_le_bytes());
             }
 
-            fn read_slot(&self, index: usize) -> (u16, u16, u64) {
+            pub fn read_slot(&self, index: usize) -> (u16, u16, u64) {
                 let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
                 let ko = u16::from_le_bytes([self.page[offset], self.page[offset + 1]]);
                 let kl = u16::from_le_bytes([self.page[offset + 2], self.page[offset + 3]]);
@@ -659,7 +671,7 @@ macro_rules! impl_bytes_keyed_page {
                 }
             }
 
-            fn search(&self, target: &[u8], pager: &mut Pager<N>) -> Option<usize> {
+            pub fn search(&self, target: &[u8], pager: &mut Pager<N>) -> Option<usize> {
                 let mut left = 0;
                 let mut right = self.len();
                 while left < right {
@@ -679,7 +691,7 @@ macro_rules! impl_bytes_keyed_page {
                 self.data_offset().saturating_sub(slots_end)
             }
 
-            fn free_space(&self) -> usize {
+            pub fn free_space(&self) -> usize {
                 let used_key_space: usize = (0..self.len())
                     .map(|i| Self::inline_len(self.read_slot(i).1))
                     .sum();
@@ -709,7 +721,7 @@ macro_rules! impl_bytes_keyed_page {
                 self.set_data_offset(new_data_offset);
             }
 
-            fn insert_raw_at(
+            pub fn insert_raw_at(
                 &mut self,
                 idx: usize,
                 key_bytes: &[u8],

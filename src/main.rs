@@ -28,7 +28,7 @@ fn format_value(v: &DbValue) -> String {
     }
 }
 
-fn open_db(path: &PathBuf) -> anyhow::Result<Database> {
+fn open_db(path: &PathBuf) -> anyhow::Result<Database<PAGE_SIZE>> {
     let create = !path.exists();
     let file = fs::OpenOptions::new()
         .read(true)
@@ -37,7 +37,7 @@ fn open_db(path: &PathBuf) -> anyhow::Result<Database> {
         .truncate(false)
         .open(path)?;
 
-    let pager = Pager::new(file, PAGE_SIZE);
+    let pager = Pager::<PAGE_SIZE>::new(file);
     if create {
         Ok(Database::create(pager)?)
     } else {
@@ -45,7 +45,7 @@ fn open_db(path: &PathBuf) -> anyhow::Result<Database> {
     }
 }
 
-fn execute_and_print(db: &Database, input: &str) -> anyhow::Result<()> {
+fn execute_and_print(db: &Database<PAGE_SIZE>, input: &str) -> anyhow::Result<()> {
     if input == ".tables" {
         let tx = db.begin_transaction();
         for name in tx.list_tables()? {
@@ -66,7 +66,7 @@ fn execute_and_print(db: &Database, input: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn repl(db: &Database) -> anyhow::Result<()> {
+fn repl(db: &Database<PAGE_SIZE>) -> anyhow::Result<()> {
     let mut line_editor = Reedline::create();
     let prompt = DefaultPrompt::new(
         DefaultPromptSegment::Basic("mybtree".to_string()),

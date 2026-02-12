@@ -1,15 +1,10 @@
 use lru::LruCache;
-use rkyv::{
-    api::high,
-    rancor::{Error, Source},
-    util::AlignedVec,
-};
+use rkyv::rancor::{Error, Source};
 use std::collections::BTreeSet;
 use std::io;
 use std::num::NonZeroUsize;
 
-use crate::types::Node;
-use crate::{page::AnyPage, types::IndexNode};
+use crate::page::AnyPage;
 
 #[cfg(unix)]
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -171,6 +166,26 @@ impl<const N: usize> Pager<N> {
     pub fn write_node(&mut self, page_num: u64, node: AnyPage<N>) -> Result<(), Error> {
         self.cache_write(page_num, Box::new(node))
             .map_err(Error::new)
+    }
+
+    /// Read raw bytes from a page. Returns a reference to the page's raw data.
+    pub fn read_raw_page(&mut self, page_num: u64) -> Result<&[u8; N], Error> {
+        let data = self.cache_read(page_num).map_err(Error::new)?;
+        Ok(&data.page)
+    }
+
+    /// Write raw bytes to a page. The slice is padded with zeros to fill the page.
+    pub fn write_raw_page(&mut self, page_num: u64, data: &[u8]) -> Result<(), Error> {
+        let mut page = AnyPage { page: [0u8; N] };
+        let len = data.len().min(N);
+        page.page[..len].copy_from_slice(&data[..len]);
+        self.cache_write(page_num, Box::new(page))
+            .map_err(Error::new)
+    }
+
+    /// Return the page size in bytes.
+    pub fn page_size(&self) -> usize {
+        N
     }
 }
 

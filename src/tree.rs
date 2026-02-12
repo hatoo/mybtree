@@ -1,89 +1,85 @@
-use rkyv::Archived;
-use rkyv::rancor::{Error, fail};
-use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 
-use crate::pager::Pager;
-use crate::types::{
-    FREE_LIST_PAGE_NUM, IndexInternal, IndexLeaf, IndexNode, Internal, Key, Leaf, Node, NodePtr,
-    Value,
+use rkyv::rancor::{Error, fail};
+
+use crate::page::{
+    IndexInternalPage, IndexLeafPage, InternalPage, LeafPage, OVERFLOW_FLAG, OVERFLOW_META_SIZE,
+    PageType,
 };
-use crate::util::{is_overlap, split_index_internal, split_index_leaf, split_internal, split_leaf};
+use crate::pager::Pager;
+use crate::types::{FREE_LIST_PAGE_NUM, Key, NodePtr};
+use crate::util::is_overlap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TreeError {
-    #[error("unexpected node type: expected {expected}")]
-    UnexpectedNodeType { expected: &'static str },
+    #[error("unexpected page type: expected {expected}")]
+    UnexpectedPageType { expected: &'static str },
 }
 
-
-/// Find the child page for `key` in an archived internal node.
-fn find_child_page(internal: &Archived<Internal>, key: Key) -> Option<NodePtr> {
-    let index = match internal.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-        Ok(i) | Err(i) => i,
-    };
-    internal.kv.get(index).map(|t| t.1.to_native())
+pub struct Btree<const N: usize> {
+    pub pager: Pager<N>,
 }
 
-pub struct Btree {
-    pub pager: Pager,
-}
-
-impl Btree {
-    /// Create a new `Btree` backed by the given [`Pager`].
-    pub fn new(pager: Pager) -> Self {
+impl<const N: usize> Btree<N> {
+    pub fn new(pager: Pager<N>) -> Self {
         Btree { pager }
     }
 
-    /// Flush all dirty cached pages to disk.
     pub fn flush(&mut self) -> Result<(), std::io::Error> {
         self.pager.flush()
     }
 
-    /// Initialize a fresh database file, setting up the free list.
-    /// The pager is reset and the first page is allocated for the free list head.
     pub fn init(&mut self) -> Result<(), Error> {
         self.pager.init()?;
-
-        assert!(self.pager.next_page_num() == 0);
-
-        // Initialize free list head to u64::MAX (empty)
+        // Reserve page 0 for the free list
+        let fl_page = self.pager.next_page_num();
+        assert_eq!(fl_page, FREE_LIST_PAGE_NUM);
         self.write_free_list_head(u64::MAX)?;
         Ok(())
     }
 
-    /// Initialize a new tree at the specified page, writing an empty leaf node as its root.
-    /// The page is allocated via [`alloc_page`] if needed; the caller should use the
-    /// returned page number as the root for subsequent operations.
+    // ────────────────────────────────────────────────────────────────────
+    //  Primary tree: init / free
+    // ────────────────────────────────────────────────────────────────────
+
     pub fn init_tree(&mut self) -> Result<NodePtr, Error> {
         let page = self.alloc_page()?;
-        let root_leaf = Leaf { kv: vec![] };
-        self.pager.write_node(page, &Node::Leaf(root_leaf))?;
+        let leaf = LeafPage::<N>::new();
+        self.pager.write_node(page, leaf.into())?;
         Ok(page)
     }
 
-    /// Free all pages belonging to the tree rooted at `root`, including
-    /// overflow pages. The root page itself is also freed.
     pub fn free_tree(&mut self, root: NodePtr) -> Result<(), Error> {
-        let node = self.pager.owned_node(root)?;
-        match node {
-            Node::Leaf(leaf) => {
-                for (_, v) in &leaf.kv {
-                    self.free_value_pages(v)?;
+        let page = self.pager.owned_node(root)?;
+        match page.page_type() {
+            PageType::Leaf => {
+                let leaf: LeafPage<N> = page.try_into().unwrap();
+                for i in 0..leaf.len() {
+                    if leaf.is_overflow(i) {
+                        let meta = leaf.value(i);
+                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        self.free_overflow_pages(start_page, total_len)?;
+                    }
                 }
             }
-            Node::Internal(internal) => {
-                for (_, ptr) in &internal.kv {
-                    self.free_tree(*ptr)?;
+            PageType::Internal => {
+                let internal: InternalPage<N> = page.try_into().unwrap();
+                for i in 0..internal.len() {
+                    self.free_tree(internal.ptr(i))?;
                 }
             }
+            _ => fail!(TreeError::UnexpectedPageType {
+                expected: "Leaf or Internal"
+            }),
         }
         self.free_page(root)
     }
 
-    /// Insert or update a key-value pair in the tree rooted at `root`.
-    /// Returns the previous value if the key already existed, or `None` for a new key.
-    /// Large values are automatically stored in overflow pages.
+    // ────────────────────────────────────────────────────────────────────
+    //  Primary tree: insert
+    // ────────────────────────────────────────────────────────────────────
+
     pub fn insert(
         &mut self,
         root: NodePtr,
@@ -93,206 +89,285 @@ impl Btree {
         let mut current = root;
         let mut path = vec![];
 
-        enum NextNode {
-            Leaf,
-            Next(NodePtr),
-            NeedAlloc,
-        }
-
         loop {
             path.push(current);
+            let page = self.pager.owned_node(current)?;
 
-            let next = self
-                .pager
-                .read_node(current, |archived_node| match archived_node {
-                    Archived::<Node>::Leaf(_) => NextNode::Leaf,
-                    Archived::<Node>::Internal(internal) => match find_child_page(internal, key) {
-                        Some(next) => NextNode::Next(next),
-                        None => NextNode::NeedAlloc,
-                    },
-                })?;
-
-            match next {
-                NextNode::Leaf => {
-                    let Node::Leaf(mut leaf) = self.pager.owned_node(current)? else {
-                        fail!(TreeError::UnexpectedNodeType { expected: "leaf" });
-                    };
-                    match leaf.kv.binary_search_by_key(&key, |t| t.0) {
+            match page.page_type() {
+                PageType::Leaf => {
+                    let mut leaf: LeafPage<N> = page.try_into().unwrap();
+                    match leaf.search_key(key) {
                         Ok(index) => {
-                            let old_value_entry = leaf.kv[index].1.clone();
-                            let old_bytes = self.resolve_value(&old_value_entry)?;
-
-                            let new_value = self.make_value(value)?;
-                            let grew = match (&old_value_entry, &new_value) {
-                                (Value::Inline(old), Value::Inline(new_v)) => {
-                                    new_v.len() > old.len()
-                                }
-                                (Value::Overflow { .. }, Value::Inline(_)) => true,
-                                _ => false,
-                            };
-                            leaf.kv[index].1 = new_value;
-
-                            if grew {
-                                self.split_insert(root, &path, Node::Leaf(leaf))?;
+                            // Key exists — read old value, remove old entry, insert new
+                            let old_bytes = self.read_leaf_value(&leaf, index)?;
+                            let was_overflow = leaf.is_overflow(index);
+                            let overflow_meta = if was_overflow {
+                                Some((
+                                    u64::from_le_bytes(leaf.value(index)[0..8].try_into().unwrap()),
+                                    u64::from_le_bytes(
+                                        leaf.value(index)[8..16].try_into().unwrap(),
+                                    ),
+                                ))
                             } else {
-                                self.merge_insert(root, &path, Node::Leaf(leaf))?;
+                                None
+                            };
+                            leaf.remove(index);
+                            self.leaf_insert_and_propagate(root, &path, leaf, key, &value)?;
+                            if let Some((start_page, total_len)) = overflow_meta {
+                                self.free_overflow_pages(start_page, total_len)?;
                             }
-                            self.free_value_pages(&old_value_entry)?;
                             return Ok(Some(old_bytes));
                         }
-                        Err(index) => {
-                            let new_value = self.make_value(value)?;
-                            leaf.kv.insert(index, (key, new_value));
-                            self.split_insert(root, &path, Node::Leaf(leaf))?;
+                        Err(_) => {
+                            // New key
+                            self.leaf_insert_and_propagate(root, &path, leaf, key, &value)?;
                             return Ok(None);
                         }
                     }
                 }
-                NextNode::Next(next_page) => {
-                    current = next_page;
-                }
-                NextNode::NeedAlloc => {
-                    let Node::Internal(mut internal) = self.pager.owned_node(current)? else {
-                        fail!(TreeError::UnexpectedNodeType { expected: "internal" });
-                    };
-
-                    if internal.kv.is_empty() {
-                        let new_leaf_page = self.alloc_page()?;
-                        let new_value = self.make_value(value)?;
-                        let new_leaf = Leaf {
-                            kv: vec![(key, new_value)],
-                        };
-                        self.pager
-                            .write_node(new_leaf_page, &Node::Leaf(new_leaf))?;
-
-                        internal.kv.push((key, new_leaf_page));
-                        self.pager.write_node(current, &Node::Internal(internal))?;
-
-                        return Ok(None);
-                    } else {
-                        let last = internal.kv.last_mut().unwrap();
-                        last.0 = key;
-                        let next = last.1;
-                        self.pager.write_node(current, &Node::Internal(internal))?;
-                        current = next;
+                PageType::Internal => {
+                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    match internal.search_index(key) {
+                        Some(idx) => {
+                            current = internal.ptr(idx);
+                        }
+                        None => {
+                            // Key is beyond all entries
+                            let mut internal: InternalPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+                            if internal.len() == 0 {
+                                let new_leaf_page = self.alloc_page()?;
+                                let mut new_leaf = LeafPage::<N>::new();
+                                self.leaf_insert_entry(&mut new_leaf, key, &value)?;
+                                self.pager.write_node(new_leaf_page, new_leaf.into())?;
+                                internal.insert(key, new_leaf_page);
+                                self.pager.write_node(current, internal.into())?;
+                                return Ok(None);
+                            } else {
+                                let last_idx = internal.len() - 1;
+                                let next = internal.ptr(last_idx);
+                                // Update the last key to accommodate the new key
+                                internal.remove(last_idx);
+                                internal.insert(key, next);
+                                self.pager.write_node(current, internal.into())?;
+                                current = next;
+                            }
+                        }
                     }
                 }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "Leaf or Internal"
+                }),
             }
         }
     }
 
-    fn split_insert(
+    /// Insert a key-value into a leaf page, handling splits and propagation.
+    fn leaf_insert_and_propagate(
         &mut self,
         root: NodePtr,
         path: &[NodePtr],
-        insert: Node,
+        mut leaf: LeafPage<N>,
+        key: Key,
+        value: &[u8],
     ) -> Result<(), Error> {
-        let buffer = rkyv::to_bytes(&insert)?;
+        if leaf.can_insert(value.len()) {
+            self.leaf_insert_entry(&mut leaf, key, value)?;
+            let page = *path.last().unwrap();
+            self.pager.write_node(page, leaf.into())?;
+            return Ok(());
+        }
+
+        // Need to split
+        let mut right = leaf.split();
+        let split_key = leaf.key(leaf.len() - 1);
+
+        if key <= split_key {
+            self.leaf_insert_entry(&mut leaf, key, value)?;
+        } else {
+            self.leaf_insert_entry(&mut right, key, value)?;
+        }
 
         let page = *path.last().unwrap();
         let parents = &path[..path.len() - 1];
 
-        if buffer.len() <= self.pager.page_content_size() {
-            self.pager.write_buffer(page, buffer)?;
-            return Ok(());
-        }
+        let left_max_key = leaf.key(leaf.len() - 1);
+        let right_page = self.alloc_page()?;
 
-        let page_content_size = self.pager.page_content_size();
-        let keyed_nodes: Vec<(Key, Node)> = match insert {
-            Node::Leaf(leaf) => split_leaf(leaf.kv, page_content_size)?
-                .into_iter()
-                .map(|kv| (kv.last().unwrap().0, Node::Leaf(Leaf { kv })))
-                .collect(),
-            Node::Internal(internal) => split_internal(internal.kv, page_content_size)?
-                .into_iter()
-                .map(|kv| (kv.last().unwrap().0, Node::Internal(Internal { kv })))
-                .collect(),
-        };
+        // Write right to new page, left stays at current page
+        self.pager.write_node(right_page, right.into())?;
+        self.pager.write_node(page, leaf.into())?;
 
-        self.write_splits(root, keyed_nodes, page, parents)
+        self.propagate_split(root, parents, page, left_max_key, right_page)
     }
 
-    /// Write split nodes to pages and update the parent.
-    /// The last node in `keyed_nodes` is written to `page`; the rest get new pages.
-    fn write_splits(
+    /// Insert a key-value entry into a leaf, handling overflow if needed.
+    fn leaf_insert_entry(
+        &mut self,
+        leaf: &mut LeafPage<N>,
+        key: Key,
+        value: &[u8],
+    ) -> Result<(), Error> {
+        if LeafPage::<N>::needs_overflow(value.len()) {
+            let start_page = self.write_overflow(value)?;
+            let mut meta = [0u8; OVERFLOW_META_SIZE];
+            meta[0..8].copy_from_slice(&start_page.to_le_bytes());
+            meta[8..16].copy_from_slice(&(value.len() as u64).to_le_bytes());
+            leaf.insert_raw(key, &meta, OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG);
+        } else {
+            leaf.insert_raw(key, value, value.len() as u16);
+        }
+        Ok(())
+    }
+
+    /// Propagate a split up to the parent, iteratively.
+    /// `left_page` now has max key `left_max_key`.
+    /// `right_page` is a newly allocated page.
+    fn propagate_split(
         &mut self,
         root: NodePtr,
-        mut keyed_nodes: Vec<(Key, Node)>,
-        page: NodePtr,
         parents: &[NodePtr],
+        left_page: NodePtr,
+        left_max_key: Key,
+        right_page: NodePtr,
     ) -> Result<(), Error> {
-        if let Some(&parent_page) = parents.last() {
-            let (_right_key, right_node) = keyed_nodes.pop().unwrap();
-            self.pager.write_node(page, &right_node)?;
+        let mut cur_left_page = left_page;
+        let mut cur_left_max_key = left_max_key;
+        let mut cur_right_page = right_page;
+        let mut depth = parents.len();
 
-            let Node::Internal(mut parent_internal) = self.pager.owned_node(parent_page)? else {
-                fail!(TreeError::UnexpectedNodeType { expected: "internal parent" });
-            };
-            let mut kv_map: BTreeMap<_, _> = parent_internal.kv.into_iter().collect();
-            for (key, node) in keyed_nodes {
-                let new_page = self.alloc_page()?;
-                self.pager.write_node(new_page, &node)?;
-                kv_map.insert(key, new_page);
+        loop {
+            if depth == 0 {
+                // Splitting the root — create a new internal root
+                let right_content = self.pager.owned_node(cur_right_page)?;
+                let right_max_key = match right_content.page_type() {
+                    PageType::Leaf => {
+                        let r: LeafPage<N> = right_content.try_into().unwrap();
+                        r.key(r.len() - 1)
+                    }
+                    PageType::Internal => {
+                        let r: InternalPage<N> = right_content.try_into().unwrap();
+                        r.key(r.len() - 1)
+                    }
+                    _ => unreachable!(),
+                };
+                let moved_page = self.alloc_page()?;
+                let root_content = self.pager.owned_node(root)?;
+                self.pager.write_node(moved_page, root_content)?;
+
+                let mut new_root = InternalPage::<N>::new();
+                new_root.insert(cur_left_max_key, moved_page);
+                new_root.insert(right_max_key, cur_right_page);
+                self.pager.write_node(root, new_root.into())?;
+                return Ok(());
             }
-            parent_internal.kv = kv_map.into_iter().collect();
-            self.split_insert(root, parents, Node::Internal(parent_internal))
-        } else {
-            let new_entries = keyed_nodes
-                .into_iter()
-                .map(|(key, node)| {
-                    let new_page = self.alloc_page()?;
-                    self.pager.write_node(new_page, &node)?;
-                    Ok((key, new_page))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            self.split_insert(root, &[root], Node::Internal(Internal { kv: new_entries }))
+
+            let parent_ptr = parents[depth - 1];
+            let mut parent: InternalPage<N> =
+                self.pager.owned_node(parent_ptr)?.try_into().unwrap();
+
+            // Find and update the entry for left_page
+            let mut found_idx = None;
+            for i in 0..parent.len() {
+                if parent.ptr(i) == cur_left_page {
+                    found_idx = Some(i);
+                    break;
+                }
+            }
+            let i = found_idx.expect("left_page not found in parent during split propagation");
+            let old_key = parent.key(i);
+            let right_max_key = old_key;
+            parent.remove(i);
+            parent.insert(cur_left_max_key, cur_left_page);
+
+            if parent.can_insert() {
+                parent.insert(right_max_key, cur_right_page);
+                self.pager.write_node(parent_ptr, parent.into())?;
+                return Ok(());
+            }
+
+            // Need to split the parent too
+            // First write the updated parent, then split it
+            self.pager.write_node(parent_ptr, parent.into())?;
+
+            // Re-read and split
+            let mut internal: InternalPage<N> =
+                self.pager.owned_node(parent_ptr)?.try_into().unwrap();
+            let mut right = internal.split();
+            let split_key = internal.key(internal.len() - 1);
+
+            if right_max_key <= split_key {
+                internal.insert(right_max_key, cur_right_page);
+            } else {
+                right.insert(right_max_key, cur_right_page);
+            }
+
+            let new_left_max_key = internal.key(internal.len() - 1);
+            let new_right_page = self.alloc_page()?;
+
+            self.pager.write_node(new_right_page, right.into())?;
+            self.pager.write_node(parent_ptr, internal.into())?;
+
+            // Continue up the tree
+            cur_left_page = parent_ptr;
+            cur_left_max_key = new_left_max_key;
+            cur_right_page = new_right_page;
+            depth -= 1;
         }
     }
 
-    /// Remove the entry for `key` from the tree rooted at `root`.
-    /// Returns the old value if the key was found, or `None` if it did not exist.
+    // ────────────────────────────────────────────────────────────────────
+    //  Primary tree: remove
+    // ────────────────────────────────────────────────────────────────────
+
     pub fn remove(&mut self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, Error> {
         let mut current = root;
         let mut path = vec![];
 
         loop {
             path.push(current);
+            let page = self.pager.owned_node(current)?;
 
-            let next = self
-                .pager
-                .read_node(current, |archived_node| match archived_node {
-                    Archived::<Node>::Leaf(leaf) => {
-                        match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                            Ok(_) => None,        // found — stop traversal
-                            Err(_) => Some(None), // not found
+            match page.page_type() {
+                PageType::Leaf => {
+                    let mut leaf: LeafPage<N> = page.try_into().unwrap();
+                    match leaf.search_key(key) {
+                        Ok(index) => {
+                            let old_bytes = self.read_leaf_value(&leaf, index)?;
+                            let overflow_meta = if leaf.is_overflow(index) {
+                                Some((
+                                    u64::from_le_bytes(leaf.value(index)[0..8].try_into().unwrap()),
+                                    u64::from_le_bytes(
+                                        leaf.value(index)[8..16].try_into().unwrap(),
+                                    ),
+                                ))
+                            } else {
+                                None
+                            };
+                            leaf.remove(index);
+                            self.merge_leaf(root, &path, leaf)?;
+                            if let Some((start_page, total_len)) = overflow_meta {
+                                self.free_overflow_pages(start_page, total_len)?;
+                            }
+                            return Ok(Some(old_bytes));
                         }
+                        Err(_) => return Ok(None),
                     }
-                    Archived::<Node>::Internal(internal) => Some(find_child_page(internal, key)),
-                })?;
-
-            match next {
-                None => {
-                    // Key found in current leaf
-                    let Node::Leaf(mut leaf) = self.pager.owned_node(current)? else {
-                        fail!(TreeError::UnexpectedNodeType { expected: "leaf" });
-                    };
-                    let index = leaf
-                        .kv
-                        .binary_search_by_key(&key, |t| t.0)
-                        .expect("Key not found in leaf node");
-                    let old_value_entry = leaf.kv.remove(index).1;
-                    self.merge_insert(root, &path, Node::Leaf(leaf))?;
-                    let old_bytes = self.resolve_value(&old_value_entry)?;
-                    self.free_value_pages(&old_value_entry)?;
-                    return Ok(Some(old_bytes));
                 }
-                Some(Some(next_page)) => current = next_page,
-                Some(None) => return Ok(None),
+                PageType::Internal => {
+                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    match internal.search_index(key) {
+                        Some(idx) => current = internal.ptr(idx),
+                        None => return Ok(None),
+                    }
+                }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "Leaf or Internal"
+                }),
             }
         }
     }
 
-    /// Remove all entries whose keys fall within `range` from the tree rooted at `root`.
     pub fn remove_range(
         &mut self,
         root: NodePtr,
@@ -308,195 +383,285 @@ impl Btree {
         range: &impl RangeBounds<Key>,
         left_key: Key,
     ) -> Result<(), Error> {
-        let node = self.pager.owned_node(node_ptr)?;
+        let page = self.pager.owned_node(node_ptr)?;
 
-        match node {
-            Node::Leaf(mut leaf) => {
-                let removed: Vec<_> = leaf
-                    .kv
-                    .iter()
-                    .filter(|(k, _)| range.contains(k))
-                    .map(|(_, v)| v.clone())
-                    .collect();
-                leaf.kv.retain(|(k, _)| !range.contains(k));
-                self.merge_insert(root, &[node_ptr], Node::Leaf(leaf))?;
-                for v in &removed {
-                    self.free_value_pages(v)?;
-                }
-            }
-            Node::Internal(internal) => {
-                let mut left_key = left_key;
-                for (key, ptr) in &internal.kv {
-                    if is_overlap(&(left_key..=*key), range) {
-                        self.remove_range_at(root, *ptr, range, left_key)?;
+        match page.page_type() {
+            PageType::Leaf => {
+                let mut leaf: LeafPage<N> = page.try_into().unwrap();
+                // Collect overflow metadata for entries to remove
+                let mut overflow_metas = vec![];
+                let mut indices_to_remove = vec![];
+                for i in 0..leaf.len() {
+                    if range.contains(&leaf.key(i)) {
+                        if leaf.is_overflow(i) {
+                            let meta = leaf.value(i);
+                            overflow_metas.push((
+                                u64::from_le_bytes(meta[0..8].try_into().unwrap()),
+                                u64::from_le_bytes(meta[8..16].try_into().unwrap()),
+                            ));
+                        }
+                        indices_to_remove.push(i);
                     }
-                    left_key = *key;
+                }
+                // Remove in reverse order to preserve indices
+                for &i in indices_to_remove.iter().rev() {
+                    leaf.remove(i);
+                }
+                self.merge_leaf(root, &[node_ptr], leaf)?;
+                for (start_page, total_len) in overflow_metas {
+                    self.free_overflow_pages(start_page, total_len)?;
                 }
             }
+            PageType::Internal => {
+                let internal: InternalPage<N> = page.try_into().unwrap();
+                let mut left_key = left_key;
+                for i in 0..internal.len() {
+                    let k = internal.key(i);
+                    let ptr = internal.ptr(i);
+                    if is_overlap(&(left_key..=k), range) {
+                        self.remove_range_at(root, ptr, range, left_key)?;
+                    }
+                    left_key = k;
+                }
+            }
+            _ => fail!(TreeError::UnexpectedPageType {
+                expected: "Leaf or Internal"
+            }),
         }
 
         Ok(())
     }
 
-    fn merge_insert(
+    /// Write a leaf page back, attempting to merge with left sibling if underfull.
+    fn merge_leaf(
         &mut self,
         root: NodePtr,
         path: &[NodePtr],
-        insert: Node,
+        leaf: LeafPage<N>,
     ) -> Result<(), Error> {
-        let buffer = rkyv::to_bytes(&insert)?;
-
         let page = *path.last().unwrap();
 
-        debug_assert!(buffer.len() <= self.pager.page_content_size());
-
-        if buffer.len() >= self.pager.page_content_size() / 2 || path.len() <= 1 {
-            return self.pager.write_buffer(page, buffer);
+        // If at root or leaf is at least half full, just write it
+        if path.len() <= 1 || leaf.free_space() <= N / 2 {
+            self.pager.write_node(page, leaf.into())?;
+            return Ok(());
         }
 
-        // Handle empty leaf: remove from parent entirely
-        if let Node::Leaf(leaf) = &insert {
-            if leaf.kv.is_empty() {
-                let parents = &path[..path.len() - 1];
-                let parent_page = *parents.last().unwrap();
-                let Node::Internal(mut internal) = self.pager.owned_node(parent_page)? else {
-                    fail!(TreeError::UnexpectedNodeType { expected: "internal parent" });
-                };
-                internal.kv.retain(|&(_, ptr)| ptr != page);
-                self.free_page(page)?;
-                return self.merge_insert(root, parents, Node::Internal(internal));
+        // Handle empty leaf: remove from parent
+        if leaf.len() == 0 {
+            let parents = &path[..path.len() - 1];
+            let parent_page = *parents.last().unwrap();
+            let mut parent: InternalPage<N> =
+                self.pager.owned_node(parent_page)?.try_into().unwrap();
+            for i in 0..parent.len() {
+                if parent.ptr(i) == page {
+                    parent.remove(i);
+                    break;
+                }
             }
+            self.free_page(page)?;
+            return self.merge_internal_iterative(root, parents, parent);
         }
 
         let parents = &path[..path.len() - 1];
-        if !self.try_merge_with_left_sibling(root, page, &insert, parents)? {
-            self.pager.write_buffer(page, buffer)?;
+        if !self.try_merge_leaf_with_left_sibling(root, page, &leaf, parents)? {
+            self.pager.write_node(page, leaf.into())?;
         }
         Ok(())
     }
 
-    /// Attempt to merge `insert` with its left sibling in the parent.
-    /// Returns `true` if the merge was performed, `false` otherwise.
-    fn try_merge_with_left_sibling(
+    fn try_merge_leaf_with_left_sibling(
         &mut self,
         root: NodePtr,
         page: NodePtr,
-        insert: &Node,
+        right_leaf: &LeafPage<N>,
         parents: &[NodePtr],
     ) -> Result<bool, Error> {
         let parent_page = *parents.last().unwrap();
-        let Node::Internal(mut parent_internal) = self.pager.owned_node(parent_page)? else {
-            return Ok(false);
-        };
+        let parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
-        let index = parent_internal
-            .kv
-            .iter()
-            .position(|&(_, ptr)| ptr == page)
-            .unwrap();
+        let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
         if index == 0 {
             return Ok(false);
         }
 
-        let left_sibling_page = parent_internal.kv[index - 1].1;
-        let left_sibling_node = self.pager.owned_node(left_sibling_page)?;
+        let left_sibling_page = parent.ptr(index - 1);
+        let left_leaf: LeafPage<N> = self
+            .pager
+            .owned_node(left_sibling_page)?
+            .try_into()
+            .unwrap();
 
-        let merged = match (left_sibling_node, insert) {
-            (Node::Leaf(mut left), Node::Leaf(right)) => {
-                left.kv.extend(right.kv.iter().cloned());
-                Node::Leaf(left)
+        // Check if all entries from right can fit into left
+        let mut merged = left_leaf.clone();
+        for i in 0..right_leaf.len() {
+            let (_, _, vl) = right_leaf.read_slot(i);
+            let value_data = right_leaf.value(i);
+            let inline_size = value_data.len();
+            if merged.free_space() < LEAF_SLOT_SIZE + inline_size {
+                return Ok(false);
             }
-            (Node::Internal(mut left), Node::Internal(right)) => {
-                left.kv.extend(right.kv.iter().cloned());
-                Node::Internal(left)
-            }
-            _ => return Ok(false),
-        };
+            merged.insert_raw(right_leaf.key(i), value_data, vl);
+        }
 
-        let buffer = rkyv::to_bytes(&merged)?;
-        if buffer.len() <= self.pager.page_content_size() {
-            self.pager.write_buffer(page, buffer)?;
-            parent_internal.kv.remove(index - 1);
-            self.merge_insert(root, parents, Node::Internal(parent_internal))?;
-            self.free_page(left_sibling_page)?;
-            Ok(true)
-        } else {
-            Ok(false)
+        // Merge succeeded — write merged to current page, free left sibling
+        self.pager.write_node(page, merged.into())?;
+        let mut parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
+        parent.remove(index - 1);
+        self.free_page(left_sibling_page)?;
+        self.merge_internal_iterative(root, parents, parent)?;
+        Ok(true)
+    }
+
+    /// Write an internal page back, attempting to merge if underfull. Iterative.
+    fn merge_internal_iterative(
+        &mut self,
+        root: NodePtr,
+        path: &[NodePtr],
+        internal: InternalPage<N>,
+    ) -> Result<(), Error> {
+        let mut cur_path = path;
+        let mut cur_internal = internal;
+
+        loop {
+            let page = *cur_path.last().unwrap();
+
+            let used = INTERNAL_HEADER_SIZE + cur_internal.len() * INTERNAL_ELEMENT_SIZE;
+            if cur_path.len() <= 1 || used >= N / 2 {
+                self.pager.write_node(page, cur_internal.into())?;
+                return Ok(());
+            }
+
+            if cur_internal.len() == 0 {
+                if cur_path.len() <= 1 {
+                    let leaf = LeafPage::<N>::new();
+                    self.pager.write_node(page, leaf.into())?;
+                    return Ok(());
+                }
+                let parents = &cur_path[..cur_path.len() - 1];
+                let parent_page = *parents.last().unwrap();
+                let mut parent: InternalPage<N> =
+                    self.pager.owned_node(parent_page)?.try_into().unwrap();
+                for i in 0..parent.len() {
+                    if parent.ptr(i) == page {
+                        parent.remove(i);
+                        break;
+                    }
+                }
+                self.free_page(page)?;
+                cur_path = parents;
+                cur_internal = parent;
+                continue;
+            }
+
+            let parents = &cur_path[..cur_path.len() - 1];
+            if !self.try_merge_internal_with_left_sibling_iterative(
+                root,
+                page,
+                &cur_internal,
+                parents,
+            )? {
+                self.pager.write_node(page, cur_internal.into())?;
+            }
+            return Ok(());
         }
     }
 
-    /// Look up a single key in the tree rooted at `root`.
-    /// The closure `f` receives `Some(&[u8])` if found or `None` if absent,
-    /// and its return value is propagated to the caller.
+    fn try_merge_internal_with_left_sibling_iterative(
+        &mut self,
+        root: NodePtr,
+        page: NodePtr,
+        right_internal: &InternalPage<N>,
+        parents: &[NodePtr],
+    ) -> Result<bool, Error> {
+        let parent_page = *parents.last().unwrap();
+        let parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
+
+        let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
+        if index == 0 {
+            return Ok(false);
+        }
+
+        let left_sibling_page = parent.ptr(index - 1);
+        let left_internal: InternalPage<N> = self
+            .pager
+            .owned_node(left_sibling_page)?
+            .try_into()
+            .unwrap();
+
+        let total_entries = left_internal.len() + right_internal.len();
+        let total_used = INTERNAL_HEADER_SIZE + total_entries * INTERNAL_ELEMENT_SIZE;
+        if total_used > N {
+            return Ok(false);
+        }
+
+        let mut merged = left_internal.clone();
+        for i in 0..right_internal.len() {
+            merged.insert(right_internal.key(i), right_internal.ptr(i));
+        }
+
+        self.pager.write_node(page, merged.into())?;
+        let mut parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
+        parent.remove(index - 1);
+        self.free_page(left_sibling_page)?;
+        self.merge_internal_iterative(root, parents, parent)?;
+        Ok(true)
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Primary tree: read
+    // ────────────────────────────────────────────────────────────────────
+
     pub fn read<T>(
         &mut self,
         root: NodePtr,
         key: Key,
         f: impl FnOnce(Option<&[u8]>) -> T,
     ) -> Result<T, Error> {
-        enum ReadAction<T> {
-            Done(T),
-            Next(NodePtr),
-            Overflow { start_page: u64, total_len: u64 },
-        }
-
         let mut current = root;
 
-        let mut ff = Some(f);
-        let f = &mut ff;
-
         loop {
-            let result: ReadAction<T> =
-                self.pager
-                    .read_node(current, |archived_node| match archived_node {
-                        Archived::<Node>::Leaf(leaf) => {
-                            match leaf.kv.binary_search_by_key(&key, |t| t.0.to_native()) {
-                                Ok(index) => match &leaf.kv[index].1 {
-                                    Archived::<Value>::Inline(data) => {
-                                        ReadAction::Done(f.take().unwrap()(Some(data.as_ref())))
-                                    }
-                                    Archived::<Value>::Overflow {
-                                        start_page,
-                                        total_len,
-                                    } => ReadAction::Overflow {
-                                        start_page: start_page.to_native(),
-                                        total_len: total_len.to_native(),
-                                    },
-                                },
-                                Err(_) => ReadAction::Done(f.take().unwrap()(None)),
-                            }
-                        }
-                        Archived::<Node>::Internal(internal) => {
-                            match find_child_page(internal, key) {
-                                Some(next) => ReadAction::Next(next),
-                                None => ReadAction::Done(f.take().unwrap()(None)),
-                            }
-                        }
-                    })?;
+            let page = self.pager.owned_node(current)?;
 
-            match result {
-                ReadAction::Done(v) => return Ok(v),
-                ReadAction::Next(next) => current = next,
-                ReadAction::Overflow {
-                    start_page,
-                    total_len,
-                } => {
-                    let data = self.read_overflow(start_page, total_len)?;
-                    return Ok(f.take().unwrap()(Some(&data)));
+            match page.page_type() {
+                PageType::Leaf => {
+                    let leaf: LeafPage<N> = page.try_into().unwrap();
+                    match leaf.search_key(key) {
+                        Ok(index) => {
+                            if leaf.is_overflow(index) {
+                                let meta = leaf.value(index);
+                                let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                                let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                                let data = self.read_overflow(start_page, total_len)?;
+                                return Ok(f(Some(&data)));
+                            } else {
+                                return Ok(f(Some(leaf.value(index))));
+                            }
+                        }
+                        Err(_) => return Ok(f(None)),
+                    }
                 }
+                PageType::Internal => {
+                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    match internal.search_index(key) {
+                        Some(idx) => current = internal.ptr(idx),
+                        None => return Ok(f(None)),
+                    }
+                }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "Leaf or Internal"
+                }),
             }
         }
     }
 
-    /// Iterate over all entries in the tree rooted at `root` whose keys fall
-    /// within `range`, calling `f(key, value)` for each entry in order.
     pub fn read_range<R: RangeBounds<Key>>(
         &mut self,
         root: NodePtr,
         range: R,
         mut f: impl FnMut(Key, &[u8]),
     ) -> Result<(), Error> {
-        self.read_range_at(root, &range, &mut (f), 0)
+        self.read_range_at(root, &range, &mut f, 0)
     }
 
     fn read_range_at<R: RangeBounds<Key>>(
@@ -506,110 +671,93 @@ impl Btree {
         f: &mut impl FnMut(Key, &[u8]),
         left_key: Key,
     ) -> Result<(), Error> {
-        let node = self.pager.owned_node(node_ptr)?;
+        let page = self.pager.owned_node(node_ptr)?;
 
-        match node {
-            Node::Leaf(leaf) => {
-                for (k, v) in leaf.kv {
+        match page.page_type() {
+            PageType::Leaf => {
+                let leaf: LeafPage<N> = page.try_into().unwrap();
+                for i in 0..leaf.len() {
+                    let k = leaf.key(i);
                     if range.contains(&k) {
-                        match v {
-                            Value::Inline(data) => f(k, &data),
-                            Value::Overflow {
-                                start_page,
-                                total_len,
-                            } => {
-                                let data = self.read_overflow(start_page, total_len)?;
-                                f(k, &data);
-                            }
+                        if leaf.is_overflow(i) {
+                            let meta = leaf.value(i);
+                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let data = self.read_overflow(start_page, total_len)?;
+                            f(k, &data);
+                        } else {
+                            f(k, leaf.value(i));
                         }
                     }
                 }
             }
-            Node::Internal(internal) => {
+            PageType::Internal => {
+                let internal: InternalPage<N> = page.try_into().unwrap();
                 let mut left_key = left_key;
-                for (key, ptr) in &internal.kv {
-                    if is_overlap(&(left_key..=*key), range) {
-                        self.read_range_at(*ptr, range, f, left_key)?;
+                for i in 0..internal.len() {
+                    let k = internal.key(i);
+                    let ptr = internal.ptr(i);
+                    if is_overlap(&(left_key..=k), range) {
+                        self.read_range_at(ptr, range, f, left_key)?;
                     }
-                    left_key = *key;
+                    left_key = k;
                 }
             }
+            _ => fail!(TreeError::UnexpectedPageType {
+                expected: "Leaf or Internal"
+            }),
         }
 
         Ok(())
     }
 
-    /// Return the smallest key not yet present in the tree rooted at `root`.
-    /// This is derived from the maximum existing key plus one.
     pub fn available_key(&mut self, root: NodePtr) -> Result<Key, Error> {
-        self.pager
-            .read_node(root, |archived_node| match archived_node {
-                Archived::<Node>::Leaf(leaf) => {
-                    if let Some(t) = leaf.kv.last() {
-                        t.0.to_native().checked_add(1).unwrap_or(u64::MAX)
-                    } else {
-                        0
-                    }
+        let page = self.pager.owned_node(root)?;
+        match page.page_type() {
+            PageType::Leaf => {
+                let leaf: LeafPage<N> = page.try_into().unwrap();
+                if leaf.len() > 0 {
+                    Ok(leaf.key(leaf.len() - 1).checked_add(1).unwrap_or(u64::MAX))
+                } else {
+                    Ok(0)
                 }
-                Archived::<Node>::Internal(internal) => {
-                    if let Some(t) = internal.kv.last() {
-                        t.0.to_native().checked_add(1).unwrap_or(u64::MAX)
-                    } else {
-                        0
-                    }
-                }
-            })
-    }
-
-    /// Determine whether a value is too large for inline storage and must use overflow pages.
-    fn needs_overflow(&self, value_len: usize) -> bool {
-        value_len > self.pager.page_content_size() / 2
-    }
-
-    /// Convert a raw value into a `Value`, using overflow pages if necessary.
-    fn make_value(&mut self, value: Vec<u8>) -> Result<Value, Error> {
-        if self.needs_overflow(value.len()) {
-            let total_len = value.len() as u64;
-            let start_page = self.write_overflow(&value)?;
-            Ok(Value::Overflow {
-                start_page,
-                total_len,
-            })
-        } else {
-            Ok(Value::Inline(value))
-        }
-    }
-
-    /// Resolve a `Value` into owned bytes, reading overflow pages if needed.
-    fn resolve_value(&mut self, value: &Value) -> Result<Vec<u8>, Error> {
-        match value {
-            Value::Inline(data) => Ok(data.clone()),
-            Value::Overflow {
-                start_page,
-                total_len,
-            } => self.read_overflow(*start_page, *total_len),
-        }
-    }
-
-    /// Find the child page for a given value in an index internal node.
-    /// Returns `None` if value is greater than all entries (needs alloc).
-    fn find_index_child(
-        &mut self,
-        internal: &IndexInternal,
-        value_bytes: &[u8],
-    ) -> Result<Option<NodePtr>, Error> {
-        for (v, ptr) in &internal.kv {
-            let v_bytes = self.resolve_value(v)?;
-            if v_bytes.as_slice() >= value_bytes {
-                return Ok(Some(*ptr));
             }
+            PageType::Internal => {
+                let internal: InternalPage<N> = page.try_into().unwrap();
+                if internal.len() > 0 {
+                    Ok(internal
+                        .key(internal.len() - 1)
+                        .checked_add(1)
+                        .unwrap_or(u64::MAX))
+                } else {
+                    Ok(0)
+                }
+            }
+            _ => fail!(TreeError::UnexpectedPageType {
+                expected: "Leaf or Internal"
+            }),
         }
-        Ok(None)
     }
 
-    /// Write a large value across one or more overflow pages.
-    /// Each overflow page layout: [next_page: u64 LE][data bytes][padding]
-    /// Returns the page number of the first overflow page.
+    // ────────────────────────────────────────────────────────────────────
+    //  Leaf value helpers
+    // ────────────────────────────────────────────────────────────────────
+
+    fn read_leaf_value(&mut self, leaf: &LeafPage<N>, index: usize) -> Result<Vec<u8>, Error> {
+        if leaf.is_overflow(index) {
+            let meta = leaf.value(index);
+            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+            self.read_overflow(start_page, total_len)
+        } else {
+            Ok(leaf.value(index).to_vec())
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Overflow pages
+    // ────────────────────────────────────────────────────────────────────
+
     fn write_overflow(&mut self, data: &[u8]) -> Result<u64, Error> {
         let data_per_page = self.overflow_data_per_page();
         let num_pages = (data.len() + data_per_page - 1) / data_per_page;
@@ -639,7 +787,6 @@ impl Btree {
         Ok(pages[0])
     }
 
-    /// Read a large value stored across overflow pages.
     fn read_overflow(&mut self, start_page: u64, total_len: u64) -> Result<Vec<u8>, Error> {
         let data_per_page = self.overflow_data_per_page();
         let mut result = Vec::with_capacity(total_len as usize);
@@ -658,24 +805,10 @@ impl Btree {
         Ok(result)
     }
 
-    /// Maximum data bytes per overflow page (page_size minus 8-byte next-page pointer).
     fn overflow_data_per_page(&self) -> usize {
         self.pager.page_size() - 8
     }
 
-    /// Free pages used by a `Value`, if it is an overflow value.
-    fn free_value_pages(&mut self, value: &Value) -> Result<(), Error> {
-        if let Value::Overflow {
-            start_page,
-            total_len,
-        } = value
-        {
-            self.free_overflow_pages(*start_page, *total_len)?;
-        }
-        Ok(())
-    }
-
-    /// Free all overflow pages for a chain starting at `start_page`.
     fn free_overflow_pages(&mut self, start_page: u64, total_len: u64) -> Result<(), Error> {
         let data_per_page = self.overflow_data_per_page();
         let mut current_page = start_page;
@@ -692,38 +825,34 @@ impl Btree {
         Ok(())
     }
 
-    // ---- Persisted free page list (linked list in file) ----
+    // ────────────────────────────────────────────────────────────────────
+    //  Free page list
+    // ────────────────────────────────────────────────────────────────────
 
-    /// Read the free list head pointer from the free list metadata page.
     fn read_free_list_head(&mut self) -> Result<u64, Error> {
         let buf = self.pager.read_raw_page(FREE_LIST_PAGE_NUM)?;
         Ok(u64::from_le_bytes(buf[..8].try_into().unwrap()))
     }
 
-    /// Write the free list head pointer to the free list metadata page.
     fn write_free_list_head(&mut self, head: u64) -> Result<(), Error> {
         let mut buf = vec![0u8; 8];
         buf[..8].copy_from_slice(&head.to_le_bytes());
         self.pager.write_raw_page(FREE_LIST_PAGE_NUM, &buf)
     }
 
-    /// Allocate a page, reusing a freed page if available, otherwise extending the file.
     fn alloc_page(&mut self) -> Result<u64, Error> {
         let head = self.read_free_list_head()?;
         if head == u64::MAX {
             return Ok(self.pager.next_page_num());
         }
-        // Read the next pointer from the free page
         let buf = self.pager.read_raw_page(head)?;
         let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
         self.write_free_list_head(next)?;
         Ok(head)
     }
 
-    /// Return a page to the persisted free list.
     pub(crate) fn free_page(&mut self, page_num: u64) -> Result<(), Error> {
         let head = self.read_free_list_head()?;
-        // Write the current head into the freed page
         let mut buf = vec![0u8; 8];
         buf[..8].copy_from_slice(&head.to_le_bytes());
         self.pager.write_raw_page(page_num, &buf)?;
@@ -731,193 +860,547 @@ impl Btree {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    //  Index tree operations (IndexNode: value → key mapping)
+    //  Index tree operations
     // ────────────────────────────────────────────────────────────────────
 
-    /// Initialize a new index tree, returning its root page number.
     pub fn init_index(&mut self) -> Result<NodePtr, Error> {
         let page = self.alloc_page()?;
-        let root_leaf = IndexLeaf { kv: vec![] };
-        self.pager
-            .write_index_node(page, &IndexNode::Leaf(root_leaf))?;
+        let leaf = IndexLeafPage::<N>::new();
+        self.pager.write_node(page, leaf.into())?;
         Ok(page)
     }
 
-    /// Free all pages belonging to an index tree rooted at `root`,
-    /// including overflow pages. The root page itself is also freed.
     pub fn free_index_tree(&mut self, root: NodePtr) -> Result<(), Error> {
-        let node = self.pager.owned_index_node(root)?;
-        match node {
-            IndexNode::Leaf(leaf) => {
-                for (v, _) in &leaf.kv {
-                    self.free_value_pages(v)?;
+        let page = self.pager.owned_node(root)?;
+        match page.page_type() {
+            PageType::IndexLeaf => {
+                let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                for i in 0..leaf.len() {
+                    if leaf.is_overflow(i) {
+                        let meta = leaf.key(i);
+                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        self.free_overflow_pages(start_page, total_len)?;
+                    }
                 }
             }
-            IndexNode::Internal(internal) => {
-                for (_, ptr) in &internal.kv {
-                    self.free_index_tree(*ptr)?;
+            PageType::IndexInternal => {
+                let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                for i in 0..internal.len() {
+                    if internal.is_overflow(i) {
+                        let meta = internal.key(i);
+                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        self.free_overflow_pages(start_page, total_len)?;
+                    }
+                    self.free_index_tree(internal.ptr(i))?;
                 }
             }
+            _ => fail!(TreeError::UnexpectedPageType {
+                expected: "IndexLeaf or IndexInternal"
+            }),
         }
         self.free_page(root)
     }
 
-    /// Insert a (value, key) pair into the index tree rooted at `root`.
-    /// The tree is sorted by `value` (actual bytes). Returns `true` if the entry was newly
-    /// inserted, `false` if the exact (value, key) pair already existed.
     pub fn index_insert(&mut self, root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
-        let new_value = self.make_value(value)?;
-        let new_bytes = self.resolve_value(&new_value)?;
         let mut current = root;
         let mut path = vec![];
 
         loop {
             path.push(current);
-            let node = self.pager.owned_index_node(current)?;
+            let page = self.pager.owned_node(current)?;
 
-            match node {
-                IndexNode::Leaf(mut leaf) => {
-                    // Linear search comparing by resolved bytes
-                    let mut insert_pos = leaf.kv.len();
-                    for (i, (v, k)) in leaf.kv.iter().enumerate() {
-                        let v_bytes = self.resolve_value(v)?;
-                        let cmp = v_bytes.as_slice().cmp(new_bytes.as_slice());
-                        match cmp {
-                            std::cmp::Ordering::Equal => {
-                                let cmp_key = k.cmp(&key);
-                                match cmp_key {
-                                    std::cmp::Ordering::Equal => return Ok(false),
-                                    std::cmp::Ordering::Greater => {
-                                        insert_pos = i;
-                                        break;
-                                    }
-                                    std::cmp::Ordering::Less => {}
-                                }
-                            }
-                            std::cmp::Ordering::Greater => {
-                                insert_pos = i;
-                                break;
-                            }
-                            std::cmp::Ordering::Less => {}
-                        }
+            match page.page_type() {
+                PageType::IndexLeaf => {
+                    let mut leaf: IndexLeafPage<N> = page.try_into().unwrap();
+
+                    // Check if exact (value, key) already exists
+                    if leaf.find_entry(&value, key, &mut self.pager).is_some() {
+                        return Ok(false);
                     }
-                    leaf.kv.insert(insert_pos, (new_value, key));
-                    self.index_split_insert(root, &path, &IndexNode::Leaf(leaf))?;
+
+                    if leaf.can_insert(value.len()) {
+                        leaf.insert_entry(&value, key, &mut self.pager);
+                        let page_num = *path.last().unwrap();
+                        self.pager.write_node(page_num, leaf.into())?;
+                        return Ok(true);
+                    }
+
+                    // Need to split
+                    let mut right = leaf.split();
+                    // Determine which half to insert into
+                    let split_key_bytes = leaf.resolved_key(leaf.len() - 1, &mut self.pager);
+                    let cmp = value.as_slice().cmp(split_key_bytes.as_ref());
+                    if cmp == std::cmp::Ordering::Less
+                        || (cmp == std::cmp::Ordering::Equal && key <= leaf.value(leaf.len() - 1))
+                    {
+                        leaf.insert_entry(&value, key, &mut self.pager);
+                    } else {
+                        right.insert_entry(&value, key, &mut self.pager);
+                    }
+
+                    let page_num = *path.last().unwrap();
+                    let parents = &path[..path.len() - 1];
+                    let right_page = self.alloc_page()?;
+
+                    self.pager.write_node(right_page, right.into())?;
+                    self.pager.write_node(page_num, leaf.into())?;
+
+                    self.index_propagate_split(root, parents, page_num, right_page)?;
                     return Ok(true);
                 }
-                IndexNode::Internal(mut internal) => {
-                    match self.find_index_child(&internal, &new_bytes)? {
-                        Some(next) => {
-                            current = next;
-                        }
+                PageType::IndexInternal => {
+                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                    match internal.find_child(&value, &mut self.pager) {
+                        Some(next) => current = next,
                         None => {
-                            // value is beyond all entries
-                            if internal.kv.is_empty() {
+                            // Value is beyond all entries
+                            let mut internal: IndexInternalPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+                            if internal.len() == 0 {
                                 let new_leaf_page = self.alloc_page()?;
-                                let new_leaf = IndexLeaf {
-                                    kv: vec![(new_value.clone(), key)],
-                                };
-                                self.pager
-                                    .write_index_node(new_leaf_page, &IndexNode::Leaf(new_leaf))?;
-                                internal.kv.push((new_value, new_leaf_page));
-                                self.pager
-                                    .write_index_node(current, &IndexNode::Internal(internal))?;
+                                let mut new_leaf = IndexLeafPage::<N>::new();
+                                new_leaf.insert_entry(&value, key, &mut self.pager);
+                                self.pager.write_node(new_leaf_page, new_leaf.into())?;
+                                internal.insert(&value, new_leaf_page, &mut self.pager);
+                                self.pager.write_node(current, internal.into())?;
                                 return Ok(true);
                             } else {
-                                let last = internal.kv.last_mut().unwrap();
-                                last.0 = new_value.clone();
-                                let next = last.1;
-                                self.pager
-                                    .write_index_node(current, &IndexNode::Internal(internal))?;
+                                let last_idx = internal.len() - 1;
+                                let next = internal.ptr(last_idx);
+                                // Update last key to accommodate new value
+                                internal.remove(last_idx);
+                                internal.insert(&value, next, &mut self.pager);
+                                self.pager.write_node(current, internal.into())?;
                                 current = next;
                             }
                         }
                     }
                 }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "IndexLeaf or IndexInternal"
+                }),
             }
         }
     }
 
-    /// Remove the entry matching `(value, key)` from the index tree rooted at `root`.
-    /// Routes by `value` (actual bytes). Returns `true` if the entry was found and removed.
-    pub fn index_remove(&mut self, root: NodePtr, value: &Value, key: Key) -> Result<bool, Error> {
-        let target_bytes = self.resolve_value(value)?;
+    /// Propagate an index page split up to the parent.
+    fn index_propagate_split(
+        &mut self,
+        root: NodePtr,
+        parents: &[NodePtr],
+        left_page: NodePtr,
+        right_page: NodePtr,
+    ) -> Result<(), Error> {
+        // Get max key from left page for the parent entry
+        let left_any = self.pager.owned_node(left_page)?;
+        let left_max_key: Vec<u8> = match left_any.page_type() {
+            PageType::IndexLeaf => {
+                let leaf: IndexLeafPage<N> = left_any.try_into().unwrap();
+                leaf.resolved_key(leaf.len() - 1, &mut self.pager)
+                    .into_owned()
+            }
+            PageType::IndexInternal => {
+                let internal: IndexInternalPage<N> = left_any.try_into().unwrap();
+                internal
+                    .resolved_key(internal.len() - 1, &mut self.pager)
+                    .into_owned()
+            }
+            _ => unreachable!(),
+        };
+
+        if let Some(&parent_ptr) = parents.last() {
+            let mut parent: IndexInternalPage<N> =
+                self.pager.owned_node(parent_ptr)?.try_into().unwrap();
+
+            // Find the entry for left_page and update
+            for i in 0..parent.len() {
+                if parent.ptr(i) == left_page {
+                    let old_key = parent.resolved_key(i, &mut self.pager).into_owned();
+                    let (_, raw_kl, _) = parent.read_slot(i);
+                    // Remove old entry, re-insert with new max key for left
+                    parent.remove(i);
+
+                    // Free old overflow key if applicable
+                    if raw_kl & OVERFLOW_FLAG != 0 {
+                        // The old key data was overflow — but we're removing the slot;
+                        // the overflow pages for the old key in internal nodes should be freed
+                        // But actually the internal node key is the max key from the subtree,
+                        // and the overflow data is shared with the subtree. So we shouldn't
+                        // free it here. The subtree owns those overflow pages.
+                        // Actually, index internal page keys are COPIES, not shared.
+                        // We need to free them.
+                        let _meta_bytes = &old_key; // This is already resolved
+                        // Actually, resolved_key already read the overflow. The raw inline
+                        // data in the slot is the overflow metadata. We need the raw bytes.
+                        // Let's skip freeing here — the key data will be re-inserted.
+                    }
+
+                    // Insert left_max_key for left_page
+                    if IndexInternalPage::<N>::needs_overflow(left_max_key.len()) {
+                        let start_page = self.write_overflow(&left_max_key)?;
+                        let mut meta = [0u8; OVERFLOW_META_SIZE];
+                        meta[0..8].copy_from_slice(&start_page.to_le_bytes());
+                        meta[8..16].copy_from_slice(&(left_max_key.len() as u64).to_le_bytes());
+                        let idx = parent.len(); // append at end, will re-sort
+                        parent.insert_raw_at(
+                            idx,
+                            &meta,
+                            OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG,
+                            left_page,
+                        );
+                    } else {
+                        // Find correct position
+                        let idx = parent
+                            .search(&left_max_key, &mut self.pager)
+                            .unwrap_or(parent.len());
+                        parent.insert_raw_at(
+                            idx,
+                            &left_max_key,
+                            left_max_key.len() as u16,
+                            left_page,
+                        );
+                    }
+
+                    // Insert right_page with old max key
+                    if parent.can_insert(old_key.len()) {
+                        parent.insert(&old_key, right_page, &mut self.pager);
+                        self.pager.write_node(parent_ptr, parent.into())?;
+                    } else {
+                        // Need to split parent too
+                        let mut right_parent = parent.split();
+                        // Determine which half gets the new entry
+                        let split_key = parent
+                            .resolved_key(parent.len() - 1, &mut self.pager)
+                            .into_owned();
+                        if old_key.as_slice() <= split_key.as_slice() {
+                            parent.insert(&old_key, right_page, &mut self.pager);
+                        } else {
+                            right_parent.insert(&old_key, right_page, &mut self.pager);
+                        }
+
+                        let rp = self.alloc_page()?;
+                        self.pager.write_node(rp, right_parent.into())?;
+                        self.pager.write_node(parent_ptr, parent.into())?;
+
+                        let gparents = &parents[..parents.len() - 1];
+                        self.index_propagate_split(root, gparents, parent_ptr, rp)?;
+                    }
+
+                    return Ok(());
+                }
+            }
+            panic!("left_page not found in parent during index split propagation");
+        } else {
+            // Splitting the root
+            let right_any = self.pager.owned_node(right_page)?;
+            let right_max_key: Vec<u8> = match right_any.page_type() {
+                PageType::IndexLeaf => {
+                    let leaf: IndexLeafPage<N> = right_any.try_into().unwrap();
+                    leaf.resolved_key(leaf.len() - 1, &mut self.pager)
+                        .into_owned()
+                }
+                PageType::IndexInternal => {
+                    let internal: IndexInternalPage<N> = right_any.try_into().unwrap();
+                    internal
+                        .resolved_key(internal.len() - 1, &mut self.pager)
+                        .into_owned()
+                }
+                _ => unreachable!(),
+            };
+
+            // Move root content to a new page
+            let moved_page = self.alloc_page()?;
+            let root_content = self.pager.owned_node(root)?;
+            self.pager.write_node(moved_page, root_content)?;
+
+            let mut new_root = IndexInternalPage::<N>::new();
+            new_root.insert(&left_max_key, moved_page, &mut self.pager);
+            new_root.insert(&right_max_key, right_page, &mut self.pager);
+            self.pager.write_node(root, new_root.into())?;
+            Ok(())
+        }
+    }
+
+    pub fn index_remove(&mut self, root: NodePtr, value: &[u8], key: Key) -> Result<bool, Error> {
         let mut current = root;
         let mut path = vec![];
 
         loop {
             path.push(current);
-            let node = self.pager.owned_index_node(current)?;
+            let page = self.pager.owned_node(current)?;
 
-            match node {
-                IndexNode::Leaf(mut leaf) => {
-                    // Find the entry by resolved bytes + key
-                    let mut found_idx = None;
-                    for (i, (v, k)) in leaf.kv.iter().enumerate() {
-                        let v_bytes = self.resolve_value(v)?;
-                        if v_bytes == target_bytes && *k == key {
-                            found_idx = Some(i);
-                            break;
+            match page.page_type() {
+                PageType::IndexLeaf => {
+                    let mut leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                    // Check for overflow key to free
+                    if let Some(idx) = leaf.find_entry(value, key, &mut self.pager) {
+                        let overflow_meta = if leaf.is_overflow(idx) {
+                            let meta = leaf.key(idx);
+                            Some((
+                                u64::from_le_bytes(meta[0..8].try_into().unwrap()),
+                                u64::from_le_bytes(meta[8..16].try_into().unwrap()),
+                            ))
+                        } else {
+                            None
+                        };
+                        leaf.remove(idx);
+                        self.index_merge_leaf(root, &path, leaf)?;
+                        if let Some((start_page, total_len)) = overflow_meta {
+                            self.free_overflow_pages(start_page, total_len)?;
                         }
+                        return Ok(true);
                     }
-                    match found_idx {
-                        Some(idx) => {
-                            let old_value_entry = leaf.kv.remove(idx).0;
-                            self.index_merge_insert(root, &path, &IndexNode::Leaf(leaf))?;
-                            self.free_value_pages(&old_value_entry)?;
-                            return Ok(true);
-                        }
-                        None => return Ok(false),
-                    }
+                    return Ok(false);
                 }
-                IndexNode::Internal(internal) => {
-                    match self.find_index_child(&internal, &target_bytes)? {
+                PageType::IndexInternal => {
+                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                    match internal.find_child(value, &mut self.pager) {
                         Some(next) => current = next,
                         None => return Ok(false),
                     }
                 }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "IndexLeaf or IndexInternal"
+                }),
             }
         }
     }
 
-    /// Look up by value in the index tree rooted at `root`.
-    /// The closure `f` receives `Some(key)` if found or `None` if absent.
-    /// Comparison is by actual bytes. If multiple entries share the same value,
-    /// returns the first match.
+    fn index_merge_leaf(
+        &mut self,
+        root: NodePtr,
+        path: &[NodePtr],
+        leaf: IndexLeafPage<N>,
+    ) -> Result<(), Error> {
+        let page = *path.last().unwrap();
+
+        if path.len() <= 1 || leaf.free_space() <= N / 2 {
+            self.pager.write_node(page, leaf.into())?;
+            return Ok(());
+        }
+
+        if leaf.len() == 0 {
+            let parents = &path[..path.len() - 1];
+            let parent_page = *parents.last().unwrap();
+            let mut parent: IndexInternalPage<N> =
+                self.pager.owned_node(parent_page)?.try_into().unwrap();
+            for i in 0..parent.len() {
+                if parent.ptr(i) == page {
+                    // Free overflow key in parent if applicable
+                    if parent.is_overflow(i) {
+                        let meta = parent.key(i);
+                        let sp = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                        let tl = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        self.free_overflow_pages(sp, tl)?;
+                    }
+                    parent.remove(i);
+                    break;
+                }
+            }
+            self.free_page(page)?;
+            return self.index_merge_internal(root, parents, parent);
+        }
+
+        let parents = &path[..path.len() - 1];
+        if !self.index_try_merge_leaf_with_left(root, page, &leaf, parents)? {
+            self.pager.write_node(page, leaf.into())?;
+        }
+        Ok(())
+    }
+
+    fn index_try_merge_leaf_with_left(
+        &mut self,
+        root: NodePtr,
+        page: NodePtr,
+        right_leaf: &IndexLeafPage<N>,
+        parents: &[NodePtr],
+    ) -> Result<bool, Error> {
+        let parent_page = *parents.last().unwrap();
+        let parent: IndexInternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
+
+        let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
+        if index == 0 {
+            return Ok(false);
+        }
+
+        let left_sibling_page = parent.ptr(index - 1);
+        let left_leaf: IndexLeafPage<N> = self
+            .pager
+            .owned_node(left_sibling_page)?
+            .try_into()
+            .unwrap();
+
+        // Check if all entries from right can fit into left
+        let mut merged = left_leaf.clone();
+        for i in 0..right_leaf.len() {
+            let (_, kl, v) = right_leaf.read_slot(i);
+            let key_data = right_leaf.key(i);
+            let inline_size = key_data.len();
+            if merged.free_space() < INDEX_SLOT_SIZE + inline_size {
+                return Ok(false);
+            }
+            let end = merged.len();
+            merged.insert_raw_at(end, key_data, kl, v);
+        }
+
+        self.pager.write_node(page, merged.into())?;
+        let mut parent: IndexInternalPage<N> =
+            self.pager.owned_node(parent_page)?.try_into().unwrap();
+        // Free overflow key in parent for left sibling entry
+        if parent.is_overflow(index - 1) {
+            let meta = parent.key(index - 1);
+            let sp = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+            let tl = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+            self.free_overflow_pages(sp, tl)?;
+            // Re-read parent after freeing (pager state may change)
+            parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
+        }
+        parent.remove(index - 1);
+        self.free_page(left_sibling_page)?;
+        self.index_merge_internal(root, parents, parent)?;
+        Ok(true)
+    }
+
+    fn index_merge_internal(
+        &mut self,
+        root: NodePtr,
+        path: &[NodePtr],
+        internal: IndexInternalPage<N>,
+    ) -> Result<(), Error> {
+        let mut cur_path = path;
+        let mut cur_internal = internal;
+
+        loop {
+            let page = *cur_path.last().unwrap();
+
+            if cur_path.len() <= 1 || cur_internal.free_space() <= N / 2 {
+                self.pager.write_node(page, cur_internal.into())?;
+                return Ok(());
+            }
+
+            if cur_internal.len() == 0 {
+                if cur_path.len() <= 1 {
+                    let leaf = IndexLeafPage::<N>::new();
+                    self.pager.write_node(page, leaf.into())?;
+                    return Ok(());
+                }
+                let parents = &cur_path[..cur_path.len() - 1];
+                let parent_page = *parents.last().unwrap();
+                let mut parent: IndexInternalPage<N> =
+                    self.pager.owned_node(parent_page)?.try_into().unwrap();
+                for i in 0..parent.len() {
+                    if parent.ptr(i) == page {
+                        if parent.is_overflow(i) {
+                            let meta = parent.key(i);
+                            let sp = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let tl = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            self.free_overflow_pages(sp, tl)?;
+                            parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
+                        }
+                        parent.remove(i);
+                        break;
+                    }
+                }
+                self.free_page(page)?;
+                cur_path = parents;
+                cur_internal = parent;
+                continue;
+            }
+
+            let parents = &cur_path[..cur_path.len() - 1];
+            if !self.index_try_merge_internal_with_left(root, page, &cur_internal, parents)? {
+                self.pager.write_node(page, cur_internal.into())?;
+            }
+            return Ok(());
+        }
+    }
+
+    fn index_try_merge_internal_with_left(
+        &mut self,
+        root: NodePtr,
+        page: NodePtr,
+        right_internal: &IndexInternalPage<N>,
+        parents: &[NodePtr],
+    ) -> Result<bool, Error> {
+        let parent_page = *parents.last().unwrap();
+        let parent: IndexInternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
+
+        let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
+        if index == 0 {
+            return Ok(false);
+        }
+
+        let left_sibling_page = parent.ptr(index - 1);
+        let left_internal: IndexInternalPage<N> = self
+            .pager
+            .owned_node(left_sibling_page)?
+            .try_into()
+            .unwrap();
+
+        // Check if combined entries fit
+        let mut merged = left_internal.clone();
+        for i in 0..right_internal.len() {
+            let (_, kl, v) = right_internal.read_slot(i);
+            let key_data = right_internal.key(i);
+            let inline_size = key_data.len();
+            if merged.free_space() < INDEX_SLOT_SIZE + inline_size {
+                return Ok(false);
+            }
+            let end = merged.len();
+            merged.insert_raw_at(end, key_data, kl, v);
+        }
+
+        self.pager.write_node(page, merged.into())?;
+        let mut parent: IndexInternalPage<N> =
+            self.pager.owned_node(parent_page)?.try_into().unwrap();
+        if parent.is_overflow(index - 1) {
+            let meta = parent.key(index - 1);
+            let sp = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+            let tl = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+            self.free_overflow_pages(sp, tl)?;
+            parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
+        }
+        parent.remove(index - 1);
+        self.free_page(left_sibling_page)?;
+        self.index_merge_internal(root, parents, parent)?;
+        Ok(true)
+    }
+
     pub fn index_read<T>(
         &mut self,
         root: NodePtr,
-        value: &Value,
+        value: &[u8],
         f: impl FnOnce(Option<Key>) -> T,
     ) -> Result<T, Error> {
-        let target_bytes = self.resolve_value(value)?;
         let mut current = root;
         let mut ff = Some(f);
 
         loop {
-            let node = self.pager.owned_index_node(current)?;
-            match node {
-                IndexNode::Leaf(leaf) => {
-                    for (v, k) in &leaf.kv {
-                        let v_bytes = self.resolve_value(v)?;
-                        if v_bytes == target_bytes {
-                            return Ok(ff.take().unwrap()(Some(*k)));
-                        }
+            let page = self.pager.owned_node(current)?;
+            match page.page_type() {
+                PageType::IndexLeaf => {
+                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                    if let Some(key) = leaf.get(value, &mut self.pager) {
+                        return Ok(ff.take().unwrap()(Some(key)));
                     }
                     return Ok(ff.take().unwrap()(None));
                 }
-                IndexNode::Internal(internal) => {
-                    match self.find_index_child(&internal, &target_bytes)? {
+                PageType::IndexInternal => {
+                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                    match internal.find_child(value, &mut self.pager) {
                         Some(next) => current = next,
                         None => return Ok(ff.take().unwrap()(None)),
                     }
                 }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "IndexLeaf or IndexInternal"
+                }),
             }
         }
     }
 
-    /// Iterate over all entries in the index tree whose values (by actual bytes)
-    /// fall within `range`, calling `f(value_bytes, key)` for each entry in order.
     pub fn index_read_range<R: RangeBounds<Vec<u8>>>(
         &mut self,
         root: NodePtr,
@@ -933,23 +1416,24 @@ impl Btree {
         range: &R,
         f: &mut impl FnMut(&[u8], Key),
     ) -> Result<(), Error> {
-        let node = self.pager.owned_index_node(node_ptr)?;
+        let page = self.pager.owned_node(node_ptr)?;
 
-        match node {
-            IndexNode::Leaf(leaf) => {
-                for (v, k) in leaf.kv {
-                    let v_bytes = self.resolve_value(&v)?;
-                    if range.contains(&v_bytes) {
-                        f(&v_bytes, k);
+        match page.page_type() {
+            PageType::IndexLeaf => {
+                let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                for i in 0..leaf.len() {
+                    let key_bytes = leaf.resolved_key(i, &mut self.pager).into_owned();
+                    if range.contains(&key_bytes) {
+                        f(&key_bytes, leaf.value(i));
                     }
                 }
             }
-            IndexNode::Internal(internal) => {
-                for i in 0..internal.kv.len() {
-                    let max_bytes = self.resolve_value(&internal.kv[i].0)?;
-                    let ptr = internal.kv[i].1;
+            PageType::IndexInternal => {
+                let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                for i in 0..internal.len() {
+                    let max_bytes = internal.resolved_key(i, &mut self.pager).into_owned();
+                    let ptr = internal.ptr(i);
 
-                    // Skip if max_value is below range start
                     let below_start = match range.start_bound() {
                         Bound::Included(s) => max_bytes.as_slice() < s.as_slice(),
                         Bound::Excluded(s) => max_bytes.as_slice() <= s.as_slice(),
@@ -959,12 +1443,11 @@ impl Btree {
                         continue;
                     }
 
-                    // Stop if this subtree's min value exceeds range end
                     if i > 0 {
-                        let prev_max_bytes = self.resolve_value(&internal.kv[i - 1].0)?;
+                        let prev_max = internal.resolved_key(i - 1, &mut self.pager).into_owned();
                         let beyond_end = match range.end_bound() {
-                            Bound::Included(e) => prev_max_bytes.as_slice() > e.as_slice(),
-                            Bound::Excluded(e) => prev_max_bytes.as_slice() >= e.as_slice(),
+                            Bound::Included(e) => prev_max.as_slice() > e.as_slice(),
+                            Bound::Excluded(e) => prev_max.as_slice() >= e.as_slice(),
                             Bound::Unbounded => false,
                         };
                         if beyond_end {
@@ -975,298 +1458,102 @@ impl Btree {
                     self.index_read_range_at(ptr, range, f)?;
                 }
             }
+            _ => fail!(TreeError::UnexpectedPageType {
+                expected: "IndexLeaf or IndexInternal"
+            }),
         }
 
         Ok(())
     }
 
-    /// Return the smallest key not yet present in the index tree rooted at `root`.
-    /// Since the tree is sorted by value, this traverses all leaves to find the max key.
     pub fn index_available_key(&mut self, root: NodePtr) -> Result<Key, Error> {
-        let node = self.pager.owned_index_node(root)?;
-        match node {
-            IndexNode::Leaf(leaf) => Ok(leaf
-                .kv
-                .iter()
-                .map(|t| t.1)
-                .max()
-                .map_or(0, |k| k.checked_add(1).unwrap_or(u64::MAX))),
-            IndexNode::Internal(internal) => {
+        let page = self.pager.owned_node(root)?;
+        match page.page_type() {
+            PageType::IndexLeaf => {
+                let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                Ok((0..leaf.len())
+                    .map(|i| leaf.value(i))
+                    .max()
+                    .map_or(0, |k| k.checked_add(1).unwrap_or(u64::MAX)))
+            }
+            PageType::IndexInternal => {
+                let internal: IndexInternalPage<N> = page.try_into().unwrap();
                 let mut max_key: Key = 0;
-                for (_, ptr) in &internal.kv {
-                    let child_key = self.index_available_key(*ptr)?;
+                for i in 0..internal.len() {
+                    let child_key = self.index_available_key(internal.ptr(i))?;
                     max_key = max_key.max(child_key);
                 }
                 Ok(max_key)
             }
+            _ => fail!(TreeError::UnexpectedPageType {
+                expected: "IndexLeaf or IndexInternal"
+            }),
         }
     }
 
-    fn index_split_insert(
-        &mut self,
-        root: NodePtr,
-        path: &[NodePtr],
-        insert: &IndexNode,
-    ) -> Result<(), Error> {
-        let buffer = rkyv::to_bytes(insert)?;
+    // ────────────────────────────────────────────────────────────────────
+    //  Test helpers
+    // ────────────────────────────────────────────────────────────────────
 
-        let page = *path.last().unwrap();
-        let parents = &path[..path.len() - 1];
-
-        if buffer.len() <= self.pager.page_content_size() {
-            self.pager.write_buffer(page, buffer)?;
-            return Ok(());
-        }
-
-        let page_content_size = self.pager.page_content_size();
-        let mut keyed_nodes: Vec<(Value, IndexNode)> = match insert {
-            IndexNode::Leaf(leaf) => split_index_leaf(leaf.kv.clone(), page_content_size)?
-                .into_iter()
-                .map(|kv| {
-                    let max_value = kv.last().unwrap().0.clone();
-                    (max_value, IndexNode::Leaf(IndexLeaf { kv }))
-                })
-                .collect(),
-            IndexNode::Internal(internal) => {
-                split_index_internal(internal.kv.clone(), page_content_size)?
-                    .into_iter()
-                    .map(|kv| {
-                        let max_value = kv.last().unwrap().0.clone();
-                        (max_value, IndexNode::Internal(IndexInternal { kv }))
-                    })
-                    .collect()
-            }
-        };
-
-        // Sort split chunks by resolved max value bytes
-        self.sort_keyed_nodes(&mut keyed_nodes)?;
-
-        self.index_write_splits(root, keyed_nodes, page, parents)
-    }
-
-    /// Sort a vec of (Value, T) by resolved byte content of the Value.
-    fn sort_keyed_nodes<T>(&mut self, nodes: &mut Vec<(Value, T)>) -> Result<(), Error> {
-        // Resolve all values to bytes, then sort by those bytes
-        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
-        for (v, _) in nodes.iter() {
-            bytes.push(self.resolve_value(v)?);
-        }
-        // Build index array and sort
-        let mut indices: Vec<usize> = (0..nodes.len()).collect();
-        indices.sort_by(|&a, &b| bytes[a].cmp(&bytes[b]));
-        // Reorder in-place using the sorted indices
-        let mut sorted = Vec::with_capacity(nodes.len());
-        for &i in &indices {
-            // Safe because we consume the original vec below
-            sorted.push(i);
-        }
-        let mut taken: Vec<Option<(Value, T)>> = nodes.drain(..).map(Some).collect();
-        for i in sorted {
-            nodes.push(taken[i].take().unwrap());
-        }
-        Ok(())
-    }
-
-    /// Sort an IndexInternal's kv entries by resolved byte content of the Value.
-    fn sort_index_internal_kv(&mut self, kv: &mut Vec<(Value, NodePtr)>) -> Result<(), Error> {
-        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(kv.len());
-        for (v, _) in kv.iter() {
-            bytes.push(self.resolve_value(v)?);
-        }
-        let mut indices: Vec<usize> = (0..kv.len()).collect();
-        indices.sort_by(|&a, &b| bytes[a].cmp(&bytes[b]));
-        let mut taken: Vec<Option<(Value, NodePtr)>> = kv.drain(..).map(Some).collect();
-        for &i in &indices {
-            kv.push(taken[i].take().unwrap());
-        }
-        Ok(())
-    }
-
-    fn index_write_splits(
-        &mut self,
-        root: NodePtr,
-        mut keyed_nodes: Vec<(Value, IndexNode)>,
-        page: NodePtr,
-        parents: &[NodePtr],
-    ) -> Result<(), Error> {
-        if let Some(&parent_page) = parents.last() {
-            let (_right_value, right_node) = keyed_nodes.pop().unwrap();
-            self.pager.write_index_node(page, &right_node)?;
-
-            let IndexNode::Internal(mut parent_internal) =
-                self.pager.owned_index_node(parent_page)?
-            else {
-                fail!(TreeError::UnexpectedNodeType { expected: "internal parent" });
-            };
-            for (value, node) in keyed_nodes {
-                let new_page = self.alloc_page()?;
-                self.pager.write_index_node(new_page, &node)?;
-                parent_internal.kv.push((value, new_page));
-            }
-            self.sort_index_internal_kv(&mut parent_internal.kv)?;
-            self.index_split_insert(root, parents, &IndexNode::Internal(parent_internal))
-        } else {
-            let new_entries = keyed_nodes
-                .into_iter()
-                .map(|(value, node)| {
-                    let new_page = self.alloc_page()?;
-                    self.pager.write_index_node(new_page, &node)?;
-                    Ok((value, new_page))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            self.index_split_insert(
-                root,
-                &[root],
-                &IndexNode::Internal(IndexInternal { kv: new_entries }),
-            )
-        }
-    }
-
-    fn index_merge_insert(
-        &mut self,
-        root: NodePtr,
-        path: &[NodePtr],
-        insert: &IndexNode,
-    ) -> Result<(), Error> {
-        let buffer = rkyv::to_bytes(insert)?;
-
-        let page = *path.last().unwrap();
-
-        debug_assert!(buffer.len() <= self.pager.page_content_size());
-
-        if buffer.len() >= self.pager.page_content_size() / 2 || path.len() <= 1 {
-            return self.pager.write_buffer(page, buffer);
-        }
-
-        // Handle empty leaf: remove from parent entirely
-        if let IndexNode::Leaf(leaf) = insert {
-            if leaf.kv.is_empty() {
-                let parents = &path[..path.len() - 1];
-                let parent_page = *parents.last().unwrap();
-                let IndexNode::Internal(mut internal) = self.pager.owned_index_node(parent_page)?
-                else {
-                    fail!(TreeError::UnexpectedNodeType { expected: "internal parent" });
-                };
-                internal.kv.retain(|entry| entry.1 != page);
-                self.free_page(page)?;
-                return self.index_merge_insert(root, parents, &IndexNode::Internal(internal));
-            }
-        }
-
-        let parents = &path[..path.len() - 1];
-        if !self.index_try_merge_with_left_sibling(root, page, insert, parents)? {
-            self.pager.write_index_node(page, insert)?;
-        }
-        Ok(())
-    }
-
-    fn index_try_merge_with_left_sibling(
-        &mut self,
-        root: NodePtr,
-        page: NodePtr,
-        insert: &IndexNode,
-        parents: &[NodePtr],
-    ) -> Result<bool, Error> {
-        let parent_page = *parents.last().unwrap();
-        let IndexNode::Internal(mut parent_internal) = self.pager.owned_index_node(parent_page)?
-        else {
-            return Ok(false);
-        };
-
-        let index = parent_internal
-            .kv
-            .iter()
-            .position(|entry| entry.1 == page)
-            .unwrap();
-        if index == 0 {
-            return Ok(false);
-        }
-
-        let left_sibling_page = parent_internal.kv[index - 1].1;
-        let left_sibling_node = self.pager.owned_index_node(left_sibling_page)?;
-
-        let merged = match (left_sibling_node, insert) {
-            (IndexNode::Leaf(mut left), IndexNode::Leaf(right)) => {
-                left.kv.extend(right.kv.iter().cloned());
-                IndexNode::Leaf(left)
-            }
-            (IndexNode::Internal(mut left), IndexNode::Internal(right)) => {
-                left.kv.extend(right.kv.iter().cloned());
-                IndexNode::Internal(left)
-            }
-            _ => return Ok(false),
-        };
-
-        let buffer = rkyv::to_bytes(&merged)?;
-        if buffer.len() <= self.pager.page_content_size() {
-            self.pager.write_buffer(page, buffer)?;
-            parent_internal.kv.remove(index - 1);
-            self.index_merge_insert(root, parents, &IndexNode::Internal(parent_internal))?;
-            self.free_page(left_sibling_page)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Print a human-readable dump of the tree rooted at `root` for debugging.
-    /// Panics if any key is outside `[min, max]`.
     #[cfg(test)]
     pub fn debug(&mut self, root: NodePtr, min: Key, max: Key) -> Result<(), Error> {
-        let node = self.pager.owned_node(root)?;
+        let page = self.pager.owned_node(root)?;
 
-        match node {
-            Node::Leaf(leaf) => {
+        match page.page_type() {
+            PageType::Leaf => {
+                let leaf: LeafPage<N> = page.try_into().unwrap();
                 println!("Leaf Node (page {}):", root);
-                for (k, v) in leaf.kv {
+                for i in 0..leaf.len() {
+                    let k = leaf.key(i);
                     if !(min <= k && k <= max) {
                         panic!("Key {} out of range ({}..={})", k, min, max);
                     }
-                    match &v {
-                        Value::Inline(data) => {
-                            println!("  Key: {}, Value Length: {} (inline)", k, data.len());
-                        }
-                        Value::Overflow { total_len, .. } => {
-                            println!("  Key: {}, Value Length: {} (overflow)", k, total_len);
-                        }
+                    if leaf.is_overflow(i) {
+                        let meta = leaf.value(i);
+                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        println!("  Key: {}, Value Length: {} (overflow)", k, total_len);
+                    } else {
+                        println!(
+                            "  Key: {}, Value Length: {} (inline)",
+                            k,
+                            leaf.value(i).len()
+                        );
                     }
                 }
             }
-            Node::Internal(internal) => {
+            PageType::Internal => {
+                let internal: InternalPage<N> = page.try_into().unwrap();
                 println!("Internal Node (page {}):", root);
-                for (k, ptr) in &internal.kv {
-                    if !(min <= *k && *k <= max) {
+                for i in 0..internal.len() {
+                    let k = internal.key(i);
+                    let ptr = internal.ptr(i);
+                    if !(min <= k && k <= max) {
                         panic!("Key {} out of range ({}..={})", k, min, max);
                     }
                     println!("  Key: {}, Child Page: {}", k, ptr);
                 }
                 let mut left = min;
-                for (k, ptr) in &internal.kv {
-                    self.debug(*ptr, left, *k)?;
-                    left = *k;
+                for i in 0..internal.len() {
+                    self.debug(internal.ptr(i), left, internal.key(i))?;
+                    left = internal.key(i);
                 }
             }
+            _ => {}
         }
 
         Ok(())
     }
 
-    /// Check for page leaks. Walks the tree and free list, verifying every page
-    /// in [0, next_page_num) is accounted for exactly once.
-    /// Panics with a detailed message if any leaked or double-used pages are found.
     #[cfg(test)]
     pub fn assert_no_page_leak(&mut self, root: NodePtr) {
         use std::collections::BTreeSet;
 
         let total_pages = self.pager.total_page_count();
-
-        // Collect all pages reachable from the tree
         let mut tree_pages = BTreeSet::new();
         tree_pages.insert(root);
         tree_pages.insert(FREE_LIST_PAGE_NUM);
         self.collect_tree_pages(root, &mut tree_pages);
 
-        // Collect all pages in the free list
         let mut free_pages = BTreeSet::new();
         let mut head = self.read_free_list_head().unwrap();
         while head != u64::MAX {
@@ -1279,7 +1566,6 @@ impl Btree {
             head = u64::from_le_bytes(buf[..8].try_into().unwrap());
         }
 
-        // Check for overlap
         let overlap: Vec<_> = tree_pages.intersection(&free_pages).collect();
         assert!(
             overlap.is_empty(),
@@ -1287,7 +1573,6 @@ impl Btree {
             overlap
         );
 
-        // Check all pages are accounted for
         let mut all_pages: BTreeSet<u64> = (0..total_pages).collect();
         for &p in &tree_pages {
             all_pages.remove(&p);
@@ -1305,41 +1590,40 @@ impl Btree {
         );
     }
 
-    /// Recursively collect all pages used by the tree rooted at `page_num`,
-    /// including overflow pages.
     #[cfg(test)]
     fn collect_tree_pages(
         &mut self,
         page_num: NodePtr,
         pages: &mut std::collections::BTreeSet<u64>,
     ) {
-        let node = self.pager.owned_node(page_num).unwrap();
-        match node {
-            Node::Leaf(leaf) => {
-                for (_, v) in &leaf.kv {
-                    if let Value::Overflow {
-                        start_page,
-                        total_len,
-                    } = v
-                    {
-                        self.collect_overflow_pages(*start_page, *total_len, pages);
+        let page = self.pager.owned_node(page_num).unwrap();
+        match page.page_type() {
+            PageType::Leaf => {
+                let leaf: LeafPage<N> = page.try_into().unwrap();
+                for i in 0..leaf.len() {
+                    if leaf.is_overflow(i) {
+                        let meta = leaf.value(i);
+                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        self.collect_overflow_pages(start_page, total_len, pages);
                     }
                 }
             }
-            Node::Internal(internal) => {
-                for (_, ptr) in &internal.kv {
+            PageType::Internal => {
+                let internal: InternalPage<N> = page.try_into().unwrap();
+                for i in 0..internal.len() {
                     assert!(
-                        pages.insert(*ptr),
+                        pages.insert(internal.ptr(i)),
                         "Page {} referenced multiple times in tree",
-                        ptr
+                        internal.ptr(i)
                     );
-                    self.collect_tree_pages(*ptr, pages);
+                    self.collect_tree_pages(internal.ptr(i), pages);
                 }
             }
+            _ => {}
         }
     }
 
-    /// Collect all overflow pages in a chain.
     #[cfg(test)]
     fn collect_overflow_pages(
         &mut self,
@@ -1364,14 +1648,11 @@ impl Btree {
         }
     }
 
-    /// Check for page leaks with an index tree root. Same as [`assert_no_page_leak`]
-    /// but walks an `IndexNode` tree instead of a `Node` tree.
     #[cfg(test)]
     pub fn assert_no_page_leak_index(&mut self, root: NodePtr) {
         use std::collections::BTreeSet;
 
         let total_pages = self.pager.total_page_count();
-
         let mut tree_pages = BTreeSet::new();
         tree_pages.insert(root);
         tree_pages.insert(FREE_LIST_PAGE_NUM);
@@ -1413,47 +1694,52 @@ impl Btree {
         );
     }
 
-    /// Recursively collect all pages used by the index tree rooted at `page_num`,
-    /// including overflow pages.
     #[cfg(test)]
     fn collect_index_tree_pages(
         &mut self,
         page_num: NodePtr,
         pages: &mut std::collections::BTreeSet<u64>,
     ) {
-        let node = self.pager.owned_index_node(page_num).unwrap();
-        match node {
-            IndexNode::Leaf(leaf) => {
-                for (v, _) in &leaf.kv {
-                    if let Value::Overflow {
-                        start_page,
-                        total_len,
-                    } = v
-                    {
-                        self.collect_overflow_pages(*start_page, *total_len, pages);
+        let page = self.pager.owned_node(page_num).unwrap();
+        match page.page_type() {
+            PageType::IndexLeaf => {
+                let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                for i in 0..leaf.len() {
+                    if leaf.is_overflow(i) {
+                        let meta = leaf.key(i);
+                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        self.collect_overflow_pages(start_page, total_len, pages);
                     }
                 }
             }
-            IndexNode::Internal(internal) => {
-                for (v, ptr) in &internal.kv {
+            PageType::IndexInternal => {
+                let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                for i in 0..internal.len() {
                     assert!(
-                        pages.insert(*ptr),
+                        pages.insert(internal.ptr(i)),
                         "Page {} referenced multiple times in index tree",
-                        ptr
+                        internal.ptr(i)
                     );
-                    if let Value::Overflow {
-                        start_page,
-                        total_len,
-                    } = v
-                    {
-                        self.collect_overflow_pages(*start_page, *total_len, pages);
+                    if internal.is_overflow(i) {
+                        let meta = internal.key(i);
+                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        self.collect_overflow_pages(start_page, total_len, pages);
                     }
-                    self.collect_index_tree_pages(*ptr, pages);
+                    self.collect_index_tree_pages(internal.ptr(i), pages);
                 }
             }
+            _ => {}
         }
     }
 }
+
+// Constants for page layout (matching page.rs internal definitions)
+const INTERNAL_HEADER_SIZE: usize = 6;
+const INTERNAL_ELEMENT_SIZE: usize = std::mem::size_of::<Key>() + std::mem::size_of::<NodePtr>();
+const LEAF_SLOT_SIZE: usize = std::mem::size_of::<Key>() + 2 + 2;
+const INDEX_SLOT_SIZE: usize = 2 + 2 + 8;
 
 #[cfg(test)]
 mod tests {
@@ -1463,19 +1749,17 @@ mod tests {
 
     use super::*;
 
-    /// Create an initialized btree backed by a temp file with the given page size.
-    fn new_btree(page_size: usize) -> (Btree, NodePtr) {
+    fn new_btree<const N: usize>() -> (Btree<N>, NodePtr) {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, page_size);
+        let pager = Pager::new(file);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
         let root = btree.init_tree().unwrap();
         (btree, root)
     }
 
-    /// Create a btree pre-populated with keys `0..count`, each with a 64-byte value.
-    fn build_btree(count: u64) -> (Btree, NodePtr) {
-        let (mut btree, root) = new_btree(4096);
+    fn build_btree(count: u64) -> (Btree<4096>, NodePtr) {
+        let (mut btree, root) = new_btree::<4096>();
         for i in 0..count {
             let mut value = vec![0u8; 64];
             value[0..8].copy_from_slice(&i.to_le_bytes());
@@ -1484,8 +1768,8 @@ mod tests {
         (btree, root)
     }
 
-    fn read_range_keys<R: RangeBounds<Key>>(
-        btree: &mut Btree,
+    fn read_range_keys<const N: usize, R: RangeBounds<Key>>(
+        btree: &mut Btree<N>,
         root: NodePtr,
         range: R,
     ) -> Vec<Key> {
@@ -1494,11 +1778,20 @@ mod tests {
         keys
     }
 
-    fn read_value(btree: &mut Btree, root: NodePtr, key: Key) -> Option<Vec<u8>> {
+    fn read_value<const N: usize>(
+        btree: &mut Btree<N>,
+        root: NodePtr,
+        key: Key,
+    ) -> Option<Vec<u8>> {
         btree.read(root, key, |v| v.map(|b| b.to_vec())).unwrap()
     }
 
-    fn assert_read_eq(btree: &mut Btree, root: NodePtr, key: Key, expected: &[u8]) {
+    fn assert_read_eq<const N: usize>(
+        btree: &mut Btree<N>,
+        root: NodePtr,
+        key: Key,
+        expected: &[u8],
+    ) {
         assert!(
             btree.read(root, key, |v| v == Some(expected)).unwrap(),
             "Key {} value mismatch",
@@ -1506,7 +1799,7 @@ mod tests {
         );
     }
 
-    fn assert_key_exists(btree: &mut Btree, root: NodePtr, key: Key) {
+    fn assert_key_exists<const N: usize>(btree: &mut Btree<N>, root: NodePtr, key: Key) {
         assert!(
             btree.read(root, key, |v| v.is_some()).unwrap(),
             "Key {} should exist",
@@ -1514,7 +1807,7 @@ mod tests {
         );
     }
 
-    fn assert_key_absent(btree: &mut Btree, root: NodePtr, key: Key) {
+    fn assert_key_absent<const N: usize>(btree: &mut Btree<N>, root: NodePtr, key: Key) {
         assert!(
             btree.read(root, key, |v| v.is_none()).unwrap(),
             "Key {} should be absent",
@@ -1522,13 +1815,21 @@ mod tests {
         );
     }
 
-    fn assert_keys_exist(btree: &mut Btree, root: NodePtr, range: impl IntoIterator<Item = u64>) {
+    fn assert_keys_exist(
+        btree: &mut Btree<4096>,
+        root: NodePtr,
+        range: impl IntoIterator<Item = u64>,
+    ) {
         for k in range {
             assert_key_exists(btree, root, k);
         }
     }
 
-    fn assert_keys_absent(btree: &mut Btree, root: NodePtr, range: impl IntoIterator<Item = u64>) {
+    fn assert_keys_absent(
+        btree: &mut Btree<4096>,
+        root: NodePtr,
+        range: impl IntoIterator<Item = u64>,
+    ) {
         for k in range {
             assert_key_absent(btree, root, k);
         }
@@ -1536,37 +1837,27 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        let (mut btree, root) = new_btree(4096);
+        let (mut btree, root) = new_btree::<4096>();
         btree.insert(root, 1, b"one".to_vec()).unwrap();
     }
 
     #[test]
     fn test_read() {
-        let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, 4096);
-        let mut btree = Btree::new(pager);
-        btree.init().unwrap();
-        let root = btree.init_tree().unwrap();
-        let root_leaf = Leaf {
-            kv: vec![(0, Value::Inline(b"zero".to_vec()))],
-        };
-        btree
-            .pager
-            .write_node(root, &Node::Leaf(root_leaf))
-            .unwrap();
+        let (mut btree, root) = new_btree::<4096>();
+        btree.insert(root, 0, b"zero".to_vec()).unwrap();
         assert_read_eq(&mut btree, root, 0, b"zero");
     }
 
     #[test]
     fn test_insert_and_read() {
-        let (mut btree, root) = new_btree(4096);
+        let (mut btree, root) = new_btree::<4096>();
         btree.insert(root, 42, b"forty-two".to_vec()).unwrap();
         assert_read_eq(&mut btree, root, 42, b"forty-two");
     }
 
     #[test]
     fn test_insert_multiple_and_read() {
-        let (mut btree, root) = new_btree(64);
+        let (mut btree, root) = new_btree::<64>();
         let mut map = HashMap::new();
 
         for i in 0u64..256 {
@@ -1583,7 +1874,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let (mut btree, root) = new_btree(64);
+        let (mut btree, root) = new_btree::<64>();
 
         btree.insert(root, 1, b"one".to_vec()).unwrap();
         btree.insert(root, 2, b"two".to_vec()).unwrap();
@@ -1597,10 +1888,73 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_4keys_page64() {
+        let (mut btree, root) = new_btree::<64>();
+        let keys = [324u64, 507, 333, 391];
+        for &k in &keys {
+            let val = format!("value-{}", k);
+            btree.insert(root, k, val.as_bytes().to_vec()).unwrap();
+        }
+        // Dump all leaf values
+        fn dump_leaves<const M: usize>(btree: &mut Btree<M>, page_num: NodePtr) {
+            let page = btree.pager.owned_node(page_num).unwrap();
+            match page.page_type() {
+                PageType::Leaf => {
+                    let leaf: LeafPage<M> = page.try_into().unwrap();
+                    eprintln!("Leaf page {}:", page_num);
+                    for i in 0..leaf.len() {
+                        let k = leaf.key(i);
+                        let v = leaf.value(i);
+                        let (_, vo, vl) = leaf.read_slot(i);
+                        eprintln!(
+                            "  [{}] key={}, offset={}, len={}, value={:?} (\"{}\")",
+                            i,
+                            k,
+                            vo,
+                            vl,
+                            v,
+                            String::from_utf8_lossy(v)
+                        );
+                    }
+                }
+                PageType::Internal => {
+                    let internal: InternalPage<M> = page.try_into().unwrap();
+                    eprintln!("Internal page {}:", page_num);
+                    for i in 0..internal.len() {
+                        eprintln!(
+                            "  [{}] key={}, child={}",
+                            i,
+                            internal.key(i),
+                            internal.ptr(i)
+                        );
+                    }
+                    for i in 0..internal.len() {
+                        dump_leaves(btree, internal.ptr(i));
+                    }
+                }
+                _ => {}
+            }
+        }
+        dump_leaves(&mut btree, root);
+
+        for &k in &keys {
+            let v = read_value(&mut btree, root, k);
+            let expected = format!("value-{}", k).as_bytes().to_vec();
+            assert_eq!(
+                v,
+                Some(expected),
+                "key {} has wrong value: {:?}",
+                k,
+                v.as_ref().map(|b| String::from_utf8_lossy(b).to_string())
+            );
+        }
+    }
+
+    #[test]
     fn test_remove_seq() {
         const LEN: u64 = 1000;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let (mut btree, root) = new_btree(64);
+        let (mut btree, root) = new_btree::<64>();
 
         let mut insert = (0..LEN).collect::<Vec<u64>>();
         insert.shuffle(&mut rng);
@@ -1765,7 +2119,7 @@ mod tests {
 
     #[test]
     fn test_big_value_insert_and_read() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, big_value.clone()).unwrap();
         assert_eq!(read_value(&mut btree, root, 1), Some(big_value));
@@ -1773,7 +2127,7 @@ mod tests {
 
     #[test]
     fn test_big_value_with_small_values() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
 
         btree.insert(root, 0, b"small-before".to_vec()).unwrap();
         let big_value = vec![42u8; 4096];
@@ -1787,7 +2141,7 @@ mod tests {
 
     #[test]
     fn test_big_value_update() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
 
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, big_value.clone()).unwrap();
@@ -1800,7 +2154,7 @@ mod tests {
 
     #[test]
     fn test_big_value_remove() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
 
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, big_value.clone()).unwrap();
@@ -1811,7 +2165,7 @@ mod tests {
 
     #[test]
     fn test_big_value_read_range() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
 
         btree.insert(root, 0, b"small".to_vec()).unwrap();
         let big_value = vec![42u8; 2048];
@@ -1831,7 +2185,7 @@ mod tests {
 
     #[test]
     fn test_multiple_big_values() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
 
         let mut expected = HashMap::new();
         for i in 0u64..20 {
@@ -1852,7 +2206,7 @@ mod tests {
 
     #[test]
     fn test_big_value_replace_with_small() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
 
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, big_value.clone()).unwrap();
@@ -1864,24 +2218,21 @@ mod tests {
 
     #[test]
     fn test_free_pages_reused_after_remove() {
-        let (mut btree, root) = new_btree(4096);
+        let (mut btree, root) = new_btree::<4096>();
         for i in 0u64..100 {
             btree.insert(root, i, vec![0u8; 64]).unwrap();
         }
         let pages_after_insert = btree.pager.total_page_count();
 
-        // Remove all keys — freed pages should accumulate
         for i in 0u64..100 {
             btree.remove(root, i).unwrap();
         }
-        // Free list head should not be empty
         assert_ne!(
             btree.read_free_list_head().unwrap(),
             u64::MAX,
             "Expected free pages after removal"
         );
 
-        // Re-insert — file should not grow (pages reused)
         for i in 0u64..100 {
             btree.insert(root, i, vec![0u8; 64]).unwrap();
         }
@@ -1895,7 +2246,7 @@ mod tests {
 
     #[test]
     fn test_free_overflow_pages_on_remove() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, big_value).unwrap();
         let pages_before = btree.pager.total_page_count();
@@ -1907,7 +2258,6 @@ mod tests {
             "Overflow pages should be freed on remove"
         );
 
-        // Re-insert a big value — should reuse freed overflow pages
         let big_value2 = vec![99u8; 4096];
         btree.insert(root, 2, big_value2).unwrap();
         assert!(
@@ -1918,12 +2268,11 @@ mod tests {
 
     #[test]
     fn test_free_overflow_pages_on_update() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, big_value).unwrap();
         let pages_before = btree.pager.total_page_count();
 
-        // Replace with small value — overflow pages should be freed
         btree.insert(root, 1, b"small".to_vec()).unwrap();
         assert_ne!(
             btree.read_free_list_head().unwrap(),
@@ -1931,7 +2280,6 @@ mod tests {
             "Old overflow pages should be freed on update"
         );
 
-        // Allocating a big value again should reuse pages
         let big_value2 = vec![99u8; 4096];
         btree.insert(root, 2, big_value2).unwrap();
         assert!(
@@ -1945,7 +2293,6 @@ mod tests {
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let path = temp_file.path().to_owned();
 
-        // Create a btree, insert and remove keys, then drop it
         let root;
         {
             let file = std::fs::OpenOptions::new()
@@ -1953,7 +2300,7 @@ mod tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            let pager = Pager::new(file, 4096);
+            let pager = Pager::<4096>::new(file);
             let mut btree = Btree::new(pager);
             btree.init().unwrap();
             root = btree.init_tree().unwrap();
@@ -1967,14 +2314,13 @@ mod tests {
             assert_ne!(btree.read_free_list_head().unwrap(), u64::MAX);
         }
 
-        // Reopen the file — free list should still be available
         {
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&path)
                 .unwrap();
-            let pager = Pager::new(file, 4096);
+            let pager = Pager::<4096>::new(file);
             let mut btree = Btree::new(pager);
             let pages_before = btree.pager.total_page_count();
 
@@ -1984,7 +2330,6 @@ mod tests {
                 "Free list lost after reopen"
             );
 
-            // New inserts should reuse freed pages
             for i in 0u64..50 {
                 btree.insert(root, i, vec![0u8; 64]).unwrap();
             }
@@ -1997,7 +2342,7 @@ mod tests {
 
     #[test]
     fn test_no_leak_insert_only() {
-        let (mut btree, root) = new_btree(64);
+        let (mut btree, root) = new_btree::<64>();
         for i in 0u64..256 {
             btree
                 .insert(root, i, format!("v-{}", i).into_bytes())
@@ -2008,7 +2353,7 @@ mod tests {
 
     #[test]
     fn test_no_leak_insert_and_remove_all() {
-        let (mut btree, root) = new_btree(64);
+        let (mut btree, root) = new_btree::<64>();
         for i in 0u64..200 {
             btree.insert(root, i, vec![0u8; 16]).unwrap();
         }
@@ -2021,7 +2366,7 @@ mod tests {
     #[test]
     fn test_no_leak_insert_remove_shuffle() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
-        let (mut btree, root) = new_btree(64);
+        let (mut btree, root) = new_btree::<64>();
 
         let mut keys: Vec<u64> = (0..500).collect();
         keys.shuffle(&mut rng);
@@ -2054,7 +2399,7 @@ mod tests {
 
     #[test]
     fn test_no_leak_overflow_insert_remove() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
         for i in 0u64..10 {
             let big = vec![i as u8; 1024 + i as usize * 100];
             btree.insert(root, i, big).unwrap();
@@ -2069,26 +2414,23 @@ mod tests {
 
     #[test]
     fn test_no_leak_overflow_update() {
-        let (mut btree, root) = new_btree(256);
+        let (mut btree, root) = new_btree::<256>();
         btree.insert(root, 1, vec![42u8; 4096]).unwrap();
         btree.assert_no_page_leak(root);
 
-        // Replace overflow with small
         btree.insert(root, 1, b"small".to_vec()).unwrap();
         btree.assert_no_page_leak(root);
 
-        // Replace small with overflow
         btree.insert(root, 1, vec![99u8; 4096]).unwrap();
         btree.assert_no_page_leak(root);
 
-        // Replace overflow with different overflow
         btree.insert(root, 1, vec![77u8; 8192]).unwrap();
         btree.assert_no_page_leak(root);
     }
 
     #[test]
     fn test_no_leak_mixed_operations() {
-        let (mut btree, root) = new_btree(128);
+        let (mut btree, root) = new_btree::<128>();
 
         for round in 0..5 {
             let base = round * 100;
@@ -2101,7 +2443,6 @@ mod tests {
             btree.assert_no_page_leak(root);
         }
 
-        // Remove everything
         btree.remove_range(root, ..).unwrap();
         btree.assert_no_page_leak(root);
     }
@@ -2110,94 +2451,89 @@ mod tests {
     //  Index tree tests
     // ────────────────────────────────────────────────────────────────────
 
-    /// Create an initialized btree with an index tree root.
-    fn new_index_btree(page_size: usize) -> (Btree, NodePtr) {
+    fn new_index_btree<const N: usize>() -> (Btree<N>, NodePtr) {
         let file = tempfile::tempfile().unwrap();
-        let pager = Pager::new(file, page_size);
+        let pager = Pager::new(file);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
         let root = btree.init_index().unwrap();
         (btree, root)
     }
 
-    /// Helper: read a key from the index tree by value.
-    fn index_read_key(btree: &mut Btree, root: NodePtr, value: &[u8]) -> Option<Key> {
-        let v = Value::Inline(value.to_vec());
-        btree.index_read(root, &v, |k| k).unwrap()
+    fn index_read_key<const N: usize>(
+        btree: &mut Btree<N>,
+        root: NodePtr,
+        value: &[u8],
+    ) -> Option<Key> {
+        btree.index_read(root, value, |k| k).unwrap()
     }
 
     #[test]
     fn test_index_insert_and_read() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         assert!(btree.index_insert(root, 42, b"hello".to_vec()).unwrap());
         assert_eq!(index_read_key(&mut btree, root, b"hello"), Some(42));
     }
 
     #[test]
     fn test_index_insert_duplicate_returns_false() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         assert!(btree.index_insert(root, 1, b"val".to_vec()).unwrap());
         assert!(!btree.index_insert(root, 1, b"val".to_vec()).unwrap());
     }
 
     #[test]
     fn test_index_same_value_different_keys() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         assert!(btree.index_insert(root, 1, b"dup".to_vec()).unwrap());
         assert!(btree.index_insert(root, 2, b"dup".to_vec()).unwrap());
         assert!(btree.index_insert(root, 3, b"dup".to_vec()).unwrap());
 
-        // index_read returns the first match
         let key = index_read_key(&mut btree, root, b"dup");
         assert!(key == Some(1) || key == Some(2) || key == Some(3));
     }
 
     #[test]
     fn test_index_read_absent() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         btree.index_insert(root, 1, b"exists".to_vec()).unwrap();
         assert_eq!(index_read_key(&mut btree, root, b"missing"), None);
     }
 
     #[test]
     fn test_index_remove() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         btree.index_insert(root, 1, b"alpha".to_vec()).unwrap();
         btree.index_insert(root, 2, b"beta".to_vec()).unwrap();
 
-        let v = Value::Inline(b"alpha".to_vec());
-        assert!(btree.index_remove(root, &v, 1).unwrap());
+        assert!(btree.index_remove(root, b"alpha", 1).unwrap());
         assert_eq!(index_read_key(&mut btree, root, b"alpha"), None);
         assert_eq!(index_read_key(&mut btree, root, b"beta"), Some(2));
     }
 
     #[test]
     fn test_index_remove_absent() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         btree.index_insert(root, 1, b"data".to_vec()).unwrap();
 
-        let v = Value::Inline(b"nonexistent".to_vec());
-        assert!(!btree.index_remove(root, &v, 1).unwrap());
+        assert!(!btree.index_remove(root, b"nonexistent", 1).unwrap());
     }
 
     #[test]
     fn test_index_remove_wrong_key_same_value() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         btree.index_insert(root, 1, b"shared".to_vec()).unwrap();
         btree.index_insert(root, 2, b"shared".to_vec()).unwrap();
 
-        // Remove key=99 which doesn't exist for this value
-        let v = Value::Inline(b"shared".to_vec());
-        assert!(!btree.index_remove(root, &v, 99).unwrap());
+        assert!(!btree.index_remove(root, b"shared", 99).unwrap());
 
-        // Both originals still present
         let key = index_read_key(&mut btree, root, b"shared");
         assert!(key.is_some());
     }
 
     #[test]
     fn test_index_multiple_values_sorted() {
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
         let values: Vec<(&[u8], Key)> = vec![
             (b"cherry", 3),
             (b"apple", 1),
@@ -2209,7 +2545,6 @@ mod tests {
             btree.index_insert(root, *k, v.to_vec()).unwrap();
         }
 
-        // All values should be findable
         for (v, k) in &values {
             assert_eq!(index_read_key(&mut btree, root, v), Some(*k));
         }
@@ -2217,7 +2552,7 @@ mod tests {
 
     #[test]
     fn test_index_insert_many_and_read() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         let mut map = HashMap::new();
 
         for i in 0u64..256 {
@@ -2236,7 +2571,7 @@ mod tests {
     fn test_index_insert_remove_seq() {
         const LEN: u64 = 200;
         let mut rng = rand::rngs::StdRng::seed_from_u64(77);
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
 
         let mut entries: Vec<(u64, Vec<u8>)> = (0..LEN)
             .map(|i| (i, format!("val-{:04}", i).into_bytes()))
@@ -2247,22 +2582,20 @@ mod tests {
             assert!(btree.index_insert(root, *k, v.clone()).unwrap());
         }
 
-        // Verify all present
         for (k, v) in &entries {
             assert_eq!(index_read_key(&mut btree, root, v), Some(*k));
         }
 
         entries.shuffle(&mut rng);
         for (k, v) in &entries {
-            let val = Value::Inline(v.clone());
-            assert!(btree.index_remove(root, &val, *k).unwrap());
+            assert!(btree.index_remove(root, v, *k).unwrap());
             assert_eq!(index_read_key(&mut btree, root, v), None);
         }
     }
 
     #[test]
     fn test_index_read_range() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
 
         btree.index_insert(root, 1, b"aaa".to_vec()).unwrap();
         btree.index_insert(root, 2, b"bbb".to_vec()).unwrap();
@@ -2285,7 +2618,7 @@ mod tests {
 
     #[test]
     fn test_index_read_range_unbounded() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         for i in 0u64..10 {
             btree
                 .index_insert(root, i, format!("{:02}", i).into_bytes())
@@ -2301,7 +2634,7 @@ mod tests {
 
     #[test]
     fn test_index_read_range_empty() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         btree.index_insert(root, 1, b"aaa".to_vec()).unwrap();
 
         let mut results = Vec::new();
@@ -2315,7 +2648,7 @@ mod tests {
 
     #[test]
     fn test_index_available_key() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         assert_eq!(btree.index_available_key(root).unwrap(), 0);
 
         btree.index_insert(root, 5, b"aaa".to_vec()).unwrap();
@@ -2330,7 +2663,7 @@ mod tests {
 
     #[test]
     fn test_index_free_tree() {
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
         for i in 0u64..100 {
             btree
                 .index_insert(root, i, format!("v-{}", i).into_bytes())
@@ -2339,10 +2672,8 @@ mod tests {
         let pages_before = btree.pager.total_page_count();
         btree.free_index_tree(root).unwrap();
 
-        // All tree pages should now be in the free list
         assert_ne!(btree.read_free_list_head().unwrap(), u64::MAX);
 
-        // Reuse: create a new index tree; pages should be reused
         let root2 = btree.init_index().unwrap();
         for i in 0u64..100 {
             btree
@@ -2357,28 +2688,26 @@ mod tests {
 
     #[test]
     fn test_index_big_values() {
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
         let big_value = vec![42u8; 4096];
         assert!(btree.index_insert(root, 1, big_value.clone()).unwrap());
 
-        let v = Value::Inline(big_value.clone());
-        let found = btree.index_read(root, &v, |k| k).unwrap();
+        let found = btree.index_read(root, &big_value, |k| k).unwrap();
         assert_eq!(found, Some(1));
     }
 
     #[test]
     fn test_index_big_value_remove() {
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
         let big_value = vec![42u8; 4096];
         btree.index_insert(root, 1, big_value.clone()).unwrap();
 
-        let v = Value::Inline(big_value);
-        assert!(btree.index_remove(root, &v, 1).unwrap());
+        assert!(btree.index_remove(root, &big_value, 1).unwrap());
     }
 
     #[test]
     fn test_index_no_leak_insert_only() {
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
         for i in 0u64..256 {
             btree
                 .index_insert(root, i, format!("v-{:04}", i).into_bytes())
@@ -2389,7 +2718,7 @@ mod tests {
 
     #[test]
     fn test_index_no_leak_insert_and_remove_all() {
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
         let entries: Vec<(u64, Vec<u8>)> = (0u64..200)
             .map(|i| (i, format!("v-{:04}", i).into_bytes()))
             .collect();
@@ -2398,8 +2727,7 @@ mod tests {
             btree.index_insert(root, *k, v.clone()).unwrap();
         }
         for (k, v) in &entries {
-            let val = Value::Inline(v.clone());
-            btree.index_remove(root, &val, *k).unwrap();
+            btree.index_remove(root, v, *k).unwrap();
         }
         btree.assert_no_page_leak_index(root);
     }
@@ -2407,7 +2735,7 @@ mod tests {
     #[test]
     fn test_index_no_leak_shuffle() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(123);
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
 
         let mut entries: Vec<(u64, Vec<u8>)> = (0u64..300)
             .map(|i| (i, format!("val-{:04}", i).into_bytes()))
@@ -2419,15 +2747,14 @@ mod tests {
 
         entries.shuffle(&mut rng);
         for (k, v) in &entries {
-            let val = Value::Inline(v.clone());
-            btree.index_remove(root, &val, *k).unwrap();
+            btree.index_remove(root, v, *k).unwrap();
         }
         btree.assert_no_page_leak_index(root);
     }
 
     #[test]
     fn test_index_no_leak_big_values() {
-        let (mut btree, root) = new_index_btree(4096);
+        let (mut btree, root) = new_index_btree::<4096>();
         let entries: Vec<(u64, Vec<u8>)> = (0u64..10)
             .map(|i| (i, vec![i as u8; 8192 + i as usize * 100]))
             .collect();
@@ -2438,17 +2765,15 @@ mod tests {
         btree.assert_no_page_leak_index(root);
 
         for (k, v) in &entries {
-            let val = Value::Inline(v.clone());
-            btree.index_remove(root, &val, *k).unwrap();
+            btree.index_remove(root, v, *k).unwrap();
         }
         btree.assert_no_page_leak_index(root);
     }
 
     #[test]
     fn test_index_sorted_order() {
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
 
-        // Insert values in reverse order
         let values: Vec<Vec<u8>> = (0u64..50)
             .rev()
             .map(|i| format!("{:04}", i).into_bytes())
@@ -2457,7 +2782,6 @@ mod tests {
             btree.index_insert(root, i as u64, v.clone()).unwrap();
         }
 
-        // Range read should return values in sorted byte order
         let mut result = Vec::new();
         btree
             .index_read_range(root, .., |v, _k| result.push(v.to_vec()))
@@ -2473,7 +2797,7 @@ mod tests {
 
     #[test]
     fn test_index_read_range_many() {
-        let (mut btree, root) = new_index_btree(256);
+        let (mut btree, root) = new_index_btree::<256>();
 
         for i in 0u64..200 {
             btree
@@ -2488,7 +2812,6 @@ mod tests {
             })
             .unwrap();
 
-        // Values "0050".."0150" (exclusive end) = 100 entries
         assert_eq!(results.len(), 100);
         for v in &results {
             assert!(v.as_slice() >= b"0050".as_slice() && v.as_slice() < b"0150".as_slice());
