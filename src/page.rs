@@ -1,6 +1,9 @@
+use std::fmt;
+
 use crate::{Key, NodePtr};
 
 #[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
     Leaf,
     Internal,
@@ -127,6 +130,16 @@ impl<const N: usize> InternalPage<N> {
         }
         self.set_len(mid);
         new_page
+    }
+}
+
+impl<const N: usize> fmt::Debug for InternalPage<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for i in 0..self.len() {
+            list.entry(&(self.key(i), self.ptr(i)));
+        }
+        list.finish()
     }
 }
 
