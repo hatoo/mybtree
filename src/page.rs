@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 use crate::{Key, NodePtr};
@@ -201,17 +202,14 @@ impl<const N: usize> LeafPage<N> {
     pub fn value(&self, index: usize) -> &[u8] {
         debug_assert!(index < self.len());
         let slot = Self::HEADER_SIZE + index * Self::SLOT_SIZE + std::mem::size_of::<Key>();
-        let value_offset =
-            u16::from_le_bytes([self.page[slot], self.page[slot + 1]]) as usize;
-        let value_len =
-            u16::from_le_bytes([self.page[slot + 2], self.page[slot + 3]]) as usize;
+        let value_offset = u16::from_le_bytes([self.page[slot], self.page[slot + 1]]) as usize;
+        let value_len = u16::from_le_bytes([self.page[slot + 2], self.page[slot + 3]]) as usize;
         &self.page[value_offset..value_offset + value_len]
     }
 
     fn write_slot(&mut self, index: usize, key: Key, value_offset: u16, value_len: u16) {
         let offset = Self::HEADER_SIZE + index * Self::SLOT_SIZE;
-        self.page[offset..offset + std::mem::size_of::<Key>()]
-            .copy_from_slice(&key.to_le_bytes());
+        self.page[offset..offset + std::mem::size_of::<Key>()].copy_from_slice(&key.to_le_bytes());
         self.page[offset + std::mem::size_of::<Key>()..offset + std::mem::size_of::<Key>() + 2]
             .copy_from_slice(&value_offset.to_le_bytes());
         self.page[offset + std::mem::size_of::<Key>() + 2..offset + Self::SLOT_SIZE]
@@ -250,6 +248,15 @@ impl<const N: usize> LeafPage<N> {
         if left == self.len() { None } else { Some(left) }
     }
 
+    pub fn get(&self, key: Key) -> Option<Cow<'_, [u8]>> {
+        let idx = self.search(key)?;
+        if self.key(idx) == key {
+            Some(Cow::Borrowed(self.value(idx)))
+        } else {
+            None
+        }
+    }
+
     /// Contiguous free space between end of slot array and start of value data.
     fn contiguous_free_space(&self) -> usize {
         let slots_end = Self::HEADER_SIZE + self.len() * Self::SLOT_SIZE;
@@ -275,7 +282,8 @@ impl<const N: usize> LeafPage<N> {
             let val_len = vl as usize;
             new_data_offset -= val_len;
             // Copy value to new position (use copy_within to handle overlap)
-            self.page.copy_within(vo as usize..vo as usize + val_len, new_data_offset);
+            self.page
+                .copy_within(vo as usize..vo as usize + val_len, new_data_offset);
             self.write_slot(i, k, new_data_offset as u16, vl);
         }
         self.set_data_offset(new_data_offset);
