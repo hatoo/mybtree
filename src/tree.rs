@@ -50,30 +50,36 @@ impl<const N: usize> Btree<N> {
     }
 
     pub fn free_tree(&mut self, root: NodePtr) -> Result<(), Error> {
-        let page = self.pager.owned_node(root)?;
-        match page.page_type() {
-            PageType::Leaf => {
-                let leaf: LeafPage<N> = page.try_into().unwrap();
-                for i in 0..leaf.len() {
-                    if leaf.is_overflow(i) {
-                        let meta = leaf.value(i);
-                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                        self.free_overflow_pages(start_page, total_len)?;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let page = self.pager.owned_node(node)?;
+            match page.page_type() {
+                PageType::Leaf => {
+                    let leaf: LeafPage<N> = page.try_into().unwrap();
+                    for i in 0..leaf.len() {
+                        if leaf.is_overflow(i) {
+                            let meta = leaf.value(i);
+                            let start_page =
+                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len =
+                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            self.free_overflow_pages(start_page, total_len)?;
+                        }
                     }
                 }
-            }
-            PageType::Internal => {
-                let internal: InternalPage<N> = page.try_into().unwrap();
-                for i in 0..internal.len() {
-                    self.free_tree(internal.ptr(i))?;
+                PageType::Internal => {
+                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    for i in 0..internal.len() {
+                        stack.push(internal.ptr(i));
+                    }
                 }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "Leaf or Internal"
+                }),
             }
-            _ => fail!(TreeError::UnexpectedPageType {
-                expected: "Leaf or Internal"
-            }),
+            self.free_page(node)?;
         }
-        self.free_page(root)
+        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -383,50 +389,59 @@ impl<const N: usize> Btree<N> {
         range: &impl RangeBounds<Key>,
         left_key: Key,
     ) -> Result<(), Error> {
-        let page = self.pager.owned_node(node_ptr)?;
+        // Collect leaf nodes to process first, then modify them.
+        // Use a stack to avoid recursion.
+        let mut visit_stack: Vec<(NodePtr, Key)> = vec![(node_ptr, left_key)];
+        let mut leaves_to_process: Vec<NodePtr> = Vec::new();
 
-        match page.page_type() {
-            PageType::Leaf => {
-                let mut leaf: LeafPage<N> = page.try_into().unwrap();
-                // Collect overflow metadata for entries to remove
-                let mut overflow_metas = vec![];
-                let mut indices_to_remove = vec![];
-                for i in 0..leaf.len() {
-                    if range.contains(&leaf.key(i)) {
-                        if leaf.is_overflow(i) {
-                            let meta = leaf.value(i);
-                            overflow_metas.push((
-                                u64::from_le_bytes(meta[0..8].try_into().unwrap()),
-                                u64::from_le_bytes(meta[8..16].try_into().unwrap()),
-                            ));
+        while let Some((cur, lk)) = visit_stack.pop() {
+            let page = self.pager.owned_node(cur)?;
+            match page.page_type() {
+                PageType::Leaf => {
+                    leaves_to_process.push(cur);
+                }
+                PageType::Internal => {
+                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    let mut left_key = lk;
+                    for i in 0..internal.len() {
+                        let k = internal.key(i);
+                        let ptr = internal.ptr(i);
+                        if is_overlap(&(left_key..=k), range) {
+                            visit_stack.push((ptr, left_key));
                         }
-                        indices_to_remove.push(i);
+                        left_key = k;
                     }
                 }
-                // Remove in reverse order to preserve indices
-                for &i in indices_to_remove.iter().rev() {
-                    leaf.remove(i);
-                }
-                self.merge_leaf(root, &[node_ptr], leaf)?;
-                for (start_page, total_len) in overflow_metas {
-                    self.free_overflow_pages(start_page, total_len)?;
-                }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "Leaf or Internal"
+                }),
             }
-            PageType::Internal => {
-                let internal: InternalPage<N> = page.try_into().unwrap();
-                let mut left_key = left_key;
-                for i in 0..internal.len() {
-                    let k = internal.key(i);
-                    let ptr = internal.ptr(i);
-                    if is_overlap(&(left_key..=k), range) {
-                        self.remove_range_at(root, ptr, range, left_key)?;
+        }
+
+        for leaf_ptr in leaves_to_process {
+            let page = self.pager.owned_node(leaf_ptr)?;
+            let mut leaf: LeafPage<N> = page.try_into().unwrap();
+            let mut overflow_metas = vec![];
+            let mut indices_to_remove = vec![];
+            for i in 0..leaf.len() {
+                if range.contains(&leaf.key(i)) {
+                    if leaf.is_overflow(i) {
+                        let meta = leaf.value(i);
+                        overflow_metas.push((
+                            u64::from_le_bytes(meta[0..8].try_into().unwrap()),
+                            u64::from_le_bytes(meta[8..16].try_into().unwrap()),
+                        ));
                     }
-                    left_key = k;
+                    indices_to_remove.push(i);
                 }
             }
-            _ => fail!(TreeError::UnexpectedPageType {
-                expected: "Leaf or Internal"
-            }),
+            for &i in indices_to_remove.iter().rev() {
+                leaf.remove(i);
+            }
+            self.merge_leaf(root, &[leaf_ptr], leaf)?;
+            for (start_page, total_len) in overflow_metas {
+                self.free_overflow_pages(start_page, total_len)?;
+            }
         }
 
         Ok(())
@@ -555,31 +570,35 @@ impl<const N: usize> Btree<N> {
             }
 
             let parents = &cur_path[..cur_path.len() - 1];
-            if !self.try_merge_internal_with_left_sibling_iterative(
-                root,
-                page,
-                &cur_internal,
-                parents,
-            )? {
-                self.pager.write_node(page, cur_internal.into())?;
+            match self.try_merge_internal_with_left_sibling(page, &cur_internal, parents)? {
+                Some(updated_parent) => {
+                    // Merge succeeded; continue loop to propagate upward
+                    cur_path = parents;
+                    cur_internal = updated_parent;
+                    continue;
+                }
+                None => {
+                    self.pager.write_node(page, cur_internal.into())?;
+                    return Ok(());
+                }
             }
-            return Ok(());
         }
     }
 
-    fn try_merge_internal_with_left_sibling_iterative(
+    /// Try to merge `right_internal` (at `page`) with its left sibling in the parent.
+    /// Returns `Some(updated_parent)` if merge succeeded, `None` otherwise.
+    fn try_merge_internal_with_left_sibling(
         &mut self,
-        root: NodePtr,
         page: NodePtr,
         right_internal: &InternalPage<N>,
         parents: &[NodePtr],
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<InternalPage<N>>, Error> {
         let parent_page = *parents.last().unwrap();
         let parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
         let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
         if index == 0 {
-            return Ok(false);
+            return Ok(None);
         }
 
         let left_sibling_page = parent.ptr(index - 1);
@@ -592,7 +611,7 @@ impl<const N: usize> Btree<N> {
         let total_entries = left_internal.len() + right_internal.len();
         let total_used = INTERNAL_HEADER_SIZE + total_entries * INTERNAL_ELEMENT_SIZE;
         if total_used > N {
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut merged = left_internal.clone();
@@ -604,8 +623,7 @@ impl<const N: usize> Btree<N> {
         let mut parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
         parent.remove(index - 1);
         self.free_page(left_sibling_page)?;
-        self.merge_internal_iterative(root, parents, parent)?;
-        Ok(true)
+        Ok(Some(parent))
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -671,43 +689,52 @@ impl<const N: usize> Btree<N> {
         f: &mut impl FnMut(Key, &[u8]),
         left_key: Key,
     ) -> Result<(), Error> {
-        let page = self.pager.owned_node(node_ptr)?;
-
-        match page.page_type() {
-            PageType::Leaf => {
-                let leaf: LeafPage<N> = page.try_into().unwrap();
-                for i in 0..leaf.len() {
-                    let k = leaf.key(i);
-                    if range.contains(&k) {
-                        if leaf.is_overflow(i) {
-                            let meta = leaf.value(i);
-                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                            let data = self.read_overflow(start_page, total_len)?;
-                            f(k, &data);
-                        } else {
-                            f(k, leaf.value(i));
+        // Stack of (node_ptr, left_key)
+        let mut stack = vec![(node_ptr, left_key)];
+        while let Some((cur, lk)) = stack.pop() {
+            let page = self.pager.owned_node(cur)?;
+            match page.page_type() {
+                PageType::Leaf => {
+                    let leaf: LeafPage<N> = page.try_into().unwrap();
+                    for i in 0..leaf.len() {
+                        let k = leaf.key(i);
+                        if range.contains(&k) {
+                            if leaf.is_overflow(i) {
+                                let meta = leaf.value(i);
+                                let start_page =
+                                    u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                                let total_len =
+                                    u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                                let data = self.read_overflow(start_page, total_len)?;
+                                f(k, &data);
+                            } else {
+                                f(k, leaf.value(i));
+                            }
                         }
                     }
                 }
-            }
-            PageType::Internal => {
-                let internal: InternalPage<N> = page.try_into().unwrap();
-                let mut left_key = left_key;
-                for i in 0..internal.len() {
-                    let k = internal.key(i);
-                    let ptr = internal.ptr(i);
-                    if is_overlap(&(left_key..=k), range) {
-                        self.read_range_at(ptr, range, f, left_key)?;
+                PageType::Internal => {
+                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    let mut left_key = lk;
+                    // Push children in reverse so leftmost is processed first
+                    let mut children = Vec::new();
+                    for i in 0..internal.len() {
+                        let k = internal.key(i);
+                        let ptr = internal.ptr(i);
+                        if is_overlap(&(left_key..=k), range) {
+                            children.push((ptr, left_key));
+                        }
+                        left_key = k;
                     }
-                    left_key = k;
+                    for child in children.into_iter().rev() {
+                        stack.push(child);
+                    }
                 }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "Leaf or Internal"
+                }),
             }
-            _ => fail!(TreeError::UnexpectedPageType {
-                expected: "Leaf or Internal"
-            }),
         }
-
         Ok(())
     }
 
@@ -871,36 +898,44 @@ impl<const N: usize> Btree<N> {
     }
 
     pub fn free_index_tree(&mut self, root: NodePtr) -> Result<(), Error> {
-        let page = self.pager.owned_node(root)?;
-        match page.page_type() {
-            PageType::IndexLeaf => {
-                let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                for i in 0..leaf.len() {
-                    if leaf.is_overflow(i) {
-                        let meta = leaf.key(i);
-                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                        self.free_overflow_pages(start_page, total_len)?;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let page = self.pager.owned_node(node)?;
+            match page.page_type() {
+                PageType::IndexLeaf => {
+                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                    for i in 0..leaf.len() {
+                        if leaf.is_overflow(i) {
+                            let meta = leaf.key(i);
+                            let start_page =
+                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len =
+                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            self.free_overflow_pages(start_page, total_len)?;
+                        }
                     }
                 }
-            }
-            PageType::IndexInternal => {
-                let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                for i in 0..internal.len() {
-                    if internal.is_overflow(i) {
-                        let meta = internal.key(i);
-                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                        self.free_overflow_pages(start_page, total_len)?;
+                PageType::IndexInternal => {
+                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                    for i in 0..internal.len() {
+                        if internal.is_overflow(i) {
+                            let meta = internal.key(i);
+                            let start_page =
+                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len =
+                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            self.free_overflow_pages(start_page, total_len)?;
+                        }
+                        stack.push(internal.ptr(i));
                     }
-                    self.free_index_tree(internal.ptr(i))?;
                 }
+                _ => fail!(TreeError::UnexpectedPageType {
+                    expected: "IndexLeaf or IndexInternal"
+                }),
             }
-            _ => fail!(TreeError::UnexpectedPageType {
-                expected: "IndexLeaf or IndexInternal"
-            }),
+            self.free_page(node)?;
         }
-        self.free_page(root)
+        Ok(())
     }
 
     pub fn index_insert(&mut self, root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
@@ -1310,26 +1345,33 @@ impl<const N: usize> Btree<N> {
             }
 
             let parents = &cur_path[..cur_path.len() - 1];
-            if !self.index_try_merge_internal_with_left(root, page, &cur_internal, parents)? {
-                self.pager.write_node(page, cur_internal.into())?;
+            match self.index_try_merge_internal_with_left(page, &cur_internal, parents)? {
+                Some(updated_parent) => {
+                    cur_path = parents;
+                    cur_internal = updated_parent;
+                    continue;
+                }
+                None => {
+                    self.pager.write_node(page, cur_internal.into())?;
+                    return Ok(());
+                }
             }
-            return Ok(());
         }
     }
 
+    /// Returns `Some(updated_parent)` if merge succeeded, `None` otherwise.
     fn index_try_merge_internal_with_left(
         &mut self,
-        root: NodePtr,
         page: NodePtr,
         right_internal: &IndexInternalPage<N>,
         parents: &[NodePtr],
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<IndexInternalPage<N>>, Error> {
         let parent_page = *parents.last().unwrap();
         let parent: IndexInternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
         let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
         if index == 0 {
-            return Ok(false);
+            return Ok(None);
         }
 
         let left_sibling_page = parent.ptr(index - 1);
@@ -1346,7 +1388,7 @@ impl<const N: usize> Btree<N> {
             let key_data = right_internal.key(i);
             let inline_size = key_data.len();
             if merged.free_space() < INDEX_SLOT_SIZE + inline_size {
-                return Ok(false);
+                return Ok(None);
             }
             let end = merged.len();
             merged.insert_raw_at(end, key_data, kl, v);
@@ -1364,8 +1406,7 @@ impl<const N: usize> Btree<N> {
         }
         parent.remove(index - 1);
         self.free_page(left_sibling_page)?;
-        self.index_merge_internal(root, parents, parent)?;
-        Ok(true)
+        Ok(Some(parent))
     }
 
     pub fn index_read<T>(
@@ -1593,34 +1634,39 @@ impl<const N: usize> Btree<N> {
     #[cfg(test)]
     fn collect_tree_pages(
         &mut self,
-        page_num: NodePtr,
+        root: NodePtr,
         pages: &mut std::collections::BTreeSet<u64>,
     ) {
-        let page = self.pager.owned_node(page_num).unwrap();
-        match page.page_type() {
-            PageType::Leaf => {
-                let leaf: LeafPage<N> = page.try_into().unwrap();
-                for i in 0..leaf.len() {
-                    if leaf.is_overflow(i) {
-                        let meta = leaf.value(i);
-                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                        self.collect_overflow_pages(start_page, total_len, pages);
+        let mut stack = vec![root];
+        while let Some(page_num) = stack.pop() {
+            let page = self.pager.owned_node(page_num).unwrap();
+            match page.page_type() {
+                PageType::Leaf => {
+                    let leaf: LeafPage<N> = page.try_into().unwrap();
+                    for i in 0..leaf.len() {
+                        if leaf.is_overflow(i) {
+                            let meta = leaf.value(i);
+                            let start_page =
+                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len =
+                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            self.collect_overflow_pages(start_page, total_len, pages);
+                        }
                     }
                 }
-            }
-            PageType::Internal => {
-                let internal: InternalPage<N> = page.try_into().unwrap();
-                for i in 0..internal.len() {
-                    assert!(
-                        pages.insert(internal.ptr(i)),
-                        "Page {} referenced multiple times in tree",
-                        internal.ptr(i)
-                    );
-                    self.collect_tree_pages(internal.ptr(i), pages);
+                PageType::Internal => {
+                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    for i in 0..internal.len() {
+                        assert!(
+                            pages.insert(internal.ptr(i)),
+                            "Page {} referenced multiple times in tree",
+                            internal.ptr(i)
+                        );
+                        stack.push(internal.ptr(i));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -1697,40 +1743,47 @@ impl<const N: usize> Btree<N> {
     #[cfg(test)]
     fn collect_index_tree_pages(
         &mut self,
-        page_num: NodePtr,
+        root: NodePtr,
         pages: &mut std::collections::BTreeSet<u64>,
     ) {
-        let page = self.pager.owned_node(page_num).unwrap();
-        match page.page_type() {
-            PageType::IndexLeaf => {
-                let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                for i in 0..leaf.len() {
-                    if leaf.is_overflow(i) {
-                        let meta = leaf.key(i);
-                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                        self.collect_overflow_pages(start_page, total_len, pages);
+        let mut stack = vec![root];
+        while let Some(page_num) = stack.pop() {
+            let page = self.pager.owned_node(page_num).unwrap();
+            match page.page_type() {
+                PageType::IndexLeaf => {
+                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                    for i in 0..leaf.len() {
+                        if leaf.is_overflow(i) {
+                            let meta = leaf.key(i);
+                            let start_page =
+                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len =
+                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            self.collect_overflow_pages(start_page, total_len, pages);
+                        }
                     }
                 }
-            }
-            PageType::IndexInternal => {
-                let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                for i in 0..internal.len() {
-                    assert!(
-                        pages.insert(internal.ptr(i)),
-                        "Page {} referenced multiple times in index tree",
-                        internal.ptr(i)
-                    );
-                    if internal.is_overflow(i) {
-                        let meta = internal.key(i);
-                        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                        self.collect_overflow_pages(start_page, total_len, pages);
+                PageType::IndexInternal => {
+                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                    for i in 0..internal.len() {
+                        assert!(
+                            pages.insert(internal.ptr(i)),
+                            "Page {} referenced multiple times in index tree",
+                            internal.ptr(i)
+                        );
+                        if internal.is_overflow(i) {
+                            let meta = internal.key(i);
+                            let start_page =
+                                u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                            let total_len =
+                                u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            self.collect_overflow_pages(start_page, total_len, pages);
+                        }
+                        stack.push(internal.ptr(i));
                     }
-                    self.collect_index_tree_pages(internal.ptr(i), pages);
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -2305,10 +2358,10 @@ mod tests {
             btree.init().unwrap();
             root = btree.init_tree().unwrap();
 
-            for i in 0u64..50 {
+            for i in 0u64..200 {
                 btree.insert(root, i, vec![0u8; 64]).unwrap();
             }
-            for i in 0u64..50 {
+            for i in 0u64..200 {
                 btree.remove(root, i).unwrap();
             }
             assert_ne!(btree.read_free_list_head().unwrap(), u64::MAX);
@@ -2330,7 +2383,7 @@ mod tests {
                 "Free list lost after reopen"
             );
 
-            for i in 0u64..50 {
+            for i in 0u64..200 {
                 btree.insert(root, i, vec![0u8; 64]).unwrap();
             }
             assert!(

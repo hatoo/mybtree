@@ -709,13 +709,14 @@ macro_rules! impl_bytes_keyed_page {
 
             fn compact(&mut self) {
                 let len = self.len();
+                let old = self.page;
                 let mut new_data_offset = N;
                 for i in 0..len {
                     let (ko, kl, v) = self.read_slot(i);
                     let key_len = Self::inline_len(kl);
                     new_data_offset -= key_len;
-                    self.page
-                        .copy_within(ko as usize..ko as usize + key_len, new_data_offset);
+                    self.page[new_data_offset..new_data_offset + key_len]
+                        .copy_from_slice(&old[ko as usize..ko as usize + key_len]);
                     self.write_slot(i, new_data_offset as u16, kl, v);
                 }
                 self.set_data_offset(new_data_offset);
