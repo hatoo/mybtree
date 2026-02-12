@@ -15,6 +15,12 @@ pub struct InternalPage<const N: usize> {
     page: [u8; N],
 }
 
+#[repr(align(4096))]
+#[derive(Clone)]
+pub struct LeafPage<const N: usize> {
+    page: [u8; N],
+}
+
 impl<const N: usize> InternalPage<N> {
     const LEN_OFFSET: usize = 4;
     const HEADER_SIZE: usize = 6;
@@ -140,6 +146,78 @@ impl<const N: usize> fmt::Debug for InternalPage<N> {
             list.entry(&(self.key(i), self.ptr(i)));
         }
         list.finish()
+    }
+}
+
+#[repr(C)]
+struct LeafElement {
+    key: Key,
+    value_offset: u16,
+    value_len: u16,
+}
+
+impl<const N: usize> LeafPage<N> {
+    const LEN_OFFSET: usize = 4;
+    const HEADER_SIZE: usize = 6;
+    
+
+    fn new() -> Self {
+        let mut leaf = Self { page: [0; N] };
+        leaf.page[0..4].copy_from_slice(&(PageType::Leaf as u32).to_le_bytes());
+        leaf
+    }
+
+    fn len(&self) -> usize {
+        usize::from(u16::from_le_bytes([
+            self.page[LeafPage::<N>::LEN_OFFSET],
+            self.page[LeafPage::<N>::LEN_OFFSET + 1],
+        ]))
+    }
+
+    fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= u16::MAX as usize);
+        let len_bytes = (len as u16).to_le_bytes();
+        self.page[LeafPage::<N>::LEN_OFFSET] = len_bytes[0];
+        self.page[LeafPage::<N>::LEN_OFFSET + 1] = len_bytes[1];
+    }
+
+    fn key(&self, index: usize) -> Key {
+        debug_assert!(index < self.len());
+        let offset = LeafPage::<N>::HEADER_SIZE + index * std::mem::size_of::<LeafElement>();
+        Key::from_le_bytes(
+            self.page[offset..offset + std::mem::size_of::<Key>()]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn value(&self, index: usize) -> &[u8] {
+        debug_assert!(index < self.len());
+        let offset = LeafPage::<N>::HEADER_SIZE + index * std::mem::size_of::<LeafElement>();
+        let value_offset = u16::from_le_bytes([
+            self.page[offset + std::mem::size_of::<Key>()],
+            self.page[offset + std::mem::size_of::<Key>() + 1],
+        ]) as usize;
+        let value_len = u16::from_le_bytes([
+            self.page[offset + std::mem::size_of::<Key>() + 2],
+            self.page[offset + std::mem::size_of::<Key>() + 3],
+        ]) as usize;
+        &self.page[value_offset..value_offset + value_len]
+    }
+
+    fn search(&self, key: Key) -> Option<usize> {
+        let mut left = 0;
+        let mut right = self.len();
+        while left < right {
+            let mid = (left + right) / 2;
+            let mid_key = self.key(mid);
+            if mid_key < key {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        if left == self.len() { None } else { Some(left) }
     }
 }
 
