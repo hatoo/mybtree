@@ -16,7 +16,7 @@ const OVERFLOW_FLAG: u16 = 0x8000;
 const OVERFLOW_META_SIZE: usize = 16;
 
 fn write_overflow<const N: usize>(pager: &mut Pager<N>, data: &[u8]) -> u64 {
-    let data_per_page = pager.page_size() - 8;
+    let data_per_page = N - 8;
     let num_pages = (data.len() + data_per_page - 1) / data_per_page;
     assert!(num_pages > 0);
 
@@ -32,27 +32,31 @@ fn write_overflow<const N: usize>(pager: &mut Pager<N>, data: &[u8]) -> u64 {
         let end = std::cmp::min(start + data_per_page, data.len());
         let chunk = &data[start..end];
 
-        let mut page_data = vec![0u8; pager.page_size()];
-        page_data[0..8].copy_from_slice(&next_page.to_le_bytes());
-        page_data[8..8 + chunk.len()].copy_from_slice(chunk);
+        let mut page_data = AnyPage { page: [0u8; N] };
+        page_data.page[0..8].copy_from_slice(&next_page.to_le_bytes());
+        page_data.page[8..8 + chunk.len()].copy_from_slice(chunk);
 
-        pager.write_raw_page(page_num, &page_data).unwrap();
+        pager.write_node(page_num, page_data).unwrap();
     }
 
     pages[0]
 }
 
-pub fn read_overflow(pager: &mut Pager, start_page: u64, total_len: u64) -> Vec<u8> {
-    let data_per_page = pager.page_size() - 8;
+pub fn read_overflow<const N: usize>(
+    pager: &mut Pager<N>,
+    start_page: u64,
+    total_len: u64,
+) -> Vec<u8> {
+    let data_per_page = N - 8;
     let mut result = Vec::with_capacity(total_len as usize);
     let mut current_page = start_page;
     let mut remaining = total_len as usize;
 
     while remaining > 0 {
-        let buffer = pager.read_raw_page(current_page).unwrap();
-        let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
+        let page = pager.read_node::<()>(current_page).unwrap();
+        let next_page = u64::from_le_bytes(page.page[..8].try_into().unwrap());
         let chunk_len = std::cmp::min(data_per_page, remaining);
-        result.extend_from_slice(&buffer[8..8 + chunk_len]);
+        result.extend_from_slice(&page.page[8..8 + chunk_len]);
         remaining -= chunk_len;
         current_page = next_page;
     }
@@ -505,7 +509,7 @@ impl<const N: usize> LeafPage<N> {
         self.set_len(len + 1);
     }
 
-    pub fn insert(&mut self, key: Key, value: &[u8], pager: &mut Pager) {
+    pub fn insert(&mut self, key: Key, value: &[u8], pager: &mut Pager<N>) {
         debug_assert!(self.can_insert(value.len()));
 
         if Self::needs_overflow(value.len()) {
@@ -644,7 +648,7 @@ macro_rules! impl_bytes_keyed_page {
                 (ko, kl, v)
             }
 
-            pub fn resolved_key<'a>(&'a self, index: usize, pager: &mut Pager) -> Cow<'a, [u8]> {
+            pub fn resolved_key<'a>(&'a self, index: usize, pager: &mut Pager<N>) -> Cow<'a, [u8]> {
                 if self.is_overflow(index) {
                     let meta = self.key(index);
                     let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
@@ -655,7 +659,7 @@ macro_rules! impl_bytes_keyed_page {
                 }
             }
 
-            fn search(&self, target: &[u8], pager: &mut Pager) -> Option<usize> {
+            fn search(&self, target: &[u8], pager: &mut Pager<N>) -> Option<usize> {
                 let mut left = 0;
                 let mut right = self.len();
                 while left < right {
@@ -739,13 +743,13 @@ macro_rules! impl_bytes_keyed_page {
                 key_bytes: &[u8],
                 raw_key_len: u16,
                 value: u64,
-                pager: &mut Pager,
+                pager: &mut Pager<N>,
             ) {
                 let idx = self.search(key_bytes, pager).unwrap_or(self.len());
                 self.insert_raw_at(idx, key_bytes, raw_key_len, value);
             }
 
-            pub fn insert(&mut self, key: &[u8], value: u64, pager: &mut Pager) {
+            pub fn insert(&mut self, key: &[u8], value: u64, pager: &mut Pager<N>) {
                 debug_assert!(self.can_insert(key.len()));
 
                 if Self::needs_overflow(key.len()) {
@@ -813,7 +817,7 @@ impl<const N: usize> IndexInternalPage<N> {
         self.slot_value(index)
     }
 
-    pub fn find_child(&self, target: &[u8], pager: &mut Pager) -> Option<NodePtr> {
+    pub fn find_child(&self, target: &[u8], pager: &mut Pager<N>) -> Option<NodePtr> {
         match self.search(target, pager) {
             Some(idx) => Some(self.ptr(idx)),
             None => None,
@@ -827,7 +831,7 @@ impl<const N: usize> IndexLeafPage<N> {
         self.slot_value(index)
     }
 
-    pub fn get(&self, target: &[u8], pager: &mut Pager) -> Option<Key> {
+    pub fn get(&self, target: &[u8], pager: &mut Pager<N>) -> Option<Key> {
         let idx = self.search(target, pager)?;
         let resolved = self.resolved_key(idx, pager);
         if resolved.as_ref() == target {
@@ -840,7 +844,12 @@ impl<const N: usize> IndexLeafPage<N> {
     /// Binary search using composite `(bytes_key, key)` ordering.
     /// Returns the index of the first entry >= `(target, target_key)`.
     /// Returns `None` if all entries are less than the target.
-    pub fn search_entry(&self, target: &[u8], target_key: Key, pager: &mut Pager) -> Option<usize> {
+    pub fn search_entry(
+        &self,
+        target: &[u8],
+        target_key: Key,
+        pager: &mut Pager<N>,
+    ) -> Option<usize> {
         let mut left = 0;
         let mut right = self.len();
         while left < right {
@@ -861,7 +870,12 @@ impl<const N: usize> IndexLeafPage<N> {
 
     /// Find the exact entry matching `(target, target_key)`.
     /// Returns `Some(index)` if found, `None` otherwise.
-    pub fn find_entry(&self, target: &[u8], target_key: Key, pager: &mut Pager) -> Option<usize> {
+    pub fn find_entry(
+        &self,
+        target: &[u8],
+        target_key: Key,
+        pager: &mut Pager<N>,
+    ) -> Option<usize> {
         let idx = self.search_entry(target, target_key, pager)?;
         let resolved = self.resolved_key(idx, pager);
         if resolved.as_ref() == target && self.value(idx) == target_key {
@@ -873,7 +887,7 @@ impl<const N: usize> IndexLeafPage<N> {
 
     /// Insert using composite `(bytes_key, key)` ordering,
     /// allowing multiple entries with the same byte key but different Key values.
-    pub fn insert_entry(&mut self, key: &[u8], entry_key: Key, pager: &mut Pager) {
+    pub fn insert_entry(&mut self, key: &[u8], entry_key: Key, pager: &mut Pager<N>) {
         debug_assert!(self.can_insert(key.len()));
 
         if Self::needs_overflow(key.len()) {
@@ -896,7 +910,7 @@ impl<const N: usize> IndexLeafPage<N> {
 
     /// Remove the entry matching `(target, target_key)`.
     /// Returns `true` if an entry was removed.
-    pub fn remove_entry(&mut self, target: &[u8], target_key: Key, pager: &mut Pager) -> bool {
+    pub fn remove_entry(&mut self, target: &[u8], target_key: Key, pager: &mut Pager<N>) -> bool {
         if let Some(idx) = self.find_entry(target, target_key, pager) {
             self.remove(idx);
             true
@@ -910,9 +924,9 @@ impl<const N: usize> IndexLeafPage<N> {
 mod tests {
     use super::*;
 
-    fn test_pager(page_size: usize) -> Pager {
+    fn test_pager<const N: usize>() -> Pager<N> {
         let file = tempfile::tempfile().unwrap();
-        Pager::new(file, page_size)
+        Pager::new(file)
     }
 
     #[test]
@@ -994,7 +1008,7 @@ mod tests {
     #[test]
     fn leaf_page_insert_single() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(10, b"hello", &mut pager);
         assert_eq!(page.len(), 1);
         assert_eq!(page.key(0), 10);
@@ -1004,7 +1018,7 @@ mod tests {
     #[test]
     fn leaf_page_insert_maintains_sorted_order() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(30, b"ccc", &mut pager);
         page.insert(10, b"aaa", &mut pager);
         page.insert(20, b"bbb", &mut pager);
@@ -1027,7 +1041,7 @@ mod tests {
     #[test]
     fn leaf_page_remove_middle() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(10, b"aaa", &mut pager);
         page.insert(20, b"bbb", &mut pager);
         page.insert(30, b"ccc", &mut pager);
@@ -1043,7 +1057,7 @@ mod tests {
     #[test]
     fn leaf_page_remove_reclaims_space() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(10, b"aaa", &mut pager);
         page.insert(20, b"bbb", &mut pager);
         let free_before = page.free_space();
@@ -1055,7 +1069,7 @@ mod tests {
     #[test]
     fn leaf_page_insert_after_remove_compacts() {
         let mut page = LeafPage::<128>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         // Fill the page
         for i in 0..5 {
             page.insert(i, &[i as u8; 10], &mut pager);
@@ -1072,7 +1086,7 @@ mod tests {
     #[test]
     fn leaf_page_split_divides_elements() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         for i in 0u64..6 {
             page.insert(i * 10, &[i as u8; 5], &mut pager);
         }
@@ -1095,7 +1109,7 @@ mod tests {
     #[test]
     fn leaf_page_overflow_insert_and_get() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         // Value larger than (4096 - 8) / 2 = 2044 triggers overflow
         let big_value = vec![0xABu8; 2100];
@@ -1113,7 +1127,7 @@ mod tests {
     #[test]
     fn leaf_page_overflow_mixed_with_inline() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         let small_value = b"hello";
         let big_value = vec![0xCDu8; 2100];
@@ -1134,7 +1148,7 @@ mod tests {
     #[test]
     fn leaf_page_overflow_split_preserves_data() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         // Insert several small values and one overflow
         for i in 0u64..4 {
@@ -1162,7 +1176,7 @@ mod tests {
     #[test]
     fn index_internal_page_insert_single() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"hello", 100, &mut pager);
         assert_eq!(page.len(), 1);
         assert_eq!(page.key(0), b"hello");
@@ -1172,7 +1186,7 @@ mod tests {
     #[test]
     fn index_internal_page_insert_maintains_sorted_order() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"cherry", 300, &mut pager);
         page.insert(b"apple", 100, &mut pager);
         page.insert(b"banana", 200, &mut pager);
@@ -1189,7 +1203,7 @@ mod tests {
     #[test]
     fn index_internal_page_find_child() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"bbb", 100, &mut pager);
         page.insert(b"ddd", 200, &mut pager);
         page.insert(b"fff", 300, &mut pager);
@@ -1213,7 +1227,7 @@ mod tests {
     #[test]
     fn index_internal_page_remove() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"aaa", 100, &mut pager);
         page.insert(b"bbb", 200, &mut pager);
         page.insert(b"ccc", 300, &mut pager);
@@ -1229,7 +1243,7 @@ mod tests {
     #[test]
     fn index_internal_page_split() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         let keys = [b"aaa", b"bbb", b"ccc", b"ddd", b"eee", b"fff"];
         for (i, key) in keys.iter().enumerate() {
             page.insert(*key, (i * 100) as u64, &mut pager);
@@ -1255,7 +1269,7 @@ mod tests {
     #[test]
     fn index_internal_page_overflow_insert_and_find() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         let big_key = vec![0xABu8; 2100];
         assert!(IndexInternalPage::<4096>::needs_overflow(big_key.len()));
@@ -1279,7 +1293,7 @@ mod tests {
     #[test]
     fn index_leaf_page_insert_single() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"hello", 100, &mut pager);
         assert_eq!(page.len(), 1);
         assert_eq!(page.key(0), b"hello");
@@ -1289,7 +1303,7 @@ mod tests {
     #[test]
     fn index_leaf_page_insert_maintains_sorted_order() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"cherry", 300, &mut pager);
         page.insert(b"apple", 100, &mut pager);
         page.insert(b"banana", 200, &mut pager);
@@ -1306,7 +1320,7 @@ mod tests {
     #[test]
     fn index_leaf_page_get() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"aaa", 10, &mut pager);
         page.insert(b"bbb", 20, &mut pager);
         page.insert(b"ccc", 30, &mut pager);
@@ -1321,7 +1335,7 @@ mod tests {
     #[test]
     fn index_leaf_page_remove() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"aaa", 100, &mut pager);
         page.insert(b"bbb", 200, &mut pager);
         page.insert(b"ccc", 300, &mut pager);
@@ -1337,7 +1351,7 @@ mod tests {
     #[test]
     fn index_leaf_page_split() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         let keys = [b"aaa", b"bbb", b"ccc", b"ddd", b"eee", b"fff"];
         for (i, key) in keys.iter().enumerate() {
             page.insert(*key, (i * 100) as u64, &mut pager);
@@ -1363,7 +1377,7 @@ mod tests {
     #[test]
     fn index_leaf_page_overflow_insert_and_get() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         let big_key = vec![0xABu8; 2100];
         assert!(IndexLeafPage::<4096>::needs_overflow(big_key.len()));
@@ -1381,7 +1395,7 @@ mod tests {
     #[test]
     fn index_leaf_page_insert_entry_duplicate_keys() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         // Insert multiple entries with the same byte key but different Key values
         page.insert_entry(b"aaa", 30, &mut pager);
@@ -1398,7 +1412,7 @@ mod tests {
     #[test]
     fn index_leaf_page_insert_entry_mixed_keys() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         page.insert_entry(b"bbb", 2, &mut pager);
         page.insert_entry(b"aaa", 3, &mut pager);
@@ -1420,7 +1434,7 @@ mod tests {
     #[test]
     fn index_leaf_page_find_entry() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         page.insert_entry(b"aaa", 10, &mut pager);
         page.insert_entry(b"aaa", 20, &mut pager);
@@ -1436,7 +1450,7 @@ mod tests {
     #[test]
     fn index_leaf_page_remove_entry() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         page.insert_entry(b"aaa", 10, &mut pager);
         page.insert_entry(b"aaa", 20, &mut pager);
@@ -1454,7 +1468,7 @@ mod tests {
     #[test]
     fn index_leaf_page_search_entry() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
 
         page.insert_entry(b"aaa", 10, &mut pager);
         page.insert_entry(b"aaa", 20, &mut pager);
@@ -1533,7 +1547,7 @@ mod tests {
     #[test]
     fn leaf_page_get_absent_key() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(10, b"hello", &mut pager);
         assert!(page.get(999, &mut pager).is_none());
     }
@@ -1541,14 +1555,14 @@ mod tests {
     #[test]
     fn leaf_page_get_empty_page() {
         let page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         assert!(page.get(10, &mut pager).is_none());
     }
 
     #[test]
     fn leaf_page_insert_empty_value() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(1, b"", &mut pager);
         assert_eq!(page.len(), 1);
         assert_eq!(page.value(0), b"");
@@ -1558,7 +1572,7 @@ mod tests {
     #[test]
     fn leaf_page_remove_first_and_last() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(10, b"a", &mut pager);
         page.insert(20, b"b", &mut pager);
         page.insert(30, b"c", &mut pager);
@@ -1576,7 +1590,7 @@ mod tests {
     #[test]
     fn leaf_page_remove_only_element() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(10, b"hi", &mut pager);
         page.remove(0);
         assert_eq!(page.len(), 0);
@@ -1585,7 +1599,7 @@ mod tests {
     #[test]
     fn leaf_page_split_odd_count() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         for i in 0u64..5 {
             page.insert(i, &[i as u8], &mut pager);
         }
@@ -1597,7 +1611,7 @@ mod tests {
     #[test]
     fn leaf_page_split_single_element() {
         let mut page = LeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(10, b"only", &mut pager);
         let right = page.split();
         assert_eq!(page.len(), 0);
@@ -1608,7 +1622,7 @@ mod tests {
     #[test]
     fn leaf_page_fill_to_capacity() {
         let mut page = LeafPage::<128>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         let mut i = 0u64;
         while page.can_insert(3) {
             page.insert(i, &[0xAA; 3], &mut pager);
@@ -1625,14 +1639,14 @@ mod tests {
     #[test]
     fn index_internal_page_find_child_empty() {
         let page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         assert_eq!(page.find_child(b"anything", &mut pager), None);
     }
 
     #[test]
     fn index_internal_page_find_child_single_entry() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"mmm", 42, &mut pager);
 
         assert_eq!(page.find_child(b"aaa", &mut pager), Some(42));
@@ -1643,7 +1657,7 @@ mod tests {
     #[test]
     fn index_internal_page_insert_empty_key() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"", 10, &mut pager);
         page.insert(b"aaa", 20, &mut pager);
         assert_eq!(page.len(), 2);
@@ -1655,7 +1669,7 @@ mod tests {
     #[test]
     fn index_internal_page_remove_first_and_last() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"aaa", 1, &mut pager);
         page.insert(b"bbb", 2, &mut pager);
         page.insert(b"ccc", 3, &mut pager);
@@ -1672,7 +1686,7 @@ mod tests {
     #[test]
     fn index_internal_page_remove_only_element() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"only", 99, &mut pager);
         page.remove(0);
         assert_eq!(page.len(), 0);
@@ -1681,7 +1695,7 @@ mod tests {
     #[test]
     fn index_internal_page_split_odd_count() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         for i in 0..5u64 {
             page.insert(&[b'a' + i as u8], i, &mut pager);
         }
@@ -1693,7 +1707,7 @@ mod tests {
     #[test]
     fn index_internal_page_split_single_element() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"only", 1, &mut pager);
         let right = page.split();
         assert_eq!(page.len(), 0);
@@ -1704,7 +1718,7 @@ mod tests {
     #[test]
     fn index_internal_page_insert_binary_keys() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(&[0x00, 0xFF], 1, &mut pager);
         page.insert(&[0x00, 0x00], 2, &mut pager);
         page.insert(&[0xFF, 0x00], 3, &mut pager);
@@ -1717,7 +1731,7 @@ mod tests {
     #[test]
     fn index_internal_page_variable_length_keys() {
         let mut page = IndexInternalPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"a", 1, &mut pager);
         page.insert(b"aa", 2, &mut pager);
         page.insert(b"aaa", 3, &mut pager);
@@ -1733,7 +1747,7 @@ mod tests {
     #[test]
     fn index_internal_page_fill_to_capacity() {
         let mut page = IndexInternalPage::<128>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         let mut i = 0u64;
         while page.can_insert(3) {
             let key = format!("{:03}", i);
@@ -1748,14 +1762,14 @@ mod tests {
     #[test]
     fn index_leaf_page_get_empty() {
         let page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         assert_eq!(page.get(b"anything", &mut pager), None);
     }
 
     #[test]
     fn index_leaf_page_insert_empty_key() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"", 10, &mut pager);
         assert_eq!(page.len(), 1);
         assert_eq!(page.key(0), b"");
@@ -1765,7 +1779,7 @@ mod tests {
     #[test]
     fn index_leaf_page_remove_first_and_last() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"aaa", 1, &mut pager);
         page.insert(b"bbb", 2, &mut pager);
         page.insert(b"ccc", 3, &mut pager);
@@ -1783,7 +1797,7 @@ mod tests {
     #[test]
     fn index_leaf_page_remove_only_element() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"only", 1, &mut pager);
         page.remove(0);
         assert_eq!(page.len(), 0);
@@ -1792,7 +1806,7 @@ mod tests {
     #[test]
     fn index_leaf_page_split_odd_count() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         for i in 0..5u64 {
             page.insert(&[b'a' + i as u8], i, &mut pager);
         }
@@ -1804,7 +1818,7 @@ mod tests {
     #[test]
     fn index_leaf_page_split_single_element() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert(b"only", 1, &mut pager);
         let right = page.split();
         assert_eq!(page.len(), 0);
@@ -1815,7 +1829,7 @@ mod tests {
     #[test]
     fn index_leaf_page_split_preserves_duplicate_keys() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         // Insert 6 entries: 3 with "aaa", 3 with "bbb"
         for i in 0..3u64 {
             page.insert_entry(b"aaa", i, &mut pager);
@@ -1842,28 +1856,28 @@ mod tests {
     #[test]
     fn index_leaf_page_search_entry_empty() {
         let page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         assert_eq!(page.search_entry(b"aaa", 0, &mut pager), None);
     }
 
     #[test]
     fn index_leaf_page_find_entry_empty() {
         let page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         assert_eq!(page.find_entry(b"aaa", 0, &mut pager), None);
     }
 
     #[test]
     fn index_leaf_page_remove_entry_empty() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         assert!(!page.remove_entry(b"aaa", 0, &mut pager));
     }
 
     #[test]
     fn index_leaf_page_insert_entry_with_max_key_values() {
         let mut page = IndexLeafPage::<4096>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         page.insert_entry(b"x", u64::MAX, &mut pager);
         page.insert_entry(b"x", 0, &mut pager);
         page.insert_entry(b"x", u64::MAX - 1, &mut pager);
@@ -1877,7 +1891,7 @@ mod tests {
     #[test]
     fn index_leaf_page_fill_to_capacity() {
         let mut page = IndexLeafPage::<128>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         let mut i = 0u64;
         while page.can_insert(3) {
             let key = format!("{:03}", i);
@@ -1892,7 +1906,7 @@ mod tests {
     #[test]
     fn index_leaf_page_insert_after_remove_reuses_space() {
         let mut page = IndexLeafPage::<128>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         // Fill up
         for i in 0..5u64 {
             page.insert(&[b'a' + i as u8; 3], i, &mut pager);
@@ -1912,7 +1926,7 @@ mod tests {
     #[test]
     fn index_internal_page_compact_after_removes() {
         let mut page = IndexInternalPage::<128>::new();
-        let mut pager = test_pager(4096);
+        let mut pager = test_pager();
         for i in 0..5u64 {
             page.insert(&[b'a' + i as u8; 3], i, &mut pager);
         }
