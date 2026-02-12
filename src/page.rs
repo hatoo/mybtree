@@ -15,7 +15,7 @@ pub enum PageType {
 const OVERFLOW_FLAG: u16 = 0x8000;
 const OVERFLOW_META_SIZE: usize = 16;
 
-fn write_overflow(pager: &mut Pager, data: &[u8]) -> u64 {
+fn write_overflow<const N: usize>(pager: &mut Pager<N>, data: &[u8]) -> u64 {
     let data_per_page = pager.page_size() - 8;
     let num_pages = (data.len() + data_per_page - 1) / data_per_page;
     assert!(num_pages > 0);
@@ -422,7 +422,7 @@ impl<const N: usize> LeafPage<N> {
         if left == self.len() { None } else { Some(left) }
     }
 
-    pub fn get(&self, key: Key, pager: &mut Pager) -> Option<Cow<'_, [u8]>> {
+    pub fn get(&self, key: Key, pager: &mut Pager<N>) -> Option<Cow<'_, [u8]>> {
         let idx = self.search(key)?;
         if self.key(idx) == key {
             if self.is_overflow(idx) {
