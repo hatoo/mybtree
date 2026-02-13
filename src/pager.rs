@@ -167,6 +167,24 @@ impl<const N: usize> Pager<N> {
         Ok(())
     }
 
+    pub fn mut_node(&mut self, page_num: u64) -> io::Result<&mut AnyPage<N>> {
+        self.dirty.insert(page_num);
+        if self.cache.contains(&page_num) {
+            Ok(self.cache.get_mut(&page_num).unwrap())
+        } else {
+            let mut buf = vec![0u8; N];
+
+            let _ = read_exact_at(&self.file, &mut buf, page_num * N as u64);
+            self.cache_put(
+                page_num,
+                Box::new(AnyPage {
+                    page: buf.try_into().unwrap(),
+                }),
+            )?;
+            Ok(self.cache.get_mut(&page_num).unwrap())
+        }
+    }
+
     /// Read raw bytes from a page. Returns a reference to the page's raw data.
     pub fn read_raw_page(&mut self, page_num: u64) -> io::Result<&[u8; N]> {
         let data = self.cache_read(page_num)?;
