@@ -204,6 +204,53 @@ impl<const N: usize> Pager<N> {
     pub fn page_size(&self) -> usize {
         N
     }
+
+    /// Write overflow data across multiple pages, returns start page number
+    pub fn write_overflow(&mut self, data: &[u8]) -> u64 {
+        let data_per_page = N - 8;
+        let num_pages = (data.len() + data_per_page - 1) / data_per_page;
+        assert!(num_pages > 0);
+
+        let pages: Vec<u64> = (0..num_pages).map(|_| self.next_page_num()).collect();
+
+        for (i, &page_num) in pages.iter().enumerate() {
+            let next_page = if i + 1 < pages.len() {
+                pages[i + 1]
+            } else {
+                u64::MAX
+            };
+            let start = i * data_per_page;
+            let end = std::cmp::min(start + data_per_page, data.len());
+            let chunk = &data[start..end];
+
+            let mut page_data = AnyPage { page: [0u8; N] };
+            page_data.page[0..8].copy_from_slice(&next_page.to_le_bytes());
+            page_data.page[8..8 + chunk.len()].copy_from_slice(chunk);
+
+            self.write_node(page_num, page_data).unwrap();
+        }
+
+        pages[0]
+    }
+
+    /// Read overflow data starting from a page, for a given total length
+    pub fn read_overflow(&mut self, start_page: u64, total_len: u64) -> Vec<u8> {
+        let data_per_page = N - 8;
+        let mut result = Vec::with_capacity(total_len as usize);
+        let mut current_page = start_page;
+        let mut remaining = total_len as usize;
+
+        while remaining > 0 {
+            let page = self.read_node(current_page).unwrap();
+            let next_page = u64::from_le_bytes(page.page[..8].try_into().unwrap());
+            let chunk_len = std::cmp::min(data_per_page, remaining);
+            result.extend_from_slice(&page.page[8..8 + chunk_len]);
+            remaining -= chunk_len;
+            current_page = next_page;
+        }
+
+        result
+    }
 }
 
 impl<const N: usize> Drop for Pager<N> {

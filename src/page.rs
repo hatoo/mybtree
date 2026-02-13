@@ -15,54 +15,6 @@ pub enum PageType {
 pub const OVERFLOW_FLAG: u16 = 0x8000;
 pub const OVERFLOW_META_SIZE: usize = 16;
 
-fn write_overflow<const N: usize>(pager: &mut Pager<N>, data: &[u8]) -> u64 {
-    let data_per_page = N - 8;
-    let num_pages = (data.len() + data_per_page - 1) / data_per_page;
-    assert!(num_pages > 0);
-
-    let pages: Vec<u64> = (0..num_pages).map(|_| pager.next_page_num()).collect();
-
-    for (i, &page_num) in pages.iter().enumerate() {
-        let next_page = if i + 1 < pages.len() {
-            pages[i + 1]
-        } else {
-            u64::MAX
-        };
-        let start = i * data_per_page;
-        let end = std::cmp::min(start + data_per_page, data.len());
-        let chunk = &data[start..end];
-
-        let mut page_data = AnyPage { page: [0u8; N] };
-        page_data.page[0..8].copy_from_slice(&next_page.to_le_bytes());
-        page_data.page[8..8 + chunk.len()].copy_from_slice(chunk);
-
-        pager.write_node(page_num, page_data).unwrap();
-    }
-
-    pages[0]
-}
-
-pub fn read_overflow<const N: usize>(
-    pager: &mut Pager<N>,
-    start_page: u64,
-    total_len: u64,
-) -> Vec<u8> {
-    let data_per_page = N - 8;
-    let mut result = Vec::with_capacity(total_len as usize);
-    let mut current_page = start_page;
-    let mut remaining = total_len as usize;
-
-    while remaining > 0 {
-        let page = pager.read_node(current_page).unwrap();
-        let next_page = u64::from_le_bytes(page.page[..8].try_into().unwrap());
-        let chunk_len = std::cmp::min(data_per_page, remaining);
-        result.extend_from_slice(&page.page[8..8 + chunk_len]);
-        remaining -= chunk_len;
-        current_page = next_page;
-    }
-
-    result
-}
 #[repr(align(4096))]
 #[repr(C)]
 #[derive(Clone)]
@@ -552,7 +504,7 @@ impl<const N: usize> LeafPage<N> {
                 let meta = self.value(idx);
                 let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
                 let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                Some(Cow::Owned(read_overflow(pager, start_page, total_len)))
+                Some(Cow::Owned(pager.read_overflow(start_page, total_len)))
             } else {
                 Some(Cow::Borrowed(self.value(idx)))
             }
@@ -634,7 +586,7 @@ impl<const N: usize> LeafPage<N> {
         debug_assert!(self.can_insert(value.len()));
 
         if Self::needs_overflow(value.len()) {
-            let start_page = write_overflow(pager, value);
+            let start_page = pager.write_overflow(value);
             let mut meta = [0u8; 16];
             meta[0..8].copy_from_slice(&start_page.to_le_bytes());
             meta[8..16].copy_from_slice(&(value.len() as u64).to_le_bytes());
@@ -780,7 +732,7 @@ macro_rules! impl_bytes_keyed_page {
                     let meta = self.key(index);
                     let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
                     let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                    Cow::Owned(read_overflow(pager, start_page, total_len))
+                    Cow::Owned(pager.read_overflow(start_page, total_len))
                 } else {
                     Cow::Borrowed(self.key(index))
                 }
@@ -881,7 +833,7 @@ macro_rules! impl_bytes_keyed_page {
                 debug_assert!(self.can_insert(key.len()));
 
                 if Self::needs_overflow(key.len()) {
-                    let start_page = write_overflow(pager, key);
+                    let start_page = pager.write_overflow(key);
                     let mut meta = [0u8; 16];
                     meta[0..8].copy_from_slice(&start_page.to_le_bytes());
                     meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
@@ -1019,7 +971,7 @@ impl<const N: usize> IndexLeafPage<N> {
         debug_assert!(self.can_insert(key.len()));
 
         if Self::needs_overflow(key.len()) {
-            let start_page = write_overflow(pager, key);
+            let start_page = pager.write_overflow(key);
             let mut meta = [0u8; 16];
             meta[0..8].copy_from_slice(&start_page.to_le_bytes());
             meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
