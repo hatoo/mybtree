@@ -35,7 +35,7 @@ impl<const N: usize> Btree<N> {
         // Reserve page 0 for the free list
         let fl_page = self.pager.next_page_num();
         assert_eq!(fl_page, FREE_LIST_PAGE_NUM);
-        self.write_free_list_head(u64::MAX)?;
+        self.pager.write_free_list_head(u64::MAX)?;
         Ok(())
     }
 
@@ -44,7 +44,7 @@ impl<const N: usize> Btree<N> {
     // ────────────────────────────────────────────────────────────────────
 
     pub fn init_tree(&mut self) -> io::Result<NodePtr> {
-        let page = self.alloc_page()?;
+        let page = self.pager.alloc_page()?;
         let leaf = LeafPage::<N>::new();
         self.pager.write_node(page, leaf.into())?;
         Ok(page)
@@ -77,7 +77,7 @@ impl<const N: usize> Btree<N> {
                     });
                 }
             }
-            self.free_page(node)?;
+            self.pager.free_page(node)?;
         }
         Ok(())
     }
@@ -134,7 +134,7 @@ impl<const N: usize> Btree<N> {
                         None => {
                             // Key is beyond all entries
                             if internal.len() == 0 {
-                                let new_leaf_page = self.alloc_page()?;
+                                let new_leaf_page = self.pager.alloc_page()?;
                                 let internal: &mut InternalPage<N> =
                                     self.pager.mut_node(current)?.try_into().unwrap();
                                 internal.insert(key, new_leaf_page);
@@ -194,7 +194,7 @@ impl<const N: usize> Btree<N> {
         let parents = &path[..path.len() - 1];
 
         let left_max_key = leaf.key(leaf.len() - 1);
-        let right_page = self.alloc_page()?;
+        let right_page = self.pager.alloc_page()?;
 
         // Write right to new page, left stays at current page
         self.pager.write_node(right_page, right.into())?;
@@ -253,7 +253,7 @@ impl<const N: usize> Btree<N> {
                     }
                     _ => unreachable!(),
                 };
-                let moved_page = self.alloc_page()?;
+                let moved_page = self.pager.alloc_page()?;
                 let root_content = self.pager.owned_node(root)?;
                 self.pager.write_node(moved_page, root_content)?;
 
@@ -315,7 +315,7 @@ impl<const N: usize> Btree<N> {
             }
 
             let new_left_max_key = internal.key(internal.len() - 1);
-            let new_right_page = self.alloc_page()?;
+            let new_right_page = self.pager.alloc_page()?;
 
             self.pager.write_node(new_right_page, right.into())?;
             self.pager.write_node(parent_ptr, internal.into())?;
@@ -489,7 +489,7 @@ impl<const N: usize> Btree<N> {
                     }
                 }
             }
-            self.free_page(page)?;
+            self.pager.free_page(page)?;
             return self.merge_internal_iterative(parents);
         }
 
@@ -569,7 +569,7 @@ impl<const N: usize> Btree<N> {
             let parent: &mut InternalPage<N> = p.try_into().unwrap();
             parent.remove(index - 1);
         }
-        self.free_page(left_sibling_page)?;
+        self.pager.free_page(left_sibling_page)?;
         self.merge_internal_iterative(parents)?;
         Ok(true)
     }
@@ -611,7 +611,7 @@ impl<const N: usize> Btree<N> {
                         }
                     }
                 }
-                self.free_page(page)?;
+                self.pager.free_page(page)?;
                 cur_path = parents;
                 continue;
             }
@@ -692,7 +692,7 @@ impl<const N: usize> Btree<N> {
             let parent: &mut InternalPage<N> = p.try_into().unwrap();
             parent.remove(index - 1);
         }
-        self.free_page(left_sibling_page)?;
+        self.pager.free_page(left_sibling_page)?;
         Ok(true)
     }
 
@@ -867,7 +867,7 @@ impl<const N: usize> Btree<N> {
         assert!(num_pages > 0);
 
         let pages: Vec<u64> = (0..num_pages)
-            .map(|_| self.alloc_page())
+            .map(|_| self.pager.alloc_page())
             .collect::<io::Result<Vec<u64>>>()?;
 
         for (i, &page_num) in pages.iter().enumerate() {
@@ -920,7 +920,7 @@ impl<const N: usize> Btree<N> {
         while remaining > 0 {
             let buffer = self.pager.read_raw_page(current_page)?;
             let next_page = u64::from_le_bytes(buffer[..8].try_into().unwrap());
-            self.free_page(current_page)?;
+            self.pager.free_page(current_page)?;
             let chunk_len = std::cmp::min(data_per_page, remaining);
             remaining -= chunk_len;
             current_page = next_page;
@@ -932,42 +932,14 @@ impl<const N: usize> Btree<N> {
     //  Free page list
     // ────────────────────────────────────────────────────────────────────
 
-    fn read_free_list_head(&mut self) -> io::Result<u64> {
-        let buf = self.pager.read_raw_page(FREE_LIST_PAGE_NUM)?;
-        Ok(u64::from_le_bytes(buf[..8].try_into().unwrap()))
-    }
-
-    fn write_free_list_head(&mut self, head: u64) -> io::Result<()> {
-        let mut buf = vec![0u8; 8];
-        buf[..8].copy_from_slice(&head.to_le_bytes());
-        self.pager.write_raw_page(FREE_LIST_PAGE_NUM, &buf)
-    }
-
-    fn alloc_page(&mut self) -> io::Result<u64> {
-        let head = self.read_free_list_head()?;
-        if head == u64::MAX {
-            return Ok(self.pager.next_page_num());
-        }
-        let buf = self.pager.read_raw_page(head)?;
-        let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        self.write_free_list_head(next)?;
-        Ok(head)
-    }
-
-    pub(crate) fn free_page(&mut self, page_num: u64) -> io::Result<()> {
-        let head = self.read_free_list_head()?;
-        let mut buf = vec![0u8; 8];
-        buf[..8].copy_from_slice(&head.to_le_bytes());
-        self.pager.write_raw_page(page_num, &buf)?;
-        self.write_free_list_head(page_num)
-    }
+    // Free list operations moved to `Pager`
 
     // ────────────────────────────────────────────────────────────────────
     //  Index tree operations
     // ────────────────────────────────────────────────────────────────────
 
     pub fn init_index(&mut self) -> io::Result<NodePtr> {
-        let page = self.alloc_page()?;
+        let page = self.pager.alloc_page()?;
         let leaf = IndexLeafPage::<N>::new();
         self.pager.write_node(page, leaf.into())?;
         Ok(page)
@@ -1004,7 +976,7 @@ impl<const N: usize> Btree<N> {
                     });
                 }
             }
-            self.free_page(node)?;
+            self.pager.free_page(node)?;
         }
         Ok(())
     }
@@ -1053,7 +1025,7 @@ impl<const N: usize> Btree<N> {
 
                     let page_num = *path.last().unwrap();
                     let parents = &path[..path.len() - 1];
-                    let right_page = self.alloc_page()?;
+                    let right_page = self.pager.alloc_page()?;
 
                     self.pager.write_node(right_page, right.into())?;
                     self.pager.write_node(page_num, leaf.into())?;
@@ -1070,7 +1042,7 @@ impl<const N: usize> Btree<N> {
                             let mut internal: IndexInternalPage<N> =
                                 self.pager.owned_node(current)?.try_into().unwrap();
                             if internal.len() == 0 {
-                                let new_leaf_page = self.alloc_page()?;
+                                let new_leaf_page = self.pager.alloc_page()?;
                                 let mut new_leaf = IndexLeafPage::<N>::new();
                                 new_leaf.insert_entry(&value, key, &mut self.pager);
                                 self.pager.write_node(new_leaf_page, new_leaf.into())?;
@@ -1193,7 +1165,7 @@ impl<const N: usize> Btree<N> {
                             right_parent.insert(&old_key, right_page, &mut self.pager);
                         }
 
-                        let rp = self.alloc_page()?;
+                        let rp = self.pager.alloc_page()?;
                         self.pager.write_node(rp, right_parent.into())?;
                         self.pager.write_node(parent_ptr, parent.into())?;
 
@@ -1224,7 +1196,7 @@ impl<const N: usize> Btree<N> {
             };
 
             // Move root content to a new page
-            let moved_page = self.alloc_page()?;
+            let moved_page = self.pager.alloc_page()?;
             let root_content = self.pager.owned_node(root)?;
             self.pager.write_node(moved_page, root_content)?;
 
@@ -1324,7 +1296,7 @@ impl<const N: usize> Btree<N> {
             if let Some((sp, tl)) = overflow_meta {
                 self.free_overflow_pages(sp, tl)?;
             }
-            self.free_page(page)?;
+            self.pager.free_page(page)?;
             return self.index_merge_internal(parents);
         }
 
@@ -1413,7 +1385,7 @@ impl<const N: usize> Btree<N> {
         if let Some((sp, tl)) = overflow_meta {
             self.free_overflow_pages(sp, tl)?;
         }
-        self.free_page(left_sibling_page)?;
+        self.pager.free_page(left_sibling_page)?;
         self.index_merge_internal(parents)?;
         Ok(true)
     }
@@ -1464,7 +1436,7 @@ impl<const N: usize> Btree<N> {
                 if let Some((sp, tl)) = overflow_meta {
                     self.free_overflow_pages(sp, tl)?;
                 }
-                self.free_page(page)?;
+                self.pager.free_page(page)?;
                 cur_path = parents;
                 continue;
             }
@@ -1561,7 +1533,7 @@ impl<const N: usize> Btree<N> {
         if let Some((sp, tl)) = overflow_meta {
             self.free_overflow_pages(sp, tl)?;
         }
-        self.free_page(left_sibling_page)?;
+        self.pager.free_page(left_sibling_page)?;
         Ok(true)
     }
 
@@ -1757,7 +1729,7 @@ impl<const N: usize> Btree<N> {
         self.collect_all_pages(root, &mut tree_pages);
 
         let mut free_pages = BTreeSet::new();
-        let mut head = self.read_free_list_head().unwrap();
+        let mut head = self.pager.read_free_list_head().unwrap();
         while head != u64::MAX {
             assert!(
                 free_pages.insert(head),
@@ -2312,7 +2284,7 @@ mod tests {
             btree.remove(root, i).unwrap();
         }
         assert_ne!(
-            btree.read_free_list_head().unwrap(),
+            btree.pager.read_free_list_head().unwrap(),
             u64::MAX,
             "Expected free pages after removal"
         );
@@ -2337,7 +2309,7 @@ mod tests {
 
         btree.remove(root, 1).unwrap();
         assert_ne!(
-            btree.read_free_list_head().unwrap(),
+            btree.pager.read_free_list_head().unwrap(),
             u64::MAX,
             "Overflow pages should be freed on remove"
         );
@@ -2359,7 +2331,7 @@ mod tests {
 
         btree.insert(root, 1, b"small".to_vec()).unwrap();
         assert_ne!(
-            btree.read_free_list_head().unwrap(),
+            btree.pager.read_free_list_head().unwrap(),
             u64::MAX,
             "Old overflow pages should be freed on update"
         );
@@ -2395,7 +2367,7 @@ mod tests {
             for i in 0u64..200 {
                 btree.remove(root, i).unwrap();
             }
-            assert_ne!(btree.read_free_list_head().unwrap(), u64::MAX);
+            assert_ne!(btree.pager.read_free_list_head().unwrap(), u64::MAX);
         }
 
         {
@@ -2409,7 +2381,7 @@ mod tests {
             let pages_before = btree.pager.total_page_count();
 
             assert_ne!(
-                btree.read_free_list_head().unwrap(),
+                btree.pager.read_free_list_head().unwrap(),
                 u64::MAX,
                 "Free list lost after reopen"
             );
@@ -2756,7 +2728,7 @@ mod tests {
         let pages_before = btree.pager.total_page_count();
         btree.free_index_tree(root).unwrap();
 
-        assert_ne!(btree.read_free_list_head().unwrap(), u64::MAX);
+        assert_ne!(btree.pager.read_free_list_head().unwrap(), u64::MAX);
 
         let root2 = btree.init_index().unwrap();
         for i in 0u64..100 {

@@ -4,6 +4,7 @@ use std::io;
 use std::num::NonZeroUsize;
 
 use crate::page::AnyPage;
+use crate::types::FREE_LIST_PAGE_NUM;
 
 #[cfg(unix)]
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -97,6 +98,40 @@ impl<const N: usize> Pager<N> {
         let page_num = self.next_page_num;
         self.next_page_num += 1;
         page_num
+    }
+
+    /// Read free list head stored at page `FREE_LIST_PAGE_NUM`.
+    pub fn read_free_list_head(&mut self) -> io::Result<u64> {
+        let buf = self.read_raw_page(FREE_LIST_PAGE_NUM)?;
+        Ok(u64::from_le_bytes(buf[..8].try_into().unwrap()))
+    }
+
+    /// Write free list head to page `FREE_LIST_PAGE_NUM`.
+    pub fn write_free_list_head(&mut self, head: u64) -> io::Result<()> {
+        let mut buf = vec![0u8; 8];
+        buf[..8].copy_from_slice(&head.to_le_bytes());
+        self.write_raw_page(FREE_LIST_PAGE_NUM, &buf)
+    }
+
+    /// Allocate a page either from the free list or by growing the file.
+    pub fn alloc_page(&mut self) -> io::Result<u64> {
+        let head = self.read_free_list_head()?;
+        if head == u64::MAX {
+            return Ok(self.next_page_num());
+        }
+        let buf = self.read_raw_page(head)?;
+        let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        self.write_free_list_head(next)?;
+        Ok(head)
+    }
+
+    /// Add `page_num` to the head of the free list.
+    pub fn free_page(&mut self, page_num: u64) -> io::Result<()> {
+        let head = self.read_free_list_head()?;
+        let mut buf = vec![0u8; 8];
+        buf[..8].copy_from_slice(&head.to_le_bytes());
+        self.write_raw_page(page_num, &buf)?;
+        self.write_free_list_head(page_num)
     }
 
     pub fn total_page_count(&self) -> u64 {

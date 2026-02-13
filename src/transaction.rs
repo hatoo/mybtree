@@ -454,10 +454,10 @@ impl<'a, const N: usize> Transaction<'a, N> {
 
         if conflict {
             for page in current_op.deferred_init_trees {
-                inner.btree.free_page(page)?;
+                inner.btree.pager.free_page(page)?;
             }
             for page in current_op.deferred_init_indexes {
-                inner.btree.free_page(page)?;
+                inner.btree.pager.free_page(page)?;
             }
             return Err(TransactionError::Conflict);
         }
@@ -499,10 +499,10 @@ impl<'a, const N: usize> Drop for Transaction<'a, N> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.remove(&self.tx_id) {
             for page in op.deferred_init_trees {
-                let _ = inner.btree.free_page(page);
+                let _ = inner.btree.pager.free_page(page);
             }
             for page in op.deferred_init_indexes {
-                let _ = inner.btree.free_page(page);
+                let _ = inner.btree.pager.free_page(page);
             }
         }
     }
