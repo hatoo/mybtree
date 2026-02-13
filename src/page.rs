@@ -861,7 +861,6 @@ macro_rules! impl_bytes_keyed_page {
             }
 
             pub fn split(&mut self) -> Self {
-                self.compact();
                 let len = self.len();
                 let mid = len / 2;
                 let mut new_page = Self::new();
@@ -871,7 +870,6 @@ macro_rules! impl_bytes_keyed_page {
                     new_page.insert_raw_at(end, self.key(i), kl, v);
                 }
                 self.set_len(mid);
-                self.compact();
                 new_page
             }
         }
