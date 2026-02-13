@@ -1,15 +1,9 @@
 use lru::LruCache;
-use rkyv::{
-    api::high,
-    rancor::{Error, Source},
-    util::AlignedVec,
-};
 use std::collections::BTreeSet;
 use std::io;
 use std::num::NonZeroUsize;
 
-use crate::types::IndexNode;
-use crate::types::Node;
+use crate::page::AnyPage;
 
 #[cfg(unix)]
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -69,24 +63,22 @@ fn write_all_at(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> io::Re
 
 const DEFAULT_CACHE_CAPACITY: usize = 256;
 
-pub struct Pager {
-    page_size: usize,
+pub struct Pager<const N: usize> {
     file: std::fs::File,
     next_page_num: u64,
-    cache: LruCache<u64, Vec<u8>>,
+    cache: LruCache<u64, Box<AnyPage<N>>>,
     dirty: BTreeSet<u64>,
 }
 
-impl Pager {
-    pub fn new(file: std::fs::File, page_size: usize) -> Self {
-        Self::with_cache_capacity(file, page_size, DEFAULT_CACHE_CAPACITY)
+impl<const N: usize> Pager<N> {
+    pub fn new(file: std::fs::File) -> Self {
+        Self::with_cache_capacity(file, DEFAULT_CACHE_CAPACITY)
     }
 
-    pub fn with_cache_capacity(file: std::fs::File, page_size: usize, capacity: usize) -> Self {
+    pub fn with_cache_capacity(file: std::fs::File, capacity: usize) -> Self {
         let file_size = file.metadata().unwrap().len();
-        let next_page_num = file_size / page_size as u64;
+        let next_page_num = file_size / N as u64;
         Pager {
-            page_size,
             file,
             next_page_num,
             cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
@@ -94,19 +86,11 @@ impl Pager {
         }
     }
 
-    pub fn init(&mut self) -> Result<(), Error> {
-        self.file.set_len(0).map_err(Error::new)?;
+    pub fn init(&mut self) -> io::Result<()> {
+        self.file.set_len(0)?;
         self.cache.clear();
         self.dirty.clear();
         Ok(())
-    }
-
-    pub fn page_size(&self) -> usize {
-        self.page_size
-    }
-
-    pub fn page_content_size(&self) -> usize {
-        self.page_size - 2
     }
 
     pub fn next_page_num(&mut self) -> u64 {
@@ -119,27 +103,13 @@ impl Pager {
         self.next_page_num
     }
 
-    fn from_page_slice(page_size: usize, buffer: &[u8]) -> &[u8] {
-        let content_size = page_size - 2;
-        let len =
-            u16::from_le_bytes([buffer[content_size], buffer[content_size + 1]]) as usize;
-        &buffer[..len]
-    }
-
-    fn to_page(&self, buffer: &mut AlignedVec<16>) {
-        assert!(buffer.len() <= self.page_content_size());
-        let len = buffer.len() as u16;
-        buffer.resize(self.page_size, 0);
-        buffer[self.page_content_size()..self.page_size].copy_from_slice(&len.to_le_bytes());
-    }
-
     /// Write an evicted dirty page to disk.
-    fn flush_page(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
-        write_all_at(&self.file, data, page_num * self.page_size as u64)
+    fn flush_page(&self, page_num: u64, data: &AnyPage<N>) -> io::Result<()> {
+        write_all_at(&self.file, &data.page, page_num * N as u64)
     }
 
     /// Insert a page into the cache, flushing any evicted dirty page to disk.
-    fn cache_put(&mut self, page_num: u64, data: Vec<u8>) -> io::Result<()> {
+    fn cache_put(&mut self, page_num: u64, data: Box<AnyPage<N>>) -> io::Result<()> {
         if let Some((evicted_page, evicted_data)) = self.cache.push(page_num, data) {
             if self.dirty.remove(&evicted_page) {
                 self.flush_page(evicted_page, &evicted_data)?;
@@ -149,18 +119,23 @@ impl Pager {
     }
 
     /// Read a page from cache, loading from disk on miss.
-    fn cache_read(&mut self, page_num: u64) -> io::Result<&Vec<u8>> {
+    fn cache_read(&mut self, page_num: u64) -> io::Result<&AnyPage<N>> {
         if self.cache.contains(&page_num) {
             return Ok(self.cache.get(&page_num).unwrap());
         }
-        let mut buf = vec![0u8; self.page_size];
-        read_exact_at(&self.file, &mut buf, page_num * self.page_size as u64)?;
-        self.cache_put(page_num, buf)?;
+        let mut buf = vec![0u8; N];
+        read_exact_at(&self.file, &mut buf, page_num * N as u64)?;
+        self.cache_put(
+            page_num,
+            Box::new(AnyPage {
+                page: buf.try_into().unwrap(),
+            }),
+        )?;
         Ok(self.cache.get(&page_num).unwrap())
     }
 
     /// Write a page into the cache and mark it dirty.
-    fn cache_write(&mut self, page_num: u64, data: Vec<u8>) -> io::Result<()> {
+    fn cache_write(&mut self, page_num: u64, data: Box<AnyPage<N>>) -> io::Result<()> {
         self.cache_put(page_num, data)?;
         self.dirty.insert(page_num);
         Ok(())
@@ -171,86 +146,67 @@ impl Pager {
         let dirty_pages = std::mem::take(&mut self.dirty);
         for page_num in dirty_pages {
             if let Some(data) = self.cache.peek(&page_num) {
-                self.flush_page(page_num, &data.clone())?;
+                self.flush_page(page_num, data)?;
             }
         }
         self.file.sync_all()
     }
 
-    pub fn read_node<T>(
-        &mut self,
-        page_num: u64,
-        f: impl FnOnce(&rkyv::Archived<Node>) -> T,
-    ) -> Result<T, Error> {
-        let page_size = self.page_size;
-        let data = self.cache_read(page_num).map_err(Error::new)?;
-        let buffer = Self::from_page_slice(page_size, data);
-        let archived = high::access::<rkyv::Archived<Node>, Error>(buffer)?;
-        Ok(f(archived))
+    pub fn read_node(&mut self, page_num: u64) -> io::Result<&AnyPage<N>> {
+        let data = self.cache_read(page_num)?;
+        Ok(data)
     }
 
-    pub fn owned_node(&mut self, page_num: u64) -> Result<Node, Error> {
-        let page_size = self.page_size;
-        let data = self.cache_read(page_num).map_err(Error::new)?;
-        let buffer = Self::from_page_slice(page_size, data);
-        let archived = rkyv::access::<rkyv::Archived<Node>, Error>(buffer)?;
-        let node: Node = rkyv::deserialize(archived)?;
-        Ok(node)
-    }
-
-    pub fn write_buffer(&mut self, page_num: u64, mut buffer: AlignedVec<16>) -> Result<(), Error> {
-        self.to_page(&mut buffer);
-        self.cache_write(page_num, buffer.to_vec())
-            .map_err(Error::new)?;
-        Ok(())
-    }
-
-    pub fn write_node(&mut self, page_num: u64, node: &Node) -> Result<(), Error> {
-        let buffer = rkyv::to_bytes(node)?;
-        self.write_buffer(page_num, buffer)
-    }
-
-    pub fn read_index_node<T>(
-        &mut self,
-        page_num: u64,
-        f: impl FnOnce(&rkyv::Archived<IndexNode>) -> T,
-    ) -> Result<T, Error> {
-        let page_size = self.page_size;
-        let data = self.cache_read(page_num).map_err(Error::new)?;
-        let buffer = Self::from_page_slice(page_size, data);
-        let archived = high::access::<rkyv::Archived<IndexNode>, Error>(buffer)?;
-        Ok(f(archived))
-    }
-
-    pub fn owned_index_node(&mut self, page_num: u64) -> Result<IndexNode, Error> {
-        let page_size = self.page_size;
-        let data = self.cache_read(page_num).map_err(Error::new)?;
-        let buffer = Self::from_page_slice(page_size, data);
-        let archived = rkyv::access::<rkyv::Archived<IndexNode>, Error>(buffer)?;
-        let node: IndexNode = rkyv::deserialize(archived)?;
-        Ok(node)
-    }
-
-    pub fn write_index_node(&mut self, page_num: u64, node: &IndexNode) -> Result<(), Error> {
-        let buffer = rkyv::to_bytes(node)?;
-        self.write_buffer(page_num, buffer)
-    }
-
-    pub fn write_raw_page(&mut self, page_num: u64, data: &[u8]) -> Result<(), Error> {
-        assert!(data.len() <= self.page_size);
-        let mut page = vec![0u8; self.page_size];
-        page[..data.len()].copy_from_slice(data);
-        self.cache_write(page_num, page).map_err(Error::new)?;
-        Ok(())
-    }
-
-    pub fn read_raw_page(&mut self, page_num: u64) -> Result<Vec<u8>, Error> {
-        let data = self.cache_read(page_num).map_err(Error::new)?;
+    pub fn owned_node(&mut self, page_num: u64) -> io::Result<AnyPage<N>> {
+        let data = self.cache_read(page_num)?;
         Ok(data.clone())
+    }
+
+    pub fn write_node(&mut self, page_num: u64, node: AnyPage<N>) -> io::Result<()> {
+        self.cache_write(page_num, Box::new(node))?;
+        Ok(())
+    }
+
+    pub fn mut_node(&mut self, page_num: u64) -> io::Result<&mut AnyPage<N>> {
+        self.dirty.insert(page_num);
+        if self.cache.contains(&page_num) {
+            Ok(self.cache.get_mut(&page_num).unwrap())
+        } else {
+            let mut buf = vec![0u8; N];
+
+            let _ = read_exact_at(&self.file, &mut buf, page_num * N as u64);
+            self.cache_put(
+                page_num,
+                Box::new(AnyPage {
+                    page: buf.try_into().unwrap(),
+                }),
+            )?;
+            Ok(self.cache.get_mut(&page_num).unwrap())
+        }
+    }
+
+    /// Read raw bytes from a page. Returns a reference to the page's raw data.
+    pub fn read_raw_page(&mut self, page_num: u64) -> io::Result<&[u8; N]> {
+        let data = self.cache_read(page_num)?;
+        Ok(&data.page)
+    }
+
+    /// Write raw bytes to a page. The slice is padded with zeros to fill the page.
+    pub fn write_raw_page(&mut self, page_num: u64, data: &[u8]) -> io::Result<()> {
+        let mut page = AnyPage { page: [0u8; N] };
+        let len = data.len().min(N);
+        page.page[..len].copy_from_slice(&data[..len]);
+        self.cache_write(page_num, Box::new(page))?;
+        Ok(())
+    }
+
+    /// Return the page size in bytes.
+    pub fn page_size(&self) -> usize {
+        N
     }
 }
 
-impl Drop for Pager {
+impl<const N: usize> Drop for Pager<N> {
     fn drop(&mut self) {
         let _ = self.flush();
     }

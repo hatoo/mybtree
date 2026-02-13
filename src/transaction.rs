@@ -4,28 +4,30 @@ use std::{
     sync::Mutex,
 };
 
-use rkyv::rancor::{Error, Source, fail};
-
-use crate::{Btree, Key, NodePtr, Value};
+use crate::{Btree, Key, NodePtr, tree::TreeError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransactionError {
     #[error("Transaction conflict detected")]
     Conflict,
+    #[error("Tree error: {0}")]
+    TreeError(#[from] TreeError),
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
 }
 
-struct TransactionStoreInner {
-    btree: Btree,
+struct TransactionStoreInner<const N: usize> {
+    btree: Btree<N>,
     next_tx_id: usize,
     active_transactions: BTreeMap<usize, Operation>,
 }
 
-pub struct TransactionStore {
-    inner: Mutex<TransactionStoreInner>,
+pub struct TransactionStore<const N: usize> {
+    inner: Mutex<TransactionStoreInner<N>>,
 }
 
-pub struct Transaction<'a> {
-    store: &'a Mutex<TransactionStoreInner>,
+pub struct Transaction<'a, const N: usize> {
+    store: &'a Mutex<TransactionStoreInner<N>>,
     tx_id: usize,
 }
 
@@ -113,8 +115,8 @@ impl Operation {
     }
 }
 
-impl TransactionStore {
-    pub fn new(btree: Btree) -> Self {
+impl<const N: usize> TransactionStore<N> {
+    pub fn new(btree: Btree<N>) -> Self {
         TransactionStore {
             inner: Mutex::new(TransactionStoreInner {
                 btree,
@@ -124,7 +126,7 @@ impl TransactionStore {
         }
     }
 
-    pub fn begin_transaction(&self) -> Transaction<'_> {
+    pub fn begin_transaction(&self) -> Transaction<'_, N> {
         let mut inner = self.inner.lock().unwrap();
         let tx_id = inner.next_tx_id;
         inner.next_tx_id = inner.next_tx_id.wrapping_add(1);
@@ -156,8 +158,8 @@ impl TransactionStore {
     }
 }
 
-impl<'a> Transaction<'a> {
-    pub fn read(&self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, Error> {
+impl<'a, const N: usize> Transaction<'a, N> {
+    pub fn read(&self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, TreeError> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             op.reads.insert((root, key));
@@ -165,7 +167,9 @@ impl<'a> Transaction<'a> {
                 return Ok(value.clone());
             }
         }
-        let value = inner.btree.read(root, key, |f| f.map(|v| v.to_vec()))?;
+        let value = inner
+            .btree
+            .read(root, key, |f: Option<&[u8]>| f.map(|v| v.to_vec()))?;
         Ok(value)
     }
 
@@ -183,7 +187,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn insert(&self, root: NodePtr, value: Vec<u8>) -> Result<Key, Error> {
+    pub fn insert(&self, root: NodePtr, value: Vec<u8>) -> Result<Key, TreeError> {
         let mut inner = self.store.lock().unwrap();
         let mut key = inner.btree.available_key(root)?;
 
@@ -213,7 +217,7 @@ impl<'a> Transaction<'a> {
         &self,
         root: NodePtr,
         range: impl RangeBounds<Key>,
-    ) -> Result<Vec<(Key, Vec<u8>)>, Error> {
+    ) -> Result<Vec<(Key, Vec<u8>)>, TreeError> {
         let mut inner = self.store.lock().unwrap();
 
         let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
@@ -222,7 +226,7 @@ impl<'a> Transaction<'a> {
         let mut results: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
         inner
             .btree
-            .read_range(root, range_bound.clone(), |key, value| {
+            .read_range(root, range_bound.clone(), |key, value: &[u8]| {
                 results.insert(key, value.to_vec());
             })?;
 
@@ -250,7 +254,11 @@ impl<'a> Transaction<'a> {
         Ok(results.into_iter().collect())
     }
 
-    pub fn remove_range(&self, root: NodePtr, range: impl RangeBounds<Key>) -> Result<(), Error> {
+    pub fn remove_range(
+        &self,
+        root: NodePtr,
+        range: impl RangeBounds<Key>,
+    ) -> Result<(), TreeError> {
         let mut inner = self.store.lock().unwrap();
 
         let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
@@ -259,7 +267,7 @@ impl<'a> Transaction<'a> {
         let mut keys_to_remove: Vec<Key> = Vec::new();
         inner
             .btree
-            .read_range(root, range_bound.clone(), |key, _| {
+            .read_range(root, range_bound.clone(), |key, _: &[u8]| {
                 keys_to_remove.push(key);
             })?;
 
@@ -290,7 +298,7 @@ impl<'a> Transaction<'a> {
 
     // ── Structural operations ──────────────────────────────────────
 
-    pub fn init_tree(&self) -> Result<NodePtr, Error> {
+    pub fn init_tree(&self) -> Result<NodePtr, TreeError> {
         let mut inner = self.store.lock().unwrap();
         let page = inner.btree.init_tree()?;
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
@@ -299,7 +307,7 @@ impl<'a> Transaction<'a> {
         Ok(page)
     }
 
-    pub fn init_index(&self) -> Result<NodePtr, Error> {
+    pub fn init_index(&self) -> Result<NodePtr, TreeError> {
         let mut inner = self.store.lock().unwrap();
         let page = inner.btree.init_index()?;
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
@@ -308,7 +316,7 @@ impl<'a> Transaction<'a> {
         Ok(page)
     }
 
-    pub fn free_tree(&self, root: NodePtr) -> Result<(), Error> {
+    pub fn free_tree(&self, root: NodePtr) -> Result<(), TreeError> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             op.deferred_free_trees.push(root);
@@ -316,7 +324,7 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    pub fn free_index_tree(&self, root: NodePtr) -> Result<(), Error> {
+    pub fn free_index_tree(&self, root: NodePtr) -> Result<(), TreeError> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             op.deferred_free_index_trees.push(root);
@@ -326,7 +334,12 @@ impl<'a> Transaction<'a> {
 
     // ── Index tree operations (deferred, with local overlay) ────────
 
-    pub fn index_insert(&self, idx_root: NodePtr, key: Key, value: Vec<u8>) -> Result<bool, Error> {
+    pub fn index_insert(
+        &self,
+        idx_root: NodePtr,
+        key: Key,
+        value: Vec<u8>,
+    ) -> Result<bool, TreeError> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             op.index_writes.insert((idx_root, value.clone()));
@@ -335,23 +348,23 @@ impl<'a> Transaction<'a> {
         Ok(true)
     }
 
-    pub fn index_remove(&self, idx_root: NodePtr, value: &Value, key: Key) -> Result<bool, Error> {
+    pub fn index_remove(
+        &self,
+        idx_root: NodePtr,
+        value: &[u8],
+        key: Key,
+    ) -> Result<bool, TreeError> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            if let Value::Inline(bytes) = value {
-                op.index_writes.insert((idx_root, bytes.clone()));
-                op.index_ops.insert((idx_root, bytes.clone(), key), false);
-            }
+            op.index_writes.insert((idx_root, value.to_vec()));
+            op.index_ops.insert((idx_root, value.to_vec(), key), false);
         }
         Ok(true)
     }
 
-    pub fn index_read(&self, idx_root: NodePtr, value: &Value) -> Result<Option<Key>, Error> {
+    pub fn index_read(&self, idx_root: NodePtr, value: &[u8]) -> Result<Option<Key>, TreeError> {
         let mut inner = self.store.lock().unwrap();
-        let value_bytes = match value {
-            Value::Inline(bytes) => bytes.clone(),
-            _ => return inner.btree.index_read(idx_root, value, |k| k),
-        };
+        let value_bytes = value.to_vec();
 
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
             op.index_reads.insert((idx_root, value_bytes.clone()));
@@ -385,7 +398,7 @@ impl<'a> Transaction<'a> {
         &self,
         idx_root: NodePtr,
         range: R,
-    ) -> Result<Vec<Key>, Error> {
+    ) -> Result<Vec<Key>, TreeError> {
         let mut inner = self.store.lock().unwrap();
         let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
 
@@ -399,7 +412,7 @@ impl<'a> Transaction<'a> {
         inner.btree.index_read_range(
             idx_root,
             (range_bound.0.clone(), range_bound.1.clone()),
-            |v, k| {
+            |v: &[u8], k| {
                 btree_entries.push((v.to_vec(), k));
             },
         )?;
@@ -429,7 +442,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn commit(self) -> Result<(), Error> {
+    pub fn commit(self) -> Result<(), TransactionError> {
         let mut inner = self.store.lock().unwrap();
 
         let current_op = inner.active_transactions.remove(&self.tx_id).unwrap();
@@ -446,7 +459,7 @@ impl<'a> Transaction<'a> {
             for page in current_op.deferred_init_indexes {
                 inner.btree.free_page(page)?;
             }
-            fail!(TransactionError::Conflict);
+            return Err(TransactionError::Conflict);
         }
 
         // Apply node writes
@@ -463,8 +476,7 @@ impl<'a> Transaction<'a> {
             if is_insert {
                 inner.btree.index_insert(idx_root, key, value_bytes)?;
             } else {
-                let value = Value::Inline(value_bytes);
-                inner.btree.index_remove(idx_root, &value, key)?;
+                inner.btree.index_remove(idx_root, &value_bytes, key)?;
             }
         }
 
@@ -476,13 +488,13 @@ impl<'a> Transaction<'a> {
             inner.btree.free_index_tree(root)?;
         }
 
-        inner.btree.flush().map_err(Error::new)?;
+        inner.btree.flush()?;
 
         Ok(())
     }
 }
 
-impl<'a> Drop for Transaction<'a> {
+impl<'a, const N: usize> Drop for Transaction<'a, N> {
     fn drop(&mut self) {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.remove(&self.tx_id) {
@@ -503,7 +515,7 @@ mod tests {
     use std::fs;
     use tempfile::NamedTempFile;
 
-    fn setup_transaction_store() -> (TransactionStore, NodePtr, NamedTempFile) {
+    fn setup_transaction_store() -> (TransactionStore<4096>, NodePtr, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let file = fs::OpenOptions::new()
             .read(true)
@@ -511,7 +523,7 @@ mod tests {
             .open(temp_file.path())
             .unwrap();
 
-        let pager = Pager::new(file, 256);
+        let pager = Pager::<4096>::new(file);
         let mut btree = Btree::new(pager);
         btree.init().unwrap();
         let root = btree.init_tree().unwrap();

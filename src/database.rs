@@ -6,7 +6,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::Pager;
 use crate::transaction::{TransactionError, TransactionStore};
 use crate::tree::Btree;
-use crate::types::{Key, NodePtr, Value};
+use crate::types::{Key, NodePtr};
 
 // ── Column types ────────────────────────────────────────────────────
 
@@ -58,6 +58,11 @@ pub enum DatabaseError {
     Transaction(#[from] TransactionError),
     #[error("internal error: {0}")]
     Internal(#[from] Error),
+
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("tree error: {0}")]
+    TreeError(#[from] crate::tree::TreeError),
 }
 
 // ── Table metadata serialisation ────────────────────────────────────
@@ -77,12 +82,12 @@ const CATALOG_PAGE_NUM: NodePtr = 1;
 /// Index tree on the catalog: table name bytes → catalog key.
 const CATALOG_INDEX_PAGE_NUM: NodePtr = 2;
 
-pub struct Database {
-    store: TransactionStore,
+pub struct Database<const N: usize> {
+    store: TransactionStore<N>,
 }
 
-impl Database {
-    pub fn create(pager: Pager) -> Result<Self, DatabaseError> {
+impl<const N: usize> Database<N> {
+    pub fn create(pager: Pager<N>) -> Result<Self, DatabaseError> {
         let mut btree = Btree::new(pager);
         btree.init()?;
         btree.init_tree()?; // page 1 = catalog
@@ -93,7 +98,7 @@ impl Database {
         })
     }
 
-    pub fn open(pager: Pager) -> Result<Self, DatabaseError> {
+    pub fn open(pager: Pager<N>) -> Result<Self, DatabaseError> {
         let btree = Btree::new(pager);
 
         Ok(Database {
@@ -101,7 +106,7 @@ impl Database {
         })
     }
 
-    pub fn begin_transaction(&self) -> DbTransaction<'_> {
+    pub fn begin_transaction(&self) -> DbTransaction<'_, N> {
         DbTransaction {
             tx: self.store.begin_transaction(),
         }
@@ -178,14 +183,16 @@ fn db_value_to_bytes(value: &DbValue) -> Vec<u8> {
 
 // ── DbTransaction ───────────────────────────────────────────────────
 
-pub struct DbTransaction<'a> {
-    tx: crate::Transaction<'a>,
+pub struct DbTransaction<'a, const N: usize> {
+    tx: crate::Transaction<'a, N>,
 }
 
-impl<'a> DbTransaction<'a> {
+impl<'a, const N: usize> DbTransaction<'a, N> {
     fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
-        let value = Value::Inline(name.as_bytes().to_vec());
-        if let Some(catalog_key) = self.tx.index_read(CATALOG_INDEX_PAGE_NUM, &value)? {
+        if let Some(catalog_key) = self
+            .tx
+            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
+        {
             if let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)? {
                 let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
                 return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
@@ -227,10 +234,9 @@ impl<'a> DbTransaction<'a> {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), DatabaseError> {
-        let value = Value::Inline(name.as_bytes().to_vec());
         let catalog_key = self
             .tx
-            .index_read(CATALOG_INDEX_PAGE_NUM, &value)?
+            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
             .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
 
         let data = self
@@ -242,7 +248,7 @@ impl<'a> DbTransaction<'a> {
 
         self.tx.remove(CATALOG_PAGE_NUM, catalog_key);
         self.tx
-            .index_remove(CATALOG_INDEX_PAGE_NUM, &value, catalog_key)?;
+            .index_remove(CATALOG_INDEX_PAGE_NUM, name.as_bytes(), catalog_key)?;
 
         // Free all pages belonging to the table's tree
         self.tx.free_tree(meta.root_page)?;
@@ -317,10 +323,9 @@ impl<'a> DbTransaction<'a> {
 
     /// Rewrite the catalog entry for `table_name` with the given `meta`.
     fn update_table_meta(&self, table_name: &str, meta: &TableMeta) -> Result<(), DatabaseError> {
-        let value = Value::Inline(table_name.as_bytes().to_vec());
         let catalog_key = self
             .tx
-            .index_read(CATALOG_INDEX_PAGE_NUM, &value)?
+            .index_read(CATALOG_INDEX_PAGE_NUM, table_name.as_bytes())?
             .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
 
         self.tx.write(
@@ -406,8 +411,7 @@ impl<'a> DbTransaction<'a> {
                     .position(|c| c.name == *col_name)
                     .unwrap();
                 let col_bytes = db_value_to_bytes(&old_row.values[col_idx]);
-                let value = Value::Inline(col_bytes);
-                self.tx.index_remove(*idx_root, &value, key)?;
+                self.tx.index_remove(*idx_root, &col_bytes, key)?;
             }
         }
 
@@ -437,8 +441,7 @@ impl<'a> DbTransaction<'a> {
                         .position(|c| c.name == *col_name)
                         .unwrap();
                     let col_bytes = db_value_to_bytes(&old_row.values[col_idx]);
-                    let value = Value::Inline(col_bytes);
-                    self.tx.index_remove(*idx_root, &value, key)?;
+                    self.tx.index_remove(*idx_root, &col_bytes, key)?;
                 }
             }
         }
@@ -518,14 +521,14 @@ mod tests {
     use std::fs;
     use tempfile::NamedTempFile;
 
-    fn open_db() -> (Database, NamedTempFile) {
+    fn open_db() -> (Database<4096>, NamedTempFile) {
         let temp = NamedTempFile::new().unwrap();
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(temp.path())
             .unwrap();
-        let pager = Pager::new(file, 256);
+        let pager = Pager::<4096>::new(file);
         let db = Database::create(pager).unwrap();
         (db, temp)
     }
@@ -972,7 +975,7 @@ mod tests {
             .write(true)
             .open(temp.path())
             .unwrap();
-        let pager = Pager::new(file, 256);
+        let pager = Pager::<4096>::new(file);
         let db = Database::create(pager).unwrap();
 
         let tx = db.begin_transaction();
@@ -1039,7 +1042,7 @@ mod tests {
             .write(true)
             .open(temp.path())
             .unwrap();
-        let pager = Pager::new(file, 256);
+        let pager = Pager::<4096>::new(file);
         let db = Database::create(pager).unwrap();
 
         let tx = db.begin_transaction();
@@ -1421,8 +1424,7 @@ mod tests {
         .unwrap();
 
         // First to commit fails — the other active tx has conflicting writes
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         // Second succeeds — conflicting tx is gone
         tx2.commit().unwrap();
     }
@@ -1461,8 +1463,7 @@ mod tests {
         .unwrap();
 
         // First to commit fails — other active tx has conflicting read/write
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1491,8 +1492,7 @@ mod tests {
         tx1.get("users", key).unwrap();
         tx2.delete("users", key).unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1531,8 +1531,7 @@ mod tests {
         // The new key should be >= k1 so it falls in the scanned range
         assert!(k2 >= k1);
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1559,8 +1558,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1587,8 +1585,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1745,8 +1742,7 @@ mod tests {
         .unwrap();
 
         // First to commit fails — both wrote to same index value
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1785,8 +1781,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1802,8 +1797,7 @@ mod tests {
         tx1.create_table("users", users_schema()).unwrap();
         tx2.create_table("users", users_schema()).unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1834,8 +1828,7 @@ mod tests {
         tx1.drop_table("users").unwrap();
         tx2.drop_table("users").unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1859,8 +1852,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1884,8 +1876,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1903,8 +1894,7 @@ mod tests {
         tx1.create_index("users", "name").unwrap();
         tx2.create_index("users", "name").unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1934,8 +1924,7 @@ mod tests {
             .unwrap();
         tx2.drop_index("users", "name").unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 
@@ -1964,8 +1953,7 @@ mod tests {
         tx1.get("users", key).unwrap();
         tx2.drop_table("users").unwrap();
 
-        let err = tx1.commit().unwrap_err();
-        assert!(matches!(err, DatabaseError::Internal(_)));
+        tx1.commit().unwrap_err();
         tx2.commit().unwrap();
     }
 

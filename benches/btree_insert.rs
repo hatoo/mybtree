@@ -1,9 +1,9 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use mybtree::{Btree, Pager};
 
-fn setup() -> (Btree, u64) {
+fn setup() -> (Btree<4096>, u64) {
     let file = tempfile::tempfile().unwrap();
-    let pager = Pager::new(file, 4096);
+    let pager = Pager::new(file);
     let mut btree = Btree::new(pager);
     btree.init().unwrap();
     let root = btree.init_tree().unwrap();
