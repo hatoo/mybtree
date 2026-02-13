@@ -133,22 +133,23 @@ impl<const N: usize> Btree<N> {
                         }
                         None => {
                             // Key is beyond all entries
-                            let mut internal: InternalPage<N> = internal.clone();
                             if internal.len() == 0 {
                                 let new_leaf_page = self.alloc_page()?;
+                                let internal: &mut InternalPage<N> =
+                                    self.pager.mut_node(current)?.try_into().unwrap();
+                                internal.insert(key, new_leaf_page);
                                 let mut new_leaf = LeafPage::<N>::new();
                                 self.leaf_insert_entry(&mut new_leaf, key, &value)?;
                                 self.pager.write_node(new_leaf_page, new_leaf.into())?;
-                                internal.insert(key, new_leaf_page);
-                                self.pager.write_node(current, internal.into())?;
                                 return Ok(None);
                             } else {
+                                let internal: &mut InternalPage<N> =
+                                    self.pager.mut_node(current)?.try_into().unwrap();
                                 let last_idx = internal.len() - 1;
                                 let next = internal.ptr(last_idx);
                                 // Update the last key to accommodate the new key
                                 internal.remove(last_idx);
                                 internal.insert(key, next);
-                                self.pager.write_node(current, internal.into())?;
                                 current = next;
                             }
                         }
