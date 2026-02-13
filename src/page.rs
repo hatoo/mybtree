@@ -650,7 +650,6 @@ impl<const N: usize> LeafPage<N> {
     }
 
     pub fn split(&mut self) -> Self {
-        self.compact();
         let len = self.len();
         let mid = len / 2;
         let mut new_page = Self::new();
@@ -659,7 +658,6 @@ impl<const N: usize> LeafPage<N> {
             new_page.insert_raw(self.key(i), self.value(i), vl);
         }
         self.set_len(mid);
-        self.compact();
         new_page
     }
 }
