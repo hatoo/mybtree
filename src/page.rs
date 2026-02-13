@@ -464,7 +464,7 @@ impl<const N: usize> LeafPage<N> {
     }
 
     pub fn needs_overflow(value_len: usize) -> bool {
-        value_len > (N - Self::HEADER_SIZE) / 2
+        Self::SLOT_SIZE + value_len > (N - Self::HEADER_SIZE) / 2
     }
 
     pub fn key(&self, index: usize) -> Key {
