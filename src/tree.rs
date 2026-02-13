@@ -278,34 +278,46 @@ impl<const N: usize> Btree<N> {
             }
 
             let parent_ptr = parents[depth - 1];
-            let mut parent: InternalPage<N> =
-                self.pager.owned_node(parent_ptr)?.try_into().unwrap();
 
-            // Find and update the entry for left_page
-            let mut found_idx = None;
-            for i in 0..parent.len() {
-                if parent.ptr(i) == cur_left_page {
-                    found_idx = Some(i);
-                    break;
+            // Read parent to find entry index, old key, and can_insert
+            let (i, old_key, can_insert) = {
+                let parent_ref: &InternalPage<N> =
+                    self.pager.read_node(parent_ptr)?.try_into().unwrap();
+                let mut found_idx = None;
+                for j in 0..parent_ref.len() {
+                    if parent_ref.ptr(j) == cur_left_page {
+                        found_idx = Some(j);
+                        break;
+                    }
                 }
-            }
-            let i = found_idx.expect("left_page not found in parent during split propagation");
-            let old_key = parent.key(i);
+                let i =
+                    found_idx.expect("left_page not found in parent during split propagation");
+                // can_insert after removing one and inserting two (net +1)
+                let can_insert = (parent_ref.len() + 1) * INTERNAL_ELEMENT_SIZE
+                    + INTERNAL_HEADER_SIZE
+                    <= N;
+                (i, parent_ref.key(i), can_insert)
+            };
             let right_max_key = old_key;
-            parent.remove(i);
-            parent.insert(cur_left_max_key, cur_left_page);
 
-            if parent.can_insert() {
+            // Mutate parent: remove old entry, insert left entry
+            {
+                let p = self.pager.mut_node(parent_ptr)?;
+                let parent: &mut InternalPage<N> = p.try_into().unwrap();
+                parent.remove(i);
+                parent.insert(cur_left_max_key, cur_left_page);
+            }
+
+            if can_insert {
+                // Fast path: insert right entry and done
+                let p = self.pager.mut_node(parent_ptr)?;
+                let parent: &mut InternalPage<N> = p.try_into().unwrap();
                 parent.insert(right_max_key, cur_right_page);
-                self.pager.write_node(parent_ptr, parent.into())?;
                 return Ok(());
             }
 
             // Need to split the parent too
-            // First write the updated parent, then split it
-            self.pager.write_node(parent_ptr, parent.into())?;
-
-            // Re-read and split
+            // Parent is already dirty in cache — owned_node gets it from cache
             let mut internal: InternalPage<N> =
                 self.pager.owned_node(parent_ptr)?.try_into().unwrap();
             let mut right = internal.split();
@@ -345,7 +357,7 @@ impl<const N: usize> Btree<N> {
 
             match page.page_type() {
                 PageType::Leaf => {
-                    let mut leaf: LeafPage<N> = page.try_into().unwrap();
+                    let leaf: LeafPage<N> = page.try_into().unwrap();
                     match leaf.search_key(key) {
                         Ok(index) => {
                             let old_bytes = self.read_leaf_value(&leaf, index)?;
@@ -354,8 +366,12 @@ impl<const N: usize> Btree<N> {
                             } else {
                                 None
                             };
-                            leaf.remove(index);
-                            self.merge_leaf(&path, leaf)?;
+                            {
+                                let p = self.pager.mut_node(current)?;
+                                let leaf_mut: &mut LeafPage<N> = p.try_into().unwrap();
+                                leaf_mut.remove(index);
+                            }
+                            self.merge_leaf(&path)?;
                             if let Some((start_page, total_len)) = overflow_meta {
                                 self.free_overflow_pages(start_page, total_len)?;
                             }
@@ -426,22 +442,31 @@ impl<const N: usize> Btree<N> {
         }
 
         for leaf_ptr in leaves_to_process {
-            let page = self.pager.owned_node(leaf_ptr)?;
-            let mut leaf: LeafPage<N> = page.try_into().unwrap();
-            let mut overflow_metas = vec![];
-            let mut indices_to_remove = vec![];
-            for i in 0..leaf.len() {
-                if range.contains(&leaf.key(i)) {
-                    if leaf.is_overflow(i) {
-                        overflow_metas.push(Self::parse_overflow_meta(leaf.value(i)));
+            let (overflow_metas, indices_to_remove) = {
+                let page = self.pager.read_node(leaf_ptr)?;
+                let leaf: &LeafPage<N> = page.try_into().unwrap();
+                let mut overflow_metas = vec![];
+                let mut indices_to_remove = vec![];
+                for i in 0..leaf.len() {
+                    if range.contains(&leaf.key(i)) {
+                        if leaf.is_overflow(i) {
+                            overflow_metas.push(Self::parse_overflow_meta(leaf.value(i)));
+                        }
+                        indices_to_remove.push(i);
                     }
-                    indices_to_remove.push(i);
                 }
+                (overflow_metas, indices_to_remove)
+            };
+            if !indices_to_remove.is_empty() {
+                {
+                    let p = self.pager.mut_node(leaf_ptr)?;
+                    let leaf_mut: &mut LeafPage<N> = p.try_into().unwrap();
+                    for &i in indices_to_remove.iter().rev() {
+                        leaf_mut.remove(i);
+                    }
+                }
+                self.merge_leaf(&[leaf_ptr])?;
             }
-            for &i in indices_to_remove.iter().rev() {
-                leaf.remove(i);
-            }
-            self.merge_leaf(&[leaf_ptr], leaf)?;
             for (start_page, total_len) in overflow_metas {
                 self.free_overflow_pages(start_page, total_len)?;
             }
@@ -450,100 +475,141 @@ impl<const N: usize> Btree<N> {
         Ok(())
     }
 
-    /// Write a leaf page back, attempting to merge with left sibling if underfull.
-    fn merge_leaf(&mut self, path: &[NodePtr], leaf: LeafPage<N>) -> Result<(), TreeError> {
+    /// Check and merge leaf page if underfull.
+    /// The page at `path.last()` must already be dirty in the pager cache.
+    fn merge_leaf(&mut self, path: &[NodePtr]) -> Result<(), TreeError> {
         let page = *path.last().unwrap();
 
-        // If at root or leaf is at least half full, just write it
-        if path.len() <= 1 || leaf.free_space() <= N / 2 {
-            self.pager.write_node(page, leaf.into())?;
+        let (free_space, len) = {
+            let leaf_ref: &LeafPage<N> = self.pager.read_node(page)?.try_into().unwrap();
+            (leaf_ref.free_space(), leaf_ref.len())
+        };
+
+        // If at root or leaf is at least half full, already dirty — done
+        if path.len() <= 1 || free_space <= N / 2 {
             return Ok(());
         }
 
         // Handle empty leaf: remove from parent
-        if leaf.len() == 0 {
+        if len == 0 {
             let parents = &path[..path.len() - 1];
             let parent_page = *parents.last().unwrap();
-            let mut parent: InternalPage<N> =
-                self.pager.owned_node(parent_page)?.try_into().unwrap();
-            for i in 0..parent.len() {
-                if parent.ptr(i) == page {
-                    parent.remove(i);
-                    break;
+            {
+                let p = self.pager.mut_node(parent_page)?;
+                let parent: &mut InternalPage<N> = p.try_into().unwrap();
+                for i in 0..parent.len() {
+                    if parent.ptr(i) == page {
+                        parent.remove(i);
+                        break;
+                    }
                 }
             }
             self.free_page(page)?;
-            return self.merge_internal_iterative(parents, parent);
+            return self.merge_internal_iterative(parents);
         }
 
         let parents = &path[..path.len() - 1];
-        if !self.try_merge_leaf_with_left_sibling(page, &leaf, parents)? {
-            self.pager.write_node(page, leaf.into())?;
-        }
+        self.try_merge_leaf_with_left_sibling(page, parents)?;
         Ok(())
     }
 
     fn try_merge_leaf_with_left_sibling(
         &mut self,
         page: NodePtr,
-        right_leaf: &LeafPage<N>,
         parents: &[NodePtr],
     ) -> Result<bool, TreeError> {
         let parent_page = *parents.last().unwrap();
-        let parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
-        let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
-        if index == 0 {
-            return Ok(false);
-        }
-
-        let left_sibling_page = parent.ptr(index - 1);
-        let left_leaf: LeafPage<N> = self
-            .pager
-            .owned_node(left_sibling_page)?
-            .try_into()
-            .unwrap();
-
-        // Check if all entries from right can fit into left
-        let mut merged = left_leaf.clone();
-        for i in 0..right_leaf.len() {
-            let (_, _, vl) = right_leaf.read_slot(i);
-            let value_data = right_leaf.value(i);
-            let inline_size = value_data.len();
-            if merged.free_space() < LEAF_SLOT_SIZE + inline_size {
+        let (index, left_sibling_page) = {
+            let parent_ref: &InternalPage<N> =
+                self.pager.read_node(parent_page)?.try_into().unwrap();
+            let index = (0..parent_ref.len())
+                .find(|&i| parent_ref.ptr(i) == page)
+                .unwrap();
+            if index == 0 {
                 return Ok(false);
             }
-            merged.insert_raw(right_leaf.key(i), value_data, vl);
+            (index, parent_ref.ptr(index - 1))
+        };
+
+        // Read right leaf entries
+        let right_entries = {
+            let right_ref: &LeafPage<N> = self.pager.read_node(page)?.try_into().unwrap();
+            (0..right_ref.len())
+                .map(|i| {
+                    let (_, _, vl) = right_ref.read_slot(i);
+                    (right_ref.key(i), right_ref.value(i).to_vec(), vl)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Check if merge is feasible using left leaf
+        {
+            let left_ref: &LeafPage<N> =
+                self.pager.read_node(left_sibling_page)?.try_into().unwrap();
+            let mut free = left_ref.free_space();
+            for (_, value_data, _) in &right_entries {
+                let inline_size = value_data.len();
+                if free < LEAF_SLOT_SIZE + inline_size {
+                    return Ok(false);
+                }
+                free -= LEAF_SLOT_SIZE + inline_size;
+            }
         }
 
-        // Merge succeeded — write merged to current page, free left sibling
-        self.pager.write_node(page, merged.into())?;
-        let mut parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
-        parent.remove(index - 1);
+        // Read left entries for merging into the right page
+        let left_entries = {
+            let left_ref: &LeafPage<N> =
+                self.pager.read_node(left_sibling_page)?.try_into().unwrap();
+            (0..left_ref.len())
+                .map(|i| {
+                    let (_, _, vl) = left_ref.read_slot(i);
+                    (left_ref.key(i), left_ref.value(i).to_vec(), vl)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Merge: insert left entries into the right page (at `page`)
+        {
+            let p = self.pager.mut_node(page)?;
+            let merged: &mut LeafPage<N> = p.try_into().unwrap();
+            for (k, v, vl) in &left_entries {
+                merged.insert_raw(*k, v, *vl);
+            }
+        }
+
+        // Remove left sibling entry from parent
+        {
+            let p = self.pager.mut_node(parent_page)?;
+            let parent: &mut InternalPage<N> = p.try_into().unwrap();
+            parent.remove(index - 1);
+        }
         self.free_page(left_sibling_page)?;
-        self.merge_internal_iterative(parents, parent)?;
+        self.merge_internal_iterative(parents)?;
         Ok(true)
     }
 
-    /// Write an internal page back, attempting to merge if underfull. Iterative.
-    fn merge_internal_iterative(
-        &mut self,
-        path: &[NodePtr],
-        internal: InternalPage<N>,
-    ) -> Result<(), TreeError> {
+    /// Check and merge internal pages if underfull. Iterative.
+    /// The page at `path.last()` must already be dirty in the pager cache.
+    fn merge_internal_iterative(&mut self, path: &[NodePtr]) -> Result<(), TreeError> {
         let mut cur_path = path;
-        let mut cur_internal = internal;
 
         loop {
             let page = *cur_path.last().unwrap();
 
-            let used = INTERNAL_HEADER_SIZE + cur_internal.len() * INTERNAL_ELEMENT_SIZE;
+            let (len, used) = {
+                let node_ref: &InternalPage<N> =
+                    self.pager.read_node(page)?.try_into().unwrap();
+                let len = node_ref.len();
+                (len, INTERNAL_HEADER_SIZE + len * INTERNAL_ELEMENT_SIZE)
+            };
+
             if cur_path.len() <= 1 || used >= N / 2 {
-                self.pager.write_node(page, cur_internal.into())?;
+                // Already dirty from caller, nothing more to do
                 return Ok(());
             }
 
-            if cur_internal.len() == 0 {
+            if len == 0 {
                 if cur_path.len() <= 1 {
                     let leaf = LeafPage::<N>::new();
                     self.pager.write_node(page, leaf.into())?;
@@ -551,75 +617,99 @@ impl<const N: usize> Btree<N> {
                 }
                 let parents = &cur_path[..cur_path.len() - 1];
                 let parent_page = *parents.last().unwrap();
-                let mut parent: InternalPage<N> =
-                    self.pager.owned_node(parent_page)?.try_into().unwrap();
-                for i in 0..parent.len() {
-                    if parent.ptr(i) == page {
-                        parent.remove(i);
-                        break;
+                {
+                    let p = self.pager.mut_node(parent_page)?;
+                    let parent: &mut InternalPage<N> = p.try_into().unwrap();
+                    for i in 0..parent.len() {
+                        if parent.ptr(i) == page {
+                            parent.remove(i);
+                            break;
+                        }
                     }
                 }
                 self.free_page(page)?;
                 cur_path = parents;
-                cur_internal = parent;
                 continue;
             }
 
             let parents = &cur_path[..cur_path.len() - 1];
-            match self.try_merge_internal_with_left_sibling(page, &cur_internal, parents)? {
-                Some(updated_parent) => {
-                    // Merge succeeded; continue loop to propagate upward
-                    cur_path = parents;
-                    cur_internal = updated_parent;
-                    continue;
-                }
-                None => {
-                    self.pager.write_node(page, cur_internal.into())?;
-                    return Ok(());
-                }
+            if self.try_merge_internal_with_left_sibling(page, parents)? {
+                // Merge succeeded; parent was modified via mut_node, continue up
+                cur_path = parents;
+                continue;
+            } else {
+                // Already dirty from caller
+                return Ok(());
             }
         }
     }
 
     /// Try to merge `right_internal` (at `page`) with its left sibling in the parent.
-    /// Returns `Some(updated_parent)` if merge succeeded, `None` otherwise.
+    /// Returns `true` if merge succeeded, `false` otherwise.
+    /// On success, the merged page is written to `page`, left sibling is freed,
+    /// and parent entry is removed via `mut_node`.
     fn try_merge_internal_with_left_sibling(
         &mut self,
         page: NodePtr,
-        right_internal: &InternalPage<N>,
         parents: &[NodePtr],
-    ) -> Result<Option<InternalPage<N>>, TreeError> {
+    ) -> Result<bool, TreeError> {
         let parent_page = *parents.last().unwrap();
-        let parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
-        let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
-        if index == 0 {
-            return Ok(None);
-        }
+        // Read parent and right page to determine merge feasibility
+        let (index, left_sibling_page) = {
+            let parent_ref: &InternalPage<N> =
+                self.pager.read_node(parent_page)?.try_into().unwrap();
+            let index = (0..parent_ref.len())
+                .find(|&i| parent_ref.ptr(i) == page)
+                .unwrap();
+            if index == 0 {
+                return Ok(false);
+            }
+            (index, parent_ref.ptr(index - 1))
+        };
 
-        let left_sibling_page = parent.ptr(index - 1);
-        let left_internal: InternalPage<N> = self
-            .pager
-            .owned_node(left_sibling_page)?
-            .try_into()
-            .unwrap();
+        let right_len = {
+            let right_ref: &InternalPage<N> = self.pager.read_node(page)?.try_into().unwrap();
+            right_ref.len()
+        };
 
-        let total_entries = left_internal.len() + right_internal.len();
+        let left_len = {
+            let left_ref: &InternalPage<N> =
+                self.pager.read_node(left_sibling_page)?.try_into().unwrap();
+            left_ref.len()
+        };
+
+        let total_entries = left_len + right_len;
         let total_used = INTERNAL_HEADER_SIZE + total_entries * INTERNAL_ELEMENT_SIZE;
         if total_used > N {
-            return Ok(None);
+            return Ok(false);
         }
 
-        let mut merged = left_internal.clone();
-        for i in 0..right_internal.len() {
-            merged.insert(right_internal.key(i), right_internal.ptr(i));
+        // Merge: copy left entries into right page (which keeps its position)
+        let left_entries = {
+            let left_ref: &InternalPage<N> =
+                self.pager.read_node(left_sibling_page)?.try_into().unwrap();
+            (0..left_ref.len())
+                .map(|i| (left_ref.key(i), left_ref.ptr(i)))
+                .collect::<Vec<_>>()
+        };
+
+        {
+            let p = self.pager.mut_node(page)?;
+            let merged: &mut InternalPage<N> = p.try_into().unwrap();
+            for (k, ptr) in left_entries {
+                merged.insert(k, ptr);
+            }
         }
 
-        self.pager.write_node(page, merged.into())?;
-        let mut parent: InternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
-        parent.remove(index - 1);
+        // Remove left sibling entry from parent
+        {
+            let p = self.pager.mut_node(parent_page)?;
+            let parent: &mut InternalPage<N> = p.try_into().unwrap();
+            parent.remove(index - 1);
+        }
         self.free_page(left_sibling_page)?;
-        Ok(Some(parent))
+        Ok(true)
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1177,16 +1267,19 @@ impl<const N: usize> Btree<N> {
 
             match page.page_type() {
                 PageType::IndexLeaf => {
-                    let mut leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                    // Check for overflow key to free
+                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
                     if let Some(idx) = leaf.find_entry(value, key, &mut self.pager) {
                         let overflow_meta = if leaf.is_overflow(idx) {
                             Some(Self::parse_overflow_meta(leaf.key(idx)))
                         } else {
                             None
                         };
-                        leaf.remove(idx);
-                        self.index_merge_leaf(&path, leaf)?;
+                        {
+                            let p = self.pager.mut_node(current)?;
+                            let leaf_mut: &mut IndexLeafPage<N> = p.try_into().unwrap();
+                            leaf_mut.remove(idx);
+                        }
+                        self.index_merge_leaf(&path)?;
                         if let Some((start_page, total_len)) = overflow_meta {
                             self.free_overflow_pages(start_page, total_len)?;
                         }
@@ -1210,112 +1303,157 @@ impl<const N: usize> Btree<N> {
         }
     }
 
-    fn index_merge_leaf(
-        &mut self,
-        path: &[NodePtr],
-        leaf: IndexLeafPage<N>,
-    ) -> Result<(), TreeError> {
+    /// Check and merge index leaf page if underfull.
+    /// The page at `path.last()` must already be dirty in the pager cache.
+    fn index_merge_leaf(&mut self, path: &[NodePtr]) -> Result<(), TreeError> {
         let page = *path.last().unwrap();
 
-        if path.len() <= 1 || leaf.free_space() <= N / 2 {
-            self.pager.write_node(page, leaf.into())?;
+        let (free_space, len) = {
+            let leaf_ref: &IndexLeafPage<N> = self.pager.read_node(page)?.try_into().unwrap();
+            (leaf_ref.free_space(), leaf_ref.len())
+        };
+
+        if path.len() <= 1 || free_space <= N / 2 {
+            // Already dirty from caller
             return Ok(());
         }
 
-        if leaf.len() == 0 {
+        if len == 0 {
             let parents = &path[..path.len() - 1];
             let parent_page = *parents.last().unwrap();
-            let mut parent: IndexInternalPage<N> =
-                self.pager.owned_node(parent_page)?.try_into().unwrap();
-            for i in 0..parent.len() {
-                if parent.ptr(i) == page {
-                    // Free overflow key in parent if applicable
-                    if parent.is_overflow(i) {
-                        let (sp, tl) = Self::parse_overflow_meta(parent.key(i));
-                        self.free_overflow_pages(sp, tl)?;
+            // Find entry, extract overflow info, and remove from parent
+            let overflow_meta = {
+                let p = self.pager.mut_node(parent_page)?;
+                let parent: &mut IndexInternalPage<N> = p.try_into().unwrap();
+                let mut meta = None;
+                for i in 0..parent.len() {
+                    if parent.ptr(i) == page {
+                        if parent.is_overflow(i) {
+                            meta = Some(Self::parse_overflow_meta(parent.key(i)));
+                        }
+                        parent.remove(i);
+                        break;
                     }
-                    parent.remove(i);
-                    break;
                 }
+                meta
+            };
+            if let Some((sp, tl)) = overflow_meta {
+                self.free_overflow_pages(sp, tl)?;
             }
             self.free_page(page)?;
-            return self.index_merge_internal(parents, parent);
+            return self.index_merge_internal(parents);
         }
 
         let parents = &path[..path.len() - 1];
-        if !self.index_try_merge_leaf_with_left(page, &leaf, parents)? {
-            self.pager.write_node(page, leaf.into())?;
-        }
+        self.index_try_merge_leaf_with_left(page, parents)?;
         Ok(())
     }
 
     fn index_try_merge_leaf_with_left(
         &mut self,
         page: NodePtr,
-        right_leaf: &IndexLeafPage<N>,
         parents: &[NodePtr],
     ) -> Result<bool, TreeError> {
         let parent_page = *parents.last().unwrap();
-        let parent: IndexInternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
-        let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
-        if index == 0 {
-            return Ok(false);
-        }
-
-        let left_sibling_page = parent.ptr(index - 1);
-        let left_leaf: IndexLeafPage<N> = self
-            .pager
-            .owned_node(left_sibling_page)?
-            .try_into()
-            .unwrap();
-
-        // Check if all entries from right can fit into left
-        let mut merged = left_leaf.clone();
-        for i in 0..right_leaf.len() {
-            let (_, kl, v) = right_leaf.read_slot(i);
-            let key_data = right_leaf.key(i);
-            let inline_size = key_data.len();
-            if merged.free_space() < INDEX_SLOT_SIZE + inline_size {
+        let (index, left_sibling_page) = {
+            let parent_ref: &IndexInternalPage<N> =
+                self.pager.read_node(parent_page)?.try_into().unwrap();
+            let index = (0..parent_ref.len())
+                .find(|&i| parent_ref.ptr(i) == page)
+                .unwrap();
+            if index == 0 {
                 return Ok(false);
             }
-            let end = merged.len();
-            merged.insert_raw_at(end, key_data, kl, v);
+            (index, parent_ref.ptr(index - 1))
+        };
+
+        // Read right leaf entries
+        let right_entries = {
+            let right_ref: &IndexLeafPage<N> = self.pager.read_node(page)?.try_into().unwrap();
+            (0..right_ref.len())
+                .map(|i| {
+                    let (_, kl, v) = right_ref.read_slot(i);
+                    (right_ref.key(i).to_vec(), kl, v)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Check feasibility
+        {
+            let left_ref: &IndexLeafPage<N> =
+                self.pager.read_node(left_sibling_page)?.try_into().unwrap();
+            let mut free = left_ref.free_space();
+            for (key_data, _, _) in &right_entries {
+                let inline_size = key_data.len();
+                if free < INDEX_SLOT_SIZE + inline_size {
+                    return Ok(false);
+                }
+                free -= INDEX_SLOT_SIZE + inline_size;
+            }
         }
 
-        self.pager.write_node(page, merged.into())?;
-        let mut parent: IndexInternalPage<N> =
-            self.pager.owned_node(parent_page)?.try_into().unwrap();
-        // Free overflow key in parent for left sibling entry
-        if parent.is_overflow(index - 1) {
-            let (sp, tl) = Self::parse_overflow_meta(parent.key(index - 1));
-            self.free_overflow_pages(sp, tl)?;
-            // Re-read parent after freeing (pager state may change)
-            parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
+        // Read left entries for merging
+        let left_entries = {
+            let left_ref: &IndexLeafPage<N> =
+                self.pager.read_node(left_sibling_page)?.try_into().unwrap();
+            (0..left_ref.len())
+                .map(|i| {
+                    let (_, kl, v) = left_ref.read_slot(i);
+                    (left_ref.key(i).to_vec(), kl, v)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Merge left entries into right page (left entries go at the beginning)
+        {
+            let p = self.pager.mut_node(page)?;
+            let merged: &mut IndexLeafPage<N> = p.try_into().unwrap();
+            for (i, (key_data, kl, v)) in left_entries.iter().enumerate() {
+                merged.insert_raw_at(i, key_data, *kl, *v);
+            }
         }
-        parent.remove(index - 1);
+
+        // Extract overflow info and remove parent entry
+        let overflow_meta = {
+            let p = self.pager.mut_node(parent_page)?;
+            let parent: &mut IndexInternalPage<N> = p.try_into().unwrap();
+            let meta = if parent.is_overflow(index - 1) {
+                Some(Self::parse_overflow_meta(parent.key(index - 1)))
+            } else {
+                None
+            };
+            parent.remove(index - 1);
+            meta
+        };
+        if let Some((sp, tl)) = overflow_meta {
+            self.free_overflow_pages(sp, tl)?;
+        }
         self.free_page(left_sibling_page)?;
-        self.index_merge_internal(parents, parent)?;
+        self.index_merge_internal(parents)?;
         Ok(true)
     }
 
-    fn index_merge_internal(
-        &mut self,
-        path: &[NodePtr],
-        internal: IndexInternalPage<N>,
-    ) -> Result<(), TreeError> {
+    /// Check and merge index internal pages if underfull. Iterative.
+    /// The page at `path.last()` must already be dirty in the pager cache.
+    fn index_merge_internal(&mut self, path: &[NodePtr]) -> Result<(), TreeError> {
         let mut cur_path = path;
-        let mut cur_internal = internal;
 
         loop {
             let page = *cur_path.last().unwrap();
 
-            if cur_path.len() <= 1 || cur_internal.free_space() <= N / 2 {
-                self.pager.write_node(page, cur_internal.into())?;
+            let (len, free_space) = {
+                let node_ref: &IndexInternalPage<N> =
+                    self.pager.read_node(page)?.try_into().unwrap();
+                (node_ref.len(), node_ref.free_space())
+            };
+
+            if cur_path.len() <= 1 || free_space <= N / 2 {
+                // Already dirty from caller
                 return Ok(());
             }
 
-            if cur_internal.len() == 0 {
+            if len == 0 {
                 if cur_path.len() <= 1 {
                     let leaf = IndexLeafPage::<N>::new();
                     self.pager.write_node(page, leaf.into())?;
@@ -1323,86 +1461,125 @@ impl<const N: usize> Btree<N> {
                 }
                 let parents = &cur_path[..cur_path.len() - 1];
                 let parent_page = *parents.last().unwrap();
-                let mut parent: IndexInternalPage<N> =
-                    self.pager.owned_node(parent_page)?.try_into().unwrap();
-                for i in 0..parent.len() {
-                    if parent.ptr(i) == page {
-                        if parent.is_overflow(i) {
-                            let (sp, tl) = Self::parse_overflow_meta(parent.key(i));
-                            self.free_overflow_pages(sp, tl)?;
-                            parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
+                // Find entry, extract overflow info, and remove from parent
+                let overflow_meta = {
+                    let p = self.pager.mut_node(parent_page)?;
+                    let parent: &mut IndexInternalPage<N> = p.try_into().unwrap();
+                    let mut meta = None;
+                    for i in 0..parent.len() {
+                        if parent.ptr(i) == page {
+                            if parent.is_overflow(i) {
+                                meta = Some(Self::parse_overflow_meta(parent.key(i)));
+                            }
+                            parent.remove(i);
+                            break;
                         }
-                        parent.remove(i);
-                        break;
                     }
+                    meta
+                };
+                if let Some((sp, tl)) = overflow_meta {
+                    self.free_overflow_pages(sp, tl)?;
                 }
                 self.free_page(page)?;
                 cur_path = parents;
-                cur_internal = parent;
                 continue;
             }
 
             let parents = &cur_path[..cur_path.len() - 1];
-            match self.index_try_merge_internal_with_left(page, &cur_internal, parents)? {
-                Some(updated_parent) => {
-                    cur_path = parents;
-                    cur_internal = updated_parent;
-                    continue;
-                }
-                None => {
-                    self.pager.write_node(page, cur_internal.into())?;
-                    return Ok(());
-                }
+            if self.index_try_merge_internal_with_left(page, parents)? {
+                cur_path = parents;
+                continue;
+            } else {
+                // Already dirty from caller
+                return Ok(());
             }
         }
     }
 
-    /// Returns `Some(updated_parent)` if merge succeeded, `None` otherwise.
+    /// Returns `true` if merge succeeded, `false` otherwise.
     fn index_try_merge_internal_with_left(
         &mut self,
         page: NodePtr,
-        right_internal: &IndexInternalPage<N>,
         parents: &[NodePtr],
-    ) -> Result<Option<IndexInternalPage<N>>, TreeError> {
+    ) -> Result<bool, TreeError> {
         let parent_page = *parents.last().unwrap();
-        let parent: IndexInternalPage<N> = self.pager.owned_node(parent_page)?.try_into().unwrap();
 
-        let index = (0..parent.len()).find(|&i| parent.ptr(i) == page).unwrap();
-        if index == 0 {
-            return Ok(None);
-        }
-
-        let left_sibling_page = parent.ptr(index - 1);
-        let left_internal: IndexInternalPage<N> = self
-            .pager
-            .owned_node(left_sibling_page)?
-            .try_into()
-            .unwrap();
-
-        // Check if combined entries fit
-        let mut merged = left_internal.clone();
-        for i in 0..right_internal.len() {
-            let (_, kl, v) = right_internal.read_slot(i);
-            let key_data = right_internal.key(i);
-            let inline_size = key_data.len();
-            if merged.free_space() < INDEX_SLOT_SIZE + inline_size {
-                return Ok(None);
+        let (index, left_sibling_page) = {
+            let parent_ref: &IndexInternalPage<N> =
+                self.pager.read_node(parent_page)?.try_into().unwrap();
+            let index = (0..parent_ref.len())
+                .find(|&i| parent_ref.ptr(i) == page)
+                .unwrap();
+            if index == 0 {
+                return Ok(false);
             }
-            let end = merged.len();
-            merged.insert_raw_at(end, key_data, kl, v);
+            (index, parent_ref.ptr(index - 1))
+        };
+
+        // Read right entries
+        let right_entries = {
+            let right_ref: &IndexInternalPage<N> =
+                self.pager.read_node(page)?.try_into().unwrap();
+            (0..right_ref.len())
+                .map(|i| {
+                    let (_, kl, v) = right_ref.read_slot(i);
+                    (right_ref.key(i).to_vec(), kl, v)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Check if merge is feasible
+        {
+            let left_ref: &IndexInternalPage<N> =
+                self.pager.read_node(left_sibling_page)?.try_into().unwrap();
+            let mut free = left_ref.free_space();
+            for (key_data, _, _) in &right_entries {
+                let inline_size = key_data.len();
+                if free < INDEX_SLOT_SIZE + inline_size {
+                    return Ok(false);
+                }
+                free -= INDEX_SLOT_SIZE + inline_size;
+            }
         }
 
-        self.pager.write_node(page, merged.into())?;
-        let mut parent: IndexInternalPage<N> =
-            self.pager.owned_node(parent_page)?.try_into().unwrap();
-        if parent.is_overflow(index - 1) {
-            let (sp, tl) = Self::parse_overflow_meta(parent.key(index - 1));
-            self.free_overflow_pages(sp, tl)?;
-            parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
+        // Read left entries for merging into the right page
+        let left_entries = {
+            let left_ref: &IndexInternalPage<N> =
+                self.pager.read_node(left_sibling_page)?.try_into().unwrap();
+            (0..left_ref.len())
+                .map(|i| {
+                    let (_, kl, v) = left_ref.read_slot(i);
+                    (left_ref.key(i).to_vec(), kl, v)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Merge left entries into right page (left entries go at the beginning)
+        {
+            let p = self.pager.mut_node(page)?;
+            let merged: &mut IndexInternalPage<N> = p.try_into().unwrap();
+            for (i, (key_data, kl, v)) in left_entries.iter().enumerate() {
+                merged.insert_raw_at(i, key_data, *kl, *v);
+            }
         }
-        parent.remove(index - 1);
+
+        // Extract overflow info and remove entry from parent
+        let overflow_meta = {
+            let p = self.pager.mut_node(parent_page)?;
+            let parent: &mut IndexInternalPage<N> = p.try_into().unwrap();
+            let meta = if parent.is_overflow(index - 1) {
+                Some(Self::parse_overflow_meta(parent.key(index - 1)))
+            } else {
+                None
+            };
+            parent.remove(index - 1);
+            meta
+        };
+        if let Some((sp, tl)) = overflow_meta {
+            self.free_overflow_pages(sp, tl)?;
+        }
         self.free_page(left_sibling_page)?;
-        Ok(Some(parent))
+        Ok(true)
     }
 
     pub fn index_read<T>(

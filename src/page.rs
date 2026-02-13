@@ -110,12 +110,36 @@ impl<'a, const N: usize> TryFrom<&'a AnyPage<N>> for &'a IndexInternalPage<N> {
     }
 }
 
+impl<'a, const N: usize> TryFrom<&'a mut AnyPage<N>> for &'a mut IndexInternalPage<N> {
+    type Error = &'static str;
+
+    fn try_from(value: &'a mut AnyPage<N>) -> Result<Self, Self::Error> {
+        if value.page_type() == PageType::IndexInternal {
+            Ok(unsafe { &mut *(value as *mut AnyPage<N> as *mut IndexInternalPage<N>) })
+        } else {
+            Err("Page is not of type IndexInternal")
+        }
+    }
+}
+
 impl<'a, const N: usize> TryFrom<&'a AnyPage<N>> for &'a IndexLeafPage<N> {
     type Error = &'static str;
 
     fn try_from(value: &'a AnyPage<N>) -> Result<Self, Self::Error> {
         if value.page_type() == PageType::IndexLeaf {
             Ok(unsafe { &*(value as *const AnyPage<N> as *const IndexLeafPage<N>) })
+        } else {
+            Err("Page is not of type IndexLeaf")
+        }
+    }
+}
+
+impl<'a, const N: usize> TryFrom<&'a mut AnyPage<N>> for &'a mut IndexLeafPage<N> {
+    type Error = &'static str;
+
+    fn try_from(value: &'a mut AnyPage<N>) -> Result<Self, Self::Error> {
+        if value.page_type() == PageType::IndexLeaf {
+            Ok(unsafe { &mut *(value as *mut AnyPage<N> as *mut IndexLeafPage<N>) })
         } else {
             Err("Page is not of type IndexLeaf")
         }
@@ -134,12 +158,36 @@ impl<'a, const N: usize> TryFrom<&'a AnyPage<N>> for &'a InternalPage<N> {
     }
 }
 
+impl<'a, const N: usize> TryFrom<&'a mut AnyPage<N>> for &'a mut InternalPage<N> {
+    type Error = &'static str;
+
+    fn try_from(value: &'a mut AnyPage<N>) -> Result<Self, Self::Error> {
+        if value.page_type() == PageType::Internal {
+            Ok(unsafe { &mut *(value as *mut AnyPage<N> as *mut InternalPage<N>) })
+        } else {
+            Err("Page is not of type Internal")
+        }
+    }
+}
+
 impl<'a, const N: usize> TryFrom<&'a AnyPage<N>> for &'a LeafPage<N> {
     type Error = &'static str;
 
     fn try_from(value: &'a AnyPage<N>) -> Result<Self, Self::Error> {
         if value.page_type() == PageType::Leaf {
             Ok(unsafe { &*(value as *const AnyPage<N> as *const LeafPage<N>) })
+        } else {
+            Err("Page is not of type Leaf")
+        }
+    }
+}
+
+impl<'a, const N: usize> TryFrom<&'a mut AnyPage<N>> for &'a mut LeafPage<N> {
+    type Error = &'static str;
+
+    fn try_from(value: &'a mut AnyPage<N>) -> Result<Self, Self::Error> {
+        if value.page_type() == PageType::Leaf {
+            Ok(unsafe { &mut *(value as *mut AnyPage<N> as *mut LeafPage<N>) })
         } else {
             Err("Page is not of type Leaf")
         }
