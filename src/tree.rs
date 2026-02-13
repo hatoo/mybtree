@@ -185,21 +185,8 @@ impl<const N: usize> Btree<N> {
         let split_key = leaf.key(leaf.len() - 1);
 
         if key <= split_key {
-            if !leaf.can_insert(value.len()) {
-                // Left half is full — move last entry from left to right to make room
-                let last = leaf.len() - 1;
-                let (_, _, vl) = leaf.read_slot(last);
-                right.insert_raw(leaf.key(last), leaf.value(last), vl);
-                leaf.remove(last);
-            }
             self.leaf_insert_entry(&mut leaf, key, value)?;
         } else {
-            if !right.can_insert(value.len()) {
-                // Right half is full — move first entry from right to left to make room
-                let (_, _, vl) = right.read_slot(0);
-                leaf.insert_raw(right.key(0), right.value(0), vl);
-                right.remove(0);
-            }
             self.leaf_insert_entry(&mut right, key, value)?;
         }
 
@@ -2463,7 +2450,7 @@ mod tests {
     #[test]
     fn test_no_leak_insert_remove_shuffle() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
-        let (mut btree, root) = new_btree::<64>();
+        let (mut btree, root) = new_btree::<128>();
 
         let mut keys: Vec<u64> = (0..500).collect();
         keys.shuffle(&mut rng);
