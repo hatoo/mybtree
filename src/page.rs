@@ -15,35 +15,30 @@ pub enum PageType {
 pub const OVERFLOW_FLAG: u16 = 0x8000;
 pub const OVERFLOW_META_SIZE: usize = 16;
 
-#[repr(align(4096))]
 #[repr(C)]
 #[derive(Clone)]
 pub struct AnyPage<const N: usize> {
     pub page: [u8; N],
 }
 
-#[repr(align(4096))]
 #[repr(C)]
 #[derive(Clone)]
 pub struct InternalPage<const N: usize> {
     page: [u8; N],
 }
 
-#[repr(align(4096))]
 #[repr(C)]
 #[derive(Clone)]
 pub struct LeafPage<const N: usize> {
     page: [u8; N],
 }
 
-#[repr(align(4096))]
 #[repr(C)]
 #[derive(Clone)]
 pub struct IndexInternalPage<const N: usize> {
     page: [u8; N],
 }
 
-#[repr(align(4096))]
 #[repr(C)]
 #[derive(Clone)]
 pub struct IndexLeafPage<const N: usize> {
