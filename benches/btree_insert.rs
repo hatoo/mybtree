@@ -23,6 +23,18 @@ fn bench_sequential_insert(c: &mut Criterion) {
                 // flush on drop
             });
         });
+        c.bench_function(&format!("sequential_remove_{n}"), |b| {
+            let (mut btree, root) = setup();
+            for i in 0..n as u64 {
+                btree.insert(root, i, value.clone()).unwrap();
+            }
+            b.iter(|| {
+                for i in 0..n as u64 {
+                    btree.remove(root, i).unwrap();
+                }
+                // flush on drop
+            });
+        });
     }
 }
 
