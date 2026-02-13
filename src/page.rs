@@ -736,7 +736,15 @@ macro_rules! impl_bytes_keyed_page {
             }
 
             pub fn needs_overflow(key_len: usize) -> bool {
-                key_len > (N - Self::HEADER_SIZE) / 2
+                // Calculate the maximum number of slots that can fit in a page
+                let max_slots = (N - Self::HEADER_SIZE) / Self::SLOT_SIZE;
+                // After split, the worst case is inserting into a page with ceil(max_slots/2) slots
+                let half_slots = (max_slots + 1) / 2;
+                // Space used by slots in half-full page
+                let used_slot_space = half_slots * Self::SLOT_SIZE;
+                // Remaining space for value
+                let available = N - Self::HEADER_SIZE - used_slot_space;
+                Self::SLOT_SIZE + key_len > available
             }
 
             pub fn key(&self, index: usize) -> &[u8] {
