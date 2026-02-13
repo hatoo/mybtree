@@ -97,11 +97,11 @@ impl<const N: usize> Btree<N> {
 
         loop {
             path.push(current);
-            let page = self.pager.owned_node(current)?;
+            let page = self.pager.read_node(current)?;
 
             match page.page_type() {
                 PageType::Leaf => {
-                    let mut leaf: LeafPage<N> = page.try_into().unwrap();
+                    let mut leaf: LeafPage<N> = self.pager.owned_node(current)?.try_into().unwrap();
                     match leaf.search_key(key) {
                         Ok(index) => {
                             // Key exists — read old value, remove old entry, insert new
@@ -126,7 +126,7 @@ impl<const N: usize> Btree<N> {
                     }
                 }
                 PageType::Internal => {
-                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    let internal: &InternalPage<N> = page.try_into().unwrap();
                     match internal.search_index(key) {
                         Some(idx) => {
                             current = internal.ptr(idx);
@@ -290,12 +290,10 @@ impl<const N: usize> Btree<N> {
                         break;
                     }
                 }
-                let i =
-                    found_idx.expect("left_page not found in parent during split propagation");
+                let i = found_idx.expect("left_page not found in parent during split propagation");
                 // can_insert after removing one and inserting two (net +1)
-                let can_insert = (parent_ref.len() + 1) * INTERNAL_ELEMENT_SIZE
-                    + INTERNAL_HEADER_SIZE
-                    <= N;
+                let can_insert =
+                    (parent_ref.len() + 1) * INTERNAL_ELEMENT_SIZE + INTERNAL_HEADER_SIZE <= N;
                 (i, parent_ref.key(i), can_insert)
             };
             let right_max_key = old_key;
@@ -598,8 +596,7 @@ impl<const N: usize> Btree<N> {
             let page = *cur_path.last().unwrap();
 
             let (len, used) = {
-                let node_ref: &InternalPage<N> =
-                    self.pager.read_node(page)?.try_into().unwrap();
+                let node_ref: &InternalPage<N> = self.pager.read_node(page)?.try_into().unwrap();
                 let len = node_ref.len();
                 (len, INTERNAL_HEADER_SIZE + len * INTERNAL_ELEMENT_SIZE)
             };
@@ -1518,8 +1515,7 @@ impl<const N: usize> Btree<N> {
 
         // Read right entries
         let right_entries = {
-            let right_ref: &IndexInternalPage<N> =
-                self.pager.read_node(page)?.try_into().unwrap();
+            let right_ref: &IndexInternalPage<N> = self.pager.read_node(page)?.try_into().unwrap();
             (0..right_ref.len())
                 .map(|i| {
                     let (_, kl, v) = right_ref.read_slot(i);
@@ -1829,8 +1825,7 @@ impl<const N: usize> Btree<N> {
                     let leaf: LeafPage<N> = page.try_into().unwrap();
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
-                            let (start_page, total_len) =
-                                Self::parse_overflow_meta(leaf.value(i));
+                            let (start_page, total_len) = Self::parse_overflow_meta(leaf.value(i));
                             self.collect_overflow_pages(start_page, total_len, pages);
                         }
                     }
@@ -1850,8 +1845,7 @@ impl<const N: usize> Btree<N> {
                     let leaf: IndexLeafPage<N> = page.try_into().unwrap();
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
-                            let (start_page, total_len) =
-                                Self::parse_overflow_meta(leaf.key(i));
+                            let (start_page, total_len) = Self::parse_overflow_meta(leaf.key(i));
                             self.collect_overflow_pages(start_page, total_len, pages);
                         }
                     }
