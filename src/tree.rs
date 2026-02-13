@@ -101,7 +101,7 @@ impl<const N: usize> Btree<N> {
 
             match page.page_type() {
                 PageType::Leaf => {
-                    let mut leaf: LeafPage<N> = self.pager.owned_node(current)?.try_into().unwrap();
+                    let mut leaf: LeafPage<N> = page.clone().try_into().unwrap();
                     match leaf.search_key(key) {
                         Ok(index) => {
                             // Key exists — read old value, remove old entry, insert new
