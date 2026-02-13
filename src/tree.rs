@@ -59,12 +59,7 @@ impl<const N: usize> Btree<N> {
                     let leaf: &LeafPage<N> = page.try_into().unwrap();
                     let overflow_pages_to_free = (0..leaf.len())
                         .filter(|&i| leaf.is_overflow(i))
-                        .map(|i| {
-                            let meta = leaf.value(i);
-                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                            (start_page, total_len)
-                        })
+                        .map(|i| Self::parse_overflow_meta(leaf.value(i)))
                         .collect::<Vec<_>>();
                     for (start_page, total_len) in overflow_pages_to_free {
                         self.free_overflow_pages(start_page, total_len)?;
@@ -111,14 +106,8 @@ impl<const N: usize> Btree<N> {
                         Ok(index) => {
                             // Key exists — read old value, remove old entry, insert new
                             let old_bytes = self.read_leaf_value(&leaf, index)?;
-                            let was_overflow = leaf.is_overflow(index);
-                            let overflow_meta = if was_overflow {
-                                Some((
-                                    u64::from_le_bytes(leaf.value(index)[0..8].try_into().unwrap()),
-                                    u64::from_le_bytes(
-                                        leaf.value(index)[8..16].try_into().unwrap(),
-                                    ),
-                                ))
+                            let overflow_meta = if leaf.is_overflow(index) {
+                                Some(Self::parse_overflow_meta(leaf.value(index)))
                             } else {
                                 None
                             };
@@ -361,12 +350,7 @@ impl<const N: usize> Btree<N> {
                         Ok(index) => {
                             let old_bytes = self.read_leaf_value(&leaf, index)?;
                             let overflow_meta = if leaf.is_overflow(index) {
-                                Some((
-                                    u64::from_le_bytes(leaf.value(index)[0..8].try_into().unwrap()),
-                                    u64::from_le_bytes(
-                                        leaf.value(index)[8..16].try_into().unwrap(),
-                                    ),
-                                ))
+                                Some(Self::parse_overflow_meta(leaf.value(index)))
                             } else {
                                 None
                             };
@@ -449,11 +433,7 @@ impl<const N: usize> Btree<N> {
             for i in 0..leaf.len() {
                 if range.contains(&leaf.key(i)) {
                     if leaf.is_overflow(i) {
-                        let meta = leaf.value(i);
-                        overflow_metas.push((
-                            u64::from_le_bytes(meta[0..8].try_into().unwrap()),
-                            u64::from_le_bytes(meta[8..16].try_into().unwrap()),
-                        ));
+                        overflow_metas.push(Self::parse_overflow_meta(leaf.value(i)));
                     }
                     indices_to_remove.push(i);
                 }
@@ -663,9 +643,8 @@ impl<const N: usize> Btree<N> {
                     match leaf.search_key(key) {
                         Ok(index) => {
                             if leaf.is_overflow(index) {
-                                let meta = leaf.value(index);
-                                let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                                let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                                let (start_page, total_len) =
+                                    Self::parse_overflow_meta(leaf.value(index));
                                 let data = self.read_overflow(start_page, total_len)?;
                                 return Ok(f(Some(&data)));
                             } else {
@@ -718,9 +697,8 @@ impl<const N: usize> Btree<N> {
                         let k = leaf.key(i);
                         if range.contains(&k) {
                             if leaf.is_overflow(i) {
-                                let meta = leaf.value(i);
-                                let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                                let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                                let (start_page, total_len) =
+                                    Self::parse_overflow_meta(leaf.value(i));
                                 let data = self.read_overflow(start_page, total_len)?;
                                 f(k, &data);
                             } else {
@@ -792,9 +770,7 @@ impl<const N: usize> Btree<N> {
 
     fn read_leaf_value(&mut self, leaf: &LeafPage<N>, index: usize) -> io::Result<Vec<u8>> {
         if leaf.is_overflow(index) {
-            let meta = leaf.value(index);
-            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+            let (start_page, total_len) = Self::parse_overflow_meta(leaf.value(index));
             Ok(self.read_overflow(start_page, total_len)?)
         } else {
             Ok(leaf.value(index).to_vec())
@@ -804,6 +780,12 @@ impl<const N: usize> Btree<N> {
     // ────────────────────────────────────────────────────────────────────
     //  Overflow pages
     // ────────────────────────────────────────────────────────────────────
+
+    fn parse_overflow_meta(meta: &[u8]) -> (u64, u64) {
+        let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+        (start_page, total_len)
+    }
 
     fn write_overflow(&mut self, data: &[u8]) -> io::Result<u64> {
         let data_per_page = self.overflow_data_per_page();
@@ -926,9 +908,7 @@ impl<const N: usize> Btree<N> {
                     let leaf: IndexLeafPage<N> = page.try_into().unwrap();
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
-                            let meta = leaf.key(i);
-                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let (start_page, total_len) = Self::parse_overflow_meta(leaf.key(i));
                             self.free_overflow_pages(start_page, total_len)?;
                         }
                     }
@@ -937,9 +917,8 @@ impl<const N: usize> Btree<N> {
                     let internal: IndexInternalPage<N> = page.try_into().unwrap();
                     for i in 0..internal.len() {
                         if internal.is_overflow(i) {
-                            let meta = internal.key(i);
-                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let (start_page, total_len) =
+                                Self::parse_overflow_meta(internal.key(i));
                             self.free_overflow_pages(start_page, total_len)?;
                         }
                         stack.push(internal.ptr(i));
@@ -1202,11 +1181,7 @@ impl<const N: usize> Btree<N> {
                     // Check for overflow key to free
                     if let Some(idx) = leaf.find_entry(value, key, &mut self.pager) {
                         let overflow_meta = if leaf.is_overflow(idx) {
-                            let meta = leaf.key(idx);
-                            Some((
-                                u64::from_le_bytes(meta[0..8].try_into().unwrap()),
-                                u64::from_le_bytes(meta[8..16].try_into().unwrap()),
-                            ))
+                            Some(Self::parse_overflow_meta(leaf.key(idx)))
                         } else {
                             None
                         };
@@ -1256,9 +1231,7 @@ impl<const N: usize> Btree<N> {
                 if parent.ptr(i) == page {
                     // Free overflow key in parent if applicable
                     if parent.is_overflow(i) {
-                        let meta = parent.key(i);
-                        let sp = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                        let tl = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        let (sp, tl) = Self::parse_overflow_meta(parent.key(i));
                         self.free_overflow_pages(sp, tl)?;
                     }
                     parent.remove(i);
@@ -1315,9 +1288,7 @@ impl<const N: usize> Btree<N> {
             self.pager.owned_node(parent_page)?.try_into().unwrap();
         // Free overflow key in parent for left sibling entry
         if parent.is_overflow(index - 1) {
-            let meta = parent.key(index - 1);
-            let sp = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-            let tl = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+            let (sp, tl) = Self::parse_overflow_meta(parent.key(index - 1));
             self.free_overflow_pages(sp, tl)?;
             // Re-read parent after freeing (pager state may change)
             parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
@@ -1357,9 +1328,7 @@ impl<const N: usize> Btree<N> {
                 for i in 0..parent.len() {
                     if parent.ptr(i) == page {
                         if parent.is_overflow(i) {
-                            let meta = parent.key(i);
-                            let sp = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let tl = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let (sp, tl) = Self::parse_overflow_meta(parent.key(i));
                             self.free_overflow_pages(sp, tl)?;
                             parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
                         }
@@ -1427,9 +1396,7 @@ impl<const N: usize> Btree<N> {
         let mut parent: IndexInternalPage<N> =
             self.pager.owned_node(parent_page)?.try_into().unwrap();
         if parent.is_overflow(index - 1) {
-            let meta = parent.key(index - 1);
-            let sp = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-            let tl = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+            let (sp, tl) = Self::parse_overflow_meta(parent.key(index - 1));
             self.free_overflow_pages(sp, tl)?;
             parent = self.pager.owned_node(parent_page)?.try_into().unwrap();
         }
@@ -1585,8 +1552,7 @@ impl<const N: usize> Btree<N> {
                         panic!("Key {} out of range ({}..={})", k, min, max);
                     }
                     if leaf.is_overflow(i) {
-                        let meta = leaf.value(i);
-                        let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                        let (_, total_len) = Self::parse_overflow_meta(leaf.value(i));
                         println!("  Key: {}, Value Length: {} (overflow)", k, total_len);
                     } else {
                         println!(
@@ -1621,14 +1587,14 @@ impl<const N: usize> Btree<N> {
     }
 
     #[cfg(test)]
-    pub fn assert_no_page_leak(&mut self, root: NodePtr) {
+    fn assert_no_page_leak_impl(&mut self, root: NodePtr) {
         use std::collections::BTreeSet;
 
         let total_pages = self.pager.total_page_count();
         let mut tree_pages = BTreeSet::new();
         tree_pages.insert(root);
         tree_pages.insert(FREE_LIST_PAGE_NUM);
-        self.collect_tree_pages(root, &mut tree_pages);
+        self.collect_all_pages(root, &mut tree_pages);
 
         let mut free_pages = BTreeSet::new();
         let mut head = self.read_free_list_head().unwrap();
@@ -1667,7 +1633,17 @@ impl<const N: usize> Btree<N> {
     }
 
     #[cfg(test)]
-    fn collect_tree_pages(&mut self, root: NodePtr, pages: &mut std::collections::BTreeSet<u64>) {
+    pub fn assert_no_page_leak(&mut self, root: NodePtr) {
+        self.assert_no_page_leak_impl(root);
+    }
+
+    #[cfg(test)]
+    pub fn assert_no_page_leak_index(&mut self, root: NodePtr) {
+        self.assert_no_page_leak_impl(root);
+    }
+
+    #[cfg(test)]
+    fn collect_all_pages(&mut self, root: NodePtr, pages: &mut std::collections::BTreeSet<u64>) {
         let mut stack = vec![root];
         while let Some(page_num) = stack.pop() {
             let page = self.pager.owned_node(page_num).unwrap();
@@ -1676,9 +1652,8 @@ impl<const N: usize> Btree<N> {
                     let leaf: LeafPage<N> = page.try_into().unwrap();
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
-                            let meta = leaf.value(i);
-                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                            let (start_page, total_len) =
+                                Self::parse_overflow_meta(leaf.value(i));
                             self.collect_overflow_pages(start_page, total_len, pages);
                         }
                     }
@@ -1694,7 +1669,32 @@ impl<const N: usize> Btree<N> {
                         stack.push(internal.ptr(i));
                     }
                 }
-                _ => {}
+                PageType::IndexLeaf => {
+                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                    for i in 0..leaf.len() {
+                        if leaf.is_overflow(i) {
+                            let (start_page, total_len) =
+                                Self::parse_overflow_meta(leaf.key(i));
+                            self.collect_overflow_pages(start_page, total_len, pages);
+                        }
+                    }
+                }
+                PageType::IndexInternal => {
+                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                    for i in 0..internal.len() {
+                        assert!(
+                            pages.insert(internal.ptr(i)),
+                            "Page {} referenced multiple times in index tree",
+                            internal.ptr(i)
+                        );
+                        if internal.is_overflow(i) {
+                            let (start_page, total_len) =
+                                Self::parse_overflow_meta(internal.key(i));
+                            self.collect_overflow_pages(start_page, total_len, pages);
+                        }
+                        stack.push(internal.ptr(i));
+                    }
+                }
             }
         }
     }
@@ -1720,95 +1720,6 @@ impl<const N: usize> Btree<N> {
             let chunk = std::cmp::min(data_per_page, remaining);
             remaining -= chunk;
             current = next;
-        }
-    }
-
-    #[cfg(test)]
-    pub fn assert_no_page_leak_index(&mut self, root: NodePtr) {
-        use std::collections::BTreeSet;
-
-        let total_pages = self.pager.total_page_count();
-        let mut tree_pages = BTreeSet::new();
-        tree_pages.insert(root);
-        tree_pages.insert(FREE_LIST_PAGE_NUM);
-        self.collect_index_tree_pages(root, &mut tree_pages);
-
-        let mut free_pages = BTreeSet::new();
-        let mut head = self.read_free_list_head().unwrap();
-        while head != u64::MAX {
-            assert!(
-                free_pages.insert(head),
-                "Free list cycle detected at page {}",
-                head
-            );
-            let buf = self.pager.read_raw_page(head).unwrap();
-            head = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        }
-
-        let overlap: Vec<_> = tree_pages.intersection(&free_pages).collect();
-        assert!(
-            overlap.is_empty(),
-            "Pages in both tree and free list: {:?}",
-            overlap
-        );
-
-        let mut all_pages: BTreeSet<u64> = (0..total_pages).collect();
-        for &p in &tree_pages {
-            all_pages.remove(&p);
-        }
-        for &p in &free_pages {
-            all_pages.remove(&p);
-        }
-        assert!(
-            all_pages.is_empty(),
-            "Leaked pages (not in tree or free list): {:?} (tree={}, free={}, total={})",
-            all_pages,
-            tree_pages.len(),
-            free_pages.len(),
-            total_pages
-        );
-    }
-
-    #[cfg(test)]
-    fn collect_index_tree_pages(
-        &mut self,
-        root: NodePtr,
-        pages: &mut std::collections::BTreeSet<u64>,
-    ) {
-        let mut stack = vec![root];
-        while let Some(page_num) = stack.pop() {
-            let page = self.pager.owned_node(page_num).unwrap();
-            match page.page_type() {
-                PageType::IndexLeaf => {
-                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                    for i in 0..leaf.len() {
-                        if leaf.is_overflow(i) {
-                            let meta = leaf.key(i);
-                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                            self.collect_overflow_pages(start_page, total_len, pages);
-                        }
-                    }
-                }
-                PageType::IndexInternal => {
-                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                    for i in 0..internal.len() {
-                        assert!(
-                            pages.insert(internal.ptr(i)),
-                            "Page {} referenced multiple times in index tree",
-                            internal.ptr(i)
-                        );
-                        if internal.is_overflow(i) {
-                            let meta = internal.key(i);
-                            let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                            let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                            self.collect_overflow_pages(start_page, total_len, pages);
-                        }
-                        stack.push(internal.ptr(i));
-                    }
-                }
-                _ => {}
-            }
         }
     }
 }
