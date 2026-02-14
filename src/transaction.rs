@@ -465,7 +465,7 @@ impl<'a, const N: usize> Transaction<'a, N> {
         // Apply node writes
         for ((root, key), value) in current_op.writes {
             if let Some(value) = value {
-                inner.btree.insert(root, key, value)?;
+                inner.btree.insert(root, key, &value)?;
             } else {
                 inner.btree.remove(root, key)?;
             }

@@ -87,7 +87,7 @@ impl<const N: usize> Btree<N> {
         &mut self,
         root: NodePtr,
         key: Key,
-        value: Vec<u8>,
+        value: &[u8],
     ) -> Result<Option<Vec<u8>>, TreeError> {
         let mut current = root;
         let mut path = vec![];
@@ -105,12 +105,12 @@ impl<const N: usize> Btree<N> {
                             leaf.remove(index);
                             let old_bytes =
                                 value_token.into_value_and_free_overflow_pages(&mut self.pager)?;
-                            self.leaf_insert_and_propagate(root, &path, key, &value)?;
+                            self.leaf_insert_and_propagate(root, &path, key, value)?;
                             return Ok(Some(old_bytes));
                         }
                         Err(_) => {
                             // New key
-                            self.leaf_insert_and_propagate(root, &path, key, &value)?;
+                            self.leaf_insert_and_propagate(root, &path, key, value)?;
                             return Ok(None);
                         }
                     }
@@ -130,7 +130,7 @@ impl<const N: usize> Btree<N> {
                                 internal.insert(key, new_leaf_page);
                                 let new_leaf = LeafPage::<N>::new();
                                 self.pager.write_node(new_leaf_page, new_leaf.into())?;
-                                self.leaf_insert_entry(new_leaf_page, key, &value)?;
+                                self.leaf_insert_entry(new_leaf_page, key, value)?;
                                 return Ok(None);
                             } else {
                                 let last_idx = internal.len() - 1;
@@ -1760,7 +1760,7 @@ mod tests {
         for i in 0..count {
             let mut value = vec![0u8; 64];
             value[0..8].copy_from_slice(&i.to_le_bytes());
-            btree.insert(root, i, value).unwrap();
+            btree.insert(root, i, &value).unwrap();
         }
         (btree, root)
     }
@@ -1835,20 +1835,20 @@ mod tests {
     #[test]
     fn test_insert() {
         let (mut btree, root) = new_btree::<4096>();
-        btree.insert(root, 1, b"one".to_vec()).unwrap();
+        btree.insert(root, 1, b"one").unwrap();
     }
 
     #[test]
     fn test_read() {
         let (mut btree, root) = new_btree::<4096>();
-        btree.insert(root, 0, b"zero".to_vec()).unwrap();
+        btree.insert(root, 0, b"zero").unwrap();
         assert_read_eq(&mut btree, root, 0, b"zero");
     }
 
     #[test]
     fn test_insert_and_read() {
         let (mut btree, root) = new_btree::<4096>();
-        btree.insert(root, 42, b"forty-two".to_vec()).unwrap();
+        btree.insert(root, 42, b"forty-two").unwrap();
         assert_read_eq(&mut btree, root, 42, b"forty-two");
     }
 
@@ -1858,8 +1858,8 @@ mod tests {
         let mut map = HashMap::new();
 
         for i in 0u64..256 {
-            let value = format!("value-{}", i).as_bytes().to_vec();
-            btree.insert(root, i, value.clone()).unwrap();
+            let value = format!("value-{}", i).into_bytes();
+            btree.insert(root, i, &value).unwrap();
             map.insert(i, value);
 
             for j in 0u64..=i {
@@ -1873,9 +1873,9 @@ mod tests {
     fn test_remove() {
         let (mut btree, root) = new_btree::<64>();
 
-        btree.insert(root, 1, b"one".to_vec()).unwrap();
-        btree.insert(root, 2, b"two".to_vec()).unwrap();
-        btree.insert(root, 3, b"three".to_vec()).unwrap();
+        btree.insert(root, 1, b"one").unwrap();
+        btree.insert(root, 2, b"two").unwrap();
+        btree.insert(root, 3, b"three").unwrap();
 
         assert_eq!(btree.remove(root, 2).unwrap(), Some(b"two".to_vec()));
         assert_key_absent(&mut btree, root, 2);
@@ -1898,7 +1898,7 @@ mod tests {
 
         for i in insert {
             btree
-                .insert(root, i, format!("value-{}", i).as_bytes().to_vec())
+                .insert(root, i, format!("value-{}", i).as_bytes())
                 .unwrap();
         }
 
@@ -2055,7 +2055,7 @@ mod tests {
     fn test_big_value_insert_and_read() {
         let (mut btree, root) = new_btree::<256>();
         let big_value = vec![42u8; 4096];
-        btree.insert(root, 1, big_value.clone()).unwrap();
+        btree.insert(root, 1, &big_value).unwrap();
         assert_eq!(read_value(&mut btree, root, 1), Some(big_value));
     }
 
@@ -2063,10 +2063,10 @@ mod tests {
     fn test_big_value_with_small_values() {
         let (mut btree, root) = new_btree::<256>();
 
-        btree.insert(root, 0, b"small-before".to_vec()).unwrap();
+        btree.insert(root, 0, b"small-before").unwrap();
         let big_value = vec![42u8; 4096];
-        btree.insert(root, 1, big_value.clone()).unwrap();
-        btree.insert(root, 2, b"small-after".to_vec()).unwrap();
+        btree.insert(root, 1, &big_value).unwrap();
+        btree.insert(root, 2, b"small-after").unwrap();
 
         assert_read_eq(&mut btree, root, 0, b"small-before");
         assert_eq!(read_value(&mut btree, root, 1), Some(big_value));
@@ -2078,10 +2078,10 @@ mod tests {
         let (mut btree, root) = new_btree::<256>();
 
         let big_value = vec![42u8; 4096];
-        btree.insert(root, 1, big_value.clone()).unwrap();
+        btree.insert(root, 1, &big_value).unwrap();
 
         let bigger_value = vec![99u8; 8192];
-        let old = btree.insert(root, 1, bigger_value.clone()).unwrap();
+        let old = btree.insert(root, 1, &bigger_value).unwrap();
         assert_eq!(old, Some(big_value));
         assert_eq!(read_value(&mut btree, root, 1), Some(bigger_value));
     }
@@ -2091,7 +2091,7 @@ mod tests {
         let (mut btree, root) = new_btree::<256>();
 
         let big_value = vec![42u8; 4096];
-        btree.insert(root, 1, big_value.clone()).unwrap();
+        btree.insert(root, 1, &big_value).unwrap();
 
         assert_eq!(btree.remove(root, 1).unwrap(), Some(big_value));
         assert_key_absent(&mut btree, root, 1);
@@ -2101,10 +2101,10 @@ mod tests {
     fn test_big_value_read_range() {
         let (mut btree, root) = new_btree::<256>();
 
-        btree.insert(root, 0, b"small".to_vec()).unwrap();
+        btree.insert(root, 0, b"small").unwrap();
         let big_value = vec![42u8; 2048];
-        btree.insert(root, 1, big_value.clone()).unwrap();
-        btree.insert(root, 2, b"also-small".to_vec()).unwrap();
+        btree.insert(root, 1, &big_value).unwrap();
+        btree.insert(root, 2, b"also-small").unwrap();
 
         let mut results = Vec::new();
         btree
@@ -2124,7 +2124,7 @@ mod tests {
         let mut expected = HashMap::new();
         for i in 0u64..20 {
             let big_value = vec![i as u8; 1024 + (i as usize * 100)];
-            btree.insert(root, i, big_value.clone()).unwrap();
+            btree.insert(root, i, &big_value).unwrap();
             expected.insert(i, big_value);
         }
 
@@ -2143,9 +2143,9 @@ mod tests {
         let (mut btree, root) = new_btree::<256>();
 
         let big_value = vec![42u8; 4096];
-        btree.insert(root, 1, big_value.clone()).unwrap();
+        btree.insert(root, 1, &big_value).unwrap();
 
-        let old = btree.insert(root, 1, b"tiny".to_vec()).unwrap();
+        let old = btree.insert(root, 1, b"tiny").unwrap();
         assert_eq!(old, Some(big_value));
         assert_read_eq(&mut btree, root, 1, b"tiny");
     }
@@ -2154,7 +2154,7 @@ mod tests {
     fn test_free_pages_reused_after_remove() {
         let (mut btree, root) = new_btree::<4096>();
         for i in 0u64..100 {
-            btree.insert(root, i, vec![0u8; 64]).unwrap();
+            btree.insert(root, i, &vec![0u8; 64]).unwrap();
         }
         let pages_after_insert = btree.pager.total_page_count();
 
@@ -2168,7 +2168,7 @@ mod tests {
         );
 
         for i in 0u64..100 {
-            btree.insert(root, i, vec![0u8; 64]).unwrap();
+            btree.insert(root, i, &vec![0u8; 64]).unwrap();
         }
         assert!(
             btree.pager.total_page_count() <= pages_after_insert + 1,
@@ -2182,7 +2182,7 @@ mod tests {
     fn test_free_overflow_pages_on_remove() {
         let (mut btree, root) = new_btree::<256>();
         let big_value = vec![42u8; 4096];
-        btree.insert(root, 1, big_value).unwrap();
+        btree.insert(root, 1, &big_value).unwrap();
         let pages_before = btree.pager.total_page_count();
 
         btree.remove(root, 1).unwrap();
@@ -2193,7 +2193,7 @@ mod tests {
         );
 
         let big_value2 = vec![99u8; 4096];
-        btree.insert(root, 2, big_value2).unwrap();
+        btree.insert(root, 2, &big_value2).unwrap();
         assert!(
             btree.pager.total_page_count() <= pages_before + 1,
             "Overflow pages were not reused"
@@ -2204,10 +2204,10 @@ mod tests {
     fn test_free_overflow_pages_on_update() {
         let (mut btree, root) = new_btree::<256>();
         let big_value = vec![42u8; 4096];
-        btree.insert(root, 1, big_value).unwrap();
+        btree.insert(root, 1, &big_value).unwrap();
         let pages_before = btree.pager.total_page_count();
 
-        btree.insert(root, 1, b"small".to_vec()).unwrap();
+        btree.insert(root, 1, b"small").unwrap();
         assert_ne!(
             btree.pager.read_free_list_head().unwrap(),
             u64::MAX,
@@ -2215,7 +2215,7 @@ mod tests {
         );
 
         let big_value2 = vec![99u8; 4096];
-        btree.insert(root, 2, big_value2).unwrap();
+        btree.insert(root, 2, &big_value2).unwrap();
         assert!(
             btree.pager.total_page_count() <= pages_before + 1,
             "Old overflow pages were not reused on update"
@@ -2240,7 +2240,7 @@ mod tests {
             root = btree.init_tree().unwrap();
 
             for i in 0u64..200 {
-                btree.insert(root, i, vec![0u8; 64]).unwrap();
+                btree.insert(root, i, &vec![0u8; 64]).unwrap();
             }
             for i in 0u64..200 {
                 btree.remove(root, i).unwrap();
@@ -2265,7 +2265,7 @@ mod tests {
             );
 
             for i in 0u64..200 {
-                btree.insert(root, i, vec![0u8; 64]).unwrap();
+                btree.insert(root, i, &vec![0u8; 64]).unwrap();
             }
             assert!(
                 btree.pager.total_page_count() <= pages_before,
@@ -2279,7 +2279,7 @@ mod tests {
         let (mut btree, root) = new_btree::<64>();
         for i in 0u64..256 {
             btree
-                .insert(root, i, format!("v-{}", i).into_bytes())
+                .insert(root, i, format!("v-{}", i).as_bytes())
                 .unwrap();
         }
         btree.assert_no_page_leak(root);
@@ -2289,7 +2289,7 @@ mod tests {
     fn test_no_leak_insert_and_remove_all() {
         let (mut btree, root) = new_btree::<64>();
         for i in 0u64..200 {
-            btree.insert(root, i, vec![0u8; 16]).unwrap();
+            btree.insert(root, i, &vec![0u8; 16]).unwrap();
         }
         for i in 0u64..200 {
             btree.remove(root, i).unwrap();
@@ -2306,7 +2306,7 @@ mod tests {
         keys.shuffle(&mut rng);
         for &k in &keys {
             btree
-                .insert(root, k, format!("val-{}", k).into_bytes())
+                .insert(root, k, format!("val-{}", k).as_bytes())
                 .unwrap();
         }
 
@@ -2336,7 +2336,7 @@ mod tests {
         let (mut btree, root) = new_btree::<256>();
         for i in 0u64..10 {
             let big = vec![i as u8; 1024 + i as usize * 100];
-            btree.insert(root, i, big).unwrap();
+            btree.insert(root, i, &big).unwrap();
         }
         btree.assert_no_page_leak(root);
 
@@ -2349,16 +2349,16 @@ mod tests {
     #[test]
     fn test_no_leak_overflow_update() {
         let (mut btree, root) = new_btree::<256>();
-        btree.insert(root, 1, vec![42u8; 4096]).unwrap();
+        btree.insert(root, 1, &vec![42u8; 4096]).unwrap();
         btree.assert_no_page_leak(root);
 
-        btree.insert(root, 1, b"small".to_vec()).unwrap();
+        btree.insert(root, 1, b"small").unwrap();
         btree.assert_no_page_leak(root);
 
-        btree.insert(root, 1, vec![99u8; 4096]).unwrap();
+        btree.insert(root, 1, &vec![99u8; 4096]).unwrap();
         btree.assert_no_page_leak(root);
 
-        btree.insert(root, 1, vec![77u8; 8192]).unwrap();
+        btree.insert(root, 1, &vec![77u8; 8192]).unwrap();
         btree.assert_no_page_leak(root);
     }
 
@@ -2369,7 +2369,7 @@ mod tests {
         for round in 0..5 {
             let base = round * 100;
             for i in 0u64..100 {
-                btree.insert(root, base + i, vec![0u8; 32]).unwrap();
+                btree.insert(root, base + i, &vec![0u8; 32]).unwrap();
             }
             let start = base + 20;
             let end = base + 80;

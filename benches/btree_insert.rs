@@ -18,7 +18,7 @@ fn bench_sequential_insert(c: &mut Criterion) {
             b.iter(|| {
                 let (mut btree, root) = setup();
                 for i in 0..n as u64 {
-                    btree.insert(root, i, value.clone()).unwrap();
+                    btree.insert(root, i, &value).unwrap();
                 }
                 // flush on drop
             });
@@ -26,7 +26,7 @@ fn bench_sequential_insert(c: &mut Criterion) {
         c.bench_function(&format!("sequential_remove_{n}"), |b| {
             let (mut btree, root) = setup();
             for i in 0..n as u64 {
-                btree.insert(root, i, value.clone()).unwrap();
+                btree.insert(root, i, &value).unwrap();
             }
             b.iter(|| {
                 for i in 0..n as u64 {
