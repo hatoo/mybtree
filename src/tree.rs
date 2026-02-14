@@ -1589,20 +1589,41 @@ impl<const N: usize> Btree<N> {
         let mut current = root;
 
         loop {
-            let page = self.pager.owned_node(current)?;
+            let page = self.pager.read_node(current)?;
             match page.page_type() {
                 PageType::IndexLeaf => {
-                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                    if let Some(key) = leaf.get(value, &mut self.pager)? {
-                        return Ok(Some(key));
+                    let leaf: &IndexLeafPage<N> = page.try_into().unwrap();
+                    match leaf.search_inline(value) {
+                        Ok(result) => {
+                            if let Some(idx) = result {
+                                if leaf.key(idx) == value {
+                                    return Ok(Some(leaf.value(idx)));
+                                }
+                            }
+                            return Ok(None);
+                        }
+                        Err(()) => {
+                            let leaf: IndexLeafPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+                            return Ok(leaf.get(value, &mut self.pager)?);
+                        }
                     }
-                    return Ok(None);
                 }
                 PageType::IndexInternal => {
-                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                    match internal.find_child(value, &mut self.pager)? {
-                        Some(next) => current = next,
-                        None => return Ok(None),
+                    let internal: &IndexInternalPage<N> = page.try_into().unwrap();
+                    match internal.search_inline(value) {
+                        Ok(Some(idx)) => {
+                            current = internal.ptr(idx);
+                        }
+                        Ok(None) => return Ok(None),
+                        Err(()) => {
+                            let internal: IndexInternalPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+                            match internal.find_child(value, &mut self.pager)? {
+                                Some(next) => current = next,
+                                None => return Ok(None),
+                            }
+                        }
                     }
                 }
                 _ => {
