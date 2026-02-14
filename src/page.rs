@@ -1072,7 +1072,12 @@ mod tests {
 
     fn test_pager<const N: usize>() -> Pager<N> {
         let file = tempfile::tempfile().unwrap();
-        Pager::new(file)
+        let mut pager = Pager::new(file);
+        // Reserve page 0 for the free list
+        let fl_page = pager.next_page_num();
+        assert_eq!(fl_page, crate::types::FREE_LIST_PAGE_NUM);
+        pager.write_free_list_head(u64::MAX).unwrap();
+        pager
     }
 
     #[test]
