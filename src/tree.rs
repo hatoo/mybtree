@@ -1650,55 +1650,184 @@ impl<const N: usize> Btree<N> {
         range: &R,
         f: &mut impl FnMut(&[u8], Key),
     ) -> Result<(), TreeError> {
-        let page = self.pager.owned_node(node_ptr)?;
+        let page_type = self.pager.read_node(node_ptr)?.page_type();
+        match page_type {
+            PageType::IndexLeaf => self.index_read_range_leaf(node_ptr, range, f),
+            PageType::IndexInternal => self.index_read_range_internal(node_ptr, range, f),
+            _ => Err(TreeError::UnexpectedPageType {
+                expected: "IndexLeaf or IndexInternal",
+            }),
+        }
+    }
 
-        match page.page_type() {
-            PageType::IndexLeaf => {
-                let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                for i in 0..leaf.len() {
-                    let key_bytes = leaf.resolved_key(i, &mut self.pager)?.into_owned();
-                    if range.contains(&key_bytes.as_slice()) {
-                        f(&key_bytes, leaf.value(i));
-                    }
+    fn index_read_range_leaf<'a, R: RangeBounds<&'a [u8]>>(
+        &mut self,
+        node_ptr: NodePtr,
+        range: &R,
+        f: &mut impl FnMut(&[u8], Key),
+    ) -> Result<(), TreeError> {
+        let page = self.pager.read_node(node_ptr)?;
+        let leaf: &IndexLeafPage<N> = page.try_into().unwrap();
+        let len = leaf.len();
+
+        // Binary search for start position
+        let start_idx = match range.start_bound() {
+            Bound::Unbounded => Ok(0),
+            Bound::Included(s) | Bound::Excluded(s) => {
+                leaf.search_inline(s).map(|opt| opt.unwrap_or(len))
+            }
+        };
+
+        let start_idx = match start_idx {
+            Err(()) => {
+                // Overflow in binary search, fall back to slow path
+                return self.index_read_range_leaf_slow(node_ptr, 0, range, f);
+            }
+            Ok(idx) if idx >= len => return Ok(()),
+            Ok(idx) => idx,
+        };
+
+        // Scan from start_idx with inline key checks
+        for i in start_idx..len {
+            if leaf.is_overflow(i) {
+                // Fall back to slow path for remaining entries
+                return self.index_read_range_leaf_slow(node_ptr, i, range, f);
+            }
+
+            let key_bytes = leaf.key(i);
+
+            // Early termination: past end bound
+            let past_end = match range.end_bound() {
+                Bound::Included(e) => key_bytes > *e,
+                Bound::Excluded(e) => key_bytes >= *e,
+                Bound::Unbounded => false,
+            };
+            if past_end {
+                return Ok(());
+            }
+
+            // Skip entries before Excluded start
+            if let Bound::Excluded(s) = range.start_bound() {
+                if key_bytes == *s {
+                    continue;
                 }
             }
-            PageType::IndexInternal => {
-                let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                for i in 0..internal.len() {
-                    let max_bytes = internal.resolved_key(i, &mut self.pager)?.into_owned();
-                    let ptr = internal.ptr(i);
 
-                    let below_start = match range.start_bound() {
-                        Bound::Included(s) => max_bytes.as_slice() < *s,
-                        Bound::Excluded(s) => max_bytes.as_slice() <= *s,
-                        Bound::Unbounded => false,
-                    };
-                    if below_start {
-                        continue;
-                    }
-
-                    if i > 0 {
-                        let prev_max = internal.resolved_key(i - 1, &mut self.pager)?.into_owned();
-                        let beyond_end = match range.end_bound() {
-                            Bound::Included(e) => prev_max.as_slice() > *e,
-                            Bound::Excluded(e) => prev_max.as_slice() >= *e,
-                            Bound::Unbounded => false,
-                        };
-                        if beyond_end {
-                            break;
-                        }
-                    }
-
-                    self.index_read_range_at(ptr, range, f)?;
-                }
-            }
-            _ => {
-                return Err(TreeError::UnexpectedPageType {
-                    expected: "IndexLeaf or IndexInternal",
-                });
-            }
+            f(key_bytes, leaf.value(i));
         }
 
+        Ok(())
+    }
+
+    fn index_read_range_leaf_slow<'a, R: RangeBounds<&'a [u8]>>(
+        &mut self,
+        node_ptr: NodePtr,
+        from_idx: usize,
+        range: &R,
+        f: &mut impl FnMut(&[u8], Key),
+    ) -> Result<(), TreeError> {
+        let page = self.pager.owned_node(node_ptr)?;
+        let leaf: IndexLeafPage<N> = page.try_into().unwrap();
+        for i in from_idx..leaf.len() {
+            let key_bytes = leaf.resolved_key(i, &mut self.pager)?.into_owned();
+            if range.contains(&key_bytes.as_slice()) {
+                f(&key_bytes, leaf.value(i));
+            }
+            let past_end = match range.end_bound() {
+                Bound::Included(e) => key_bytes.as_slice() > *e,
+                Bound::Excluded(e) => key_bytes.as_slice() >= *e,
+                Bound::Unbounded => false,
+            };
+            if past_end {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn index_read_range_internal<'a, R: RangeBounds<&'a [u8]>>(
+        &mut self,
+        node_ptr: NodePtr,
+        range: &R,
+        f: &mut impl FnMut(&[u8], Key),
+    ) -> Result<(), TreeError> {
+        let page = self.pager.read_node(node_ptr)?;
+        let internal: &IndexInternalPage<N> = page.try_into().unwrap();
+        let len = internal.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        // Binary search for first child whose max_key >= start
+        let start_idx = match range.start_bound() {
+            Bound::Unbounded => Ok(0),
+            Bound::Included(s) | Bound::Excluded(s) => {
+                internal.search_inline(s).map(|opt| opt.unwrap_or(len))
+            }
+        };
+
+        // Binary search for first child whose max_key >= end
+        let end_idx = match range.end_bound() {
+            Bound::Unbounded => Ok(len - 1),
+            Bound::Included(e) | Bound::Excluded(e) => {
+                internal.search_inline(e).map(|opt| opt.unwrap_or(len - 1))
+            }
+        };
+
+        match (start_idx, end_idx) {
+            (Ok(s), _) if s >= len => return Ok(()),
+            (Ok(s), Ok(e)) => {
+                let e = e.min(len - 1);
+                let children: Vec<NodePtr> = (s..=e).map(|i| internal.ptr(i)).collect();
+                // NLL: internal and page no longer used, borrow ends
+                for ptr in children {
+                    self.index_read_range_at(ptr, range, f)?;
+                }
+                Ok(())
+            }
+            _ => {
+                // Overflow in search, fall back to slow path
+                self.index_read_range_internal_slow(node_ptr, range, f)
+            }
+        }
+    }
+
+    fn index_read_range_internal_slow<'a, R: RangeBounds<&'a [u8]>>(
+        &mut self,
+        node_ptr: NodePtr,
+        range: &R,
+        f: &mut impl FnMut(&[u8], Key),
+    ) -> Result<(), TreeError> {
+        let page = self.pager.owned_node(node_ptr)?;
+        let internal: IndexInternalPage<N> = page.try_into().unwrap();
+        for i in 0..internal.len() {
+            let max_bytes = internal.resolved_key(i, &mut self.pager)?.into_owned();
+            let ptr = internal.ptr(i);
+
+            let below_start = match range.start_bound() {
+                Bound::Included(s) => max_bytes.as_slice() < *s,
+                Bound::Excluded(s) => max_bytes.as_slice() <= *s,
+                Bound::Unbounded => false,
+            };
+            if below_start {
+                continue;
+            }
+
+            if i > 0 {
+                let prev_max =
+                    internal.resolved_key(i - 1, &mut self.pager)?.into_owned();
+                let beyond_end = match range.end_bound() {
+                    Bound::Included(e) => prev_max.as_slice() > *e,
+                    Bound::Excluded(e) => prev_max.as_slice() >= *e,
+                    Bound::Unbounded => false,
+                };
+                if beyond_end {
+                    break;
+                }
+            }
+
+            self.index_read_range_at(ptr, range, f)?;
+        }
         Ok(())
     }
 
