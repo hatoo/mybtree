@@ -1006,7 +1006,7 @@ impl<const N: usize> Btree<N> {
                     }
 
                     if leaf.can_insert(value.len()) {
-                        leaf.insert_entry(&value, key, &mut self.pager);
+                        leaf.insert_entry(&value, key, &mut self.pager)?;
                         let page_num = *path.last().unwrap();
                         self.pager.write_node(page_num, leaf.into())?;
                         return Ok(true);
@@ -1020,9 +1020,9 @@ impl<const N: usize> Btree<N> {
                     if cmp == std::cmp::Ordering::Less
                         || (cmp == std::cmp::Ordering::Equal && key <= leaf.value(leaf.len() - 1))
                     {
-                        leaf.insert_entry(&value, key, &mut self.pager);
+                        leaf.insert_entry(&value, key, &mut self.pager)?;
                     } else {
-                        right.insert_entry(&value, key, &mut self.pager);
+                        right.insert_entry(&value, key, &mut self.pager)?;
                     }
 
                     let page_num = *path.last().unwrap();
@@ -1046,9 +1046,9 @@ impl<const N: usize> Btree<N> {
                             if internal.len() == 0 {
                                 let new_leaf_page = self.pager.alloc_page()?;
                                 let mut new_leaf = IndexLeafPage::<N>::new();
-                                new_leaf.insert_entry(&value, key, &mut self.pager);
+                                new_leaf.insert_entry(&value, key, &mut self.pager)?;
                                 self.pager.write_node(new_leaf_page, new_leaf.into())?;
-                                internal.insert(&value, new_leaf_page, &mut self.pager);
+                                internal.insert(&value, new_leaf_page, &mut self.pager)?;
                                 self.pager.write_node(current, internal.into())?;
                                 return Ok(true);
                             } else {
@@ -1056,7 +1056,7 @@ impl<const N: usize> Btree<N> {
                                 let next = internal.ptr(last_idx);
                                 // Update last key to accommodate new value
                                 internal.remove(last_idx);
-                                internal.insert(&value, next, &mut self.pager);
+                                internal.insert(&value, next, &mut self.pager)?;
                                 self.pager.write_node(current, internal.into())?;
                                 current = next;
                             }
@@ -1152,7 +1152,7 @@ impl<const N: usize> Btree<N> {
 
                     // Insert right_page with old max key
                     if parent.can_insert(old_key.len()) {
-                        parent.insert(&old_key, right_page, &mut self.pager);
+                        parent.insert(&old_key, right_page, &mut self.pager)?;
                         self.pager.write_node(parent_ptr, parent.into())?;
                     } else {
                         // Need to split parent too
@@ -1162,9 +1162,9 @@ impl<const N: usize> Btree<N> {
                             .resolved_key(parent.len() - 1, &mut self.pager)?
                             .into_owned();
                         if old_key.as_slice() <= split_key.as_slice() {
-                            parent.insert(&old_key, right_page, &mut self.pager);
+                            parent.insert(&old_key, right_page, &mut self.pager)?;
                         } else {
-                            right_parent.insert(&old_key, right_page, &mut self.pager);
+                            right_parent.insert(&old_key, right_page, &mut self.pager)?;
                         }
 
                         let rp = self.pager.alloc_page()?;
@@ -1203,8 +1203,8 @@ impl<const N: usize> Btree<N> {
             self.pager.write_node(moved_page, root_content)?;
 
             let mut new_root = IndexInternalPage::<N>::new();
-            new_root.insert(&left_max_key, moved_page, &mut self.pager);
-            new_root.insert(&right_max_key, right_page, &mut self.pager);
+            new_root.insert(&left_max_key, moved_page, &mut self.pager)?;
+            new_root.insert(&right_max_key, right_page, &mut self.pager)?;
             self.pager.write_node(root, new_root.into())?;
             Ok(())
         }
