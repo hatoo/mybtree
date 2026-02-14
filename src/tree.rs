@@ -286,8 +286,8 @@ impl<const N: usize> Btree<N> {
 
             // Need to split the parent too
             // Parent is already dirty in cache — owned_node gets it from cache
-            let mut internal: InternalPage<N> =
-                self.pager.owned_node(parent_ptr)?.try_into().unwrap();
+            let internal: &mut InternalPage<N> =
+                self.pager.mut_node(parent_ptr)?.try_into().unwrap();
             let mut right = internal.split();
             let split_key = internal.key(internal.len() - 1);
 
@@ -301,7 +301,6 @@ impl<const N: usize> Btree<N> {
             let new_right_page = self.pager.alloc_page()?;
 
             self.pager.write_node(new_right_page, right.into())?;
-            self.pager.write_node(parent_ptr, internal.into())?;
 
             // Continue up the tree
             cur_left_page = parent_ptr;
