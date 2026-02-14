@@ -263,8 +263,7 @@ impl<const N: usize> Btree<N> {
                 }
                 let i = found_idx.expect("left_page not found in parent during split propagation");
                 // can_insert after removing one and inserting two (net +1)
-                let can_insert =
-                    (parent_ref.len() + 1) * INTERNAL_ELEMENT_SIZE + INTERNAL_HEADER_SIZE <= N;
+                let can_insert = parent_ref.can_insert();
                 (i, parent_ref.key(i), can_insert)
             };
             let right_max_key = old_key;
