@@ -1,11 +1,8 @@
 use std::io;
 use std::ops::{Bound, RangeBounds};
 
-use crate::page::{
-    AnyPage, IndexInternalPage, IndexLeafPage, InternalPage, LeafPage, OVERFLOW_FLAG,
-    OVERFLOW_META_SIZE, PageType,
-};
-use crate::pager::Pager;
+use crate::page::{AnyPage, IndexInternalPage, IndexLeafPage, InternalPage, LeafPage, PageType};
+use crate::pager::{Pager, OVERFLOW_FLAG, OVERFLOW_META_SIZE};
 use crate::types::{FREE_LIST_PAGE_NUM, Key, NodePtr};
 use crate::util::is_overlap;
 
@@ -198,9 +195,7 @@ impl<const N: usize> Btree<N> {
     ) -> Result<(), TreeError> {
         if LeafPage::<N>::needs_overflow(value.len()) {
             let start_page = self.pager.write_overflow(value)?;
-            let mut meta = [0u8; OVERFLOW_META_SIZE];
-            meta[0..8].copy_from_slice(&start_page.to_le_bytes());
-            meta[8..16].copy_from_slice(&(value.len() as u64).to_le_bytes());
+            let meta = Pager::<N>::make_overflow_meta(start_page, value.len() as u64);
 
             let leaf: &mut LeafPage<N> = self.pager.mut_node(leaf_page)?.try_into().unwrap();
             leaf.insert_raw(key, &meta, OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG);
@@ -1032,9 +1027,7 @@ impl<const N: usize> Btree<N> {
                     // Insert left_max_key for left_page
                     if IndexInternalPage::<N>::needs_overflow(left_max_key.len()) {
                         let start_page = self.pager.write_overflow(&left_max_key)?;
-                        let mut meta = [0u8; OVERFLOW_META_SIZE];
-                        meta[0..8].copy_from_slice(&start_page.to_le_bytes());
-                        meta[8..16].copy_from_slice(&(left_max_key.len() as u64).to_le_bytes());
+                        let meta = Pager::<N>::make_overflow_meta(start_page, left_max_key.len() as u64);
                         let idx = parent.len(); // append at end, will re-sort
                         parent.insert_raw_at(
                             idx,

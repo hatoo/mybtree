@@ -1,6 +1,7 @@
 use std::fmt;
 use std::{borrow::Cow, io};
 
+use crate::pager::{OVERFLOW_FLAG, OVERFLOW_META_SIZE, ValueToken};
 use crate::{Key, NodePtr, Pager};
 
 #[repr(u32)]
@@ -11,9 +12,6 @@ pub enum PageType {
     IndexInternal,
     IndexLeaf,
 }
-
-pub const OVERFLOW_FLAG: u16 = 0x8000;
-pub const OVERFLOW_META_SIZE: usize = 16;
 
 #[repr(C)]
 #[derive(Clone)]
@@ -360,33 +358,6 @@ impl<const N: usize> fmt::Debug for InternalPage<N> {
     }
 }
 
-pub enum ValueToken<const N: usize> {
-    Inline(Vec<u8>),
-    Overflow(NodePtr, u64), // (start_page, total_len)
-}
-
-impl<const N: usize> ValueToken<N> {
-    pub fn into_value(self, pager: &mut Pager<N>) -> io::Result<Vec<u8>> {
-        match self {
-            ValueToken::Inline(data) => Ok(data),
-            ValueToken::Overflow(start_page, total_len) => {
-                Ok(pager.read_overflow(start_page, total_len)?)
-            }
-        }
-    }
-
-    pub fn into_value_and_free_overflow_pages(self, pager: &mut Pager<N>) -> io::Result<Vec<u8>> {
-        match self {
-            ValueToken::Inline(data) => Ok(data),
-            ValueToken::Overflow(start_page, total_len) => {
-                let data = pager.read_overflow(start_page, total_len)?;
-                pager.free_overflow_pages(start_page, total_len)?;
-                Ok(data)
-            }
-        }
-    }
-}
-
 impl<const N: usize> LeafPage<N> {
     const LEN_OFFSET: usize = 4;
     const DATA_OFFSET: usize = 6;
@@ -627,9 +598,7 @@ impl<const N: usize> LeafPage<N> {
 
         if Self::needs_overflow(value.len()) {
             let start_page = pager.write_overflow(value)?;
-            let mut meta = [0u8; 16];
-            meta[0..8].copy_from_slice(&start_page.to_le_bytes());
-            meta[8..16].copy_from_slice(&(value.len() as u64).to_le_bytes());
+            let meta = Pager::<N>::make_overflow_meta(start_page, value.len() as u64);
             self.insert_raw(key, &meta, OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG);
         } else {
             self.insert_raw(key, value, value.len() as u16);
@@ -890,9 +859,7 @@ macro_rules! impl_bytes_keyed_page {
 
                 if Self::needs_overflow(key.len()) {
                     let start_page = pager.write_overflow(key)?;
-                    let mut meta = [0u8; 16];
-                    meta[0..8].copy_from_slice(&start_page.to_le_bytes());
-                    meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
+                    let meta = Pager::<N>::make_overflow_meta(start_page, key.len() as u64);
                     self.insert_raw(
                         &meta,
                         OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG,
@@ -1042,9 +1009,7 @@ impl<const N: usize> IndexLeafPage<N> {
 
         if Self::needs_overflow(key.len()) {
             let start_page = pager.write_overflow(key)?;
-            let mut meta = [0u8; 16];
-            meta[0..8].copy_from_slice(&start_page.to_le_bytes());
-            meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
+            let meta = Pager::<N>::make_overflow_meta(start_page, key.len() as u64);
             let raw_key_len = OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG;
             let idx = self
                 .search_entry(&meta, entry_key, pager)?

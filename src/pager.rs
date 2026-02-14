@@ -4,7 +4,37 @@ use std::io;
 use std::num::NonZeroUsize;
 
 use crate::page::AnyPage;
-use crate::types::FREE_LIST_PAGE_NUM;
+use crate::types::{FREE_LIST_PAGE_NUM, NodePtr};
+
+pub const OVERFLOW_FLAG: u16 = 0x8000;
+pub const OVERFLOW_META_SIZE: usize = 16;
+
+pub enum ValueToken<const N: usize> {
+    Inline(Vec<u8>),
+    Overflow(NodePtr, u64), // (start_page, total_len)
+}
+
+impl<const N: usize> ValueToken<N> {
+    pub fn into_value(self, pager: &mut Pager<N>) -> io::Result<Vec<u8>> {
+        match self {
+            ValueToken::Inline(data) => Ok(data),
+            ValueToken::Overflow(start_page, total_len) => {
+                Ok(pager.read_overflow(start_page, total_len)?)
+            }
+        }
+    }
+
+    pub fn into_value_and_free_overflow_pages(self, pager: &mut Pager<N>) -> io::Result<Vec<u8>> {
+        match self {
+            ValueToken::Inline(data) => Ok(data),
+            ValueToken::Overflow(start_page, total_len) => {
+                let data = pager.read_overflow(start_page, total_len)?;
+                pager.free_overflow_pages(start_page, total_len)?;
+                Ok(data)
+            }
+        }
+    }
+}
 
 #[cfg(unix)]
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -245,6 +275,14 @@ impl<const N: usize> Pager<N> {
         let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
         let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
         (start_page, total_len)
+    }
+
+    /// Build overflow metadata bytes from start_page and total_len.
+    pub fn make_overflow_meta(start_page: u64, total_len: u64) -> [u8; OVERFLOW_META_SIZE] {
+        let mut meta = [0u8; OVERFLOW_META_SIZE];
+        meta[0..8].copy_from_slice(&start_page.to_le_bytes());
+        meta[8..16].copy_from_slice(&total_len.to_le_bytes());
+        meta
     }
 
     /// Write overflow data across multiple pages, returns start page number.
