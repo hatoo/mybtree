@@ -811,19 +811,6 @@ impl<const N: usize> Btree<N> {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    //  Leaf value helpers
-    // ────────────────────────────────────────────────────────────────────
-
-    fn read_leaf_value(&mut self, leaf: &LeafPage<N>, index: usize) -> io::Result<Vec<u8>> {
-        if leaf.is_overflow(index) {
-            let (start_page, total_len) = Pager::<N>::parse_overflow_meta(leaf.value(index));
-            self.pager.read_overflow(start_page, total_len)
-        } else {
-            Ok(leaf.value(index).to_vec())
-        }
-    }
-
-    // ────────────────────────────────────────────────────────────────────
     //  Index tree operations
     // ────────────────────────────────────────────────────────────────────
 
