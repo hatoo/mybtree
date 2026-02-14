@@ -2,7 +2,7 @@ use std::io;
 use std::ops::{Bound, RangeBounds};
 
 use crate::page::{AnyPage, IndexInternalPage, IndexLeafPage, InternalPage, LeafPage, PageType};
-use crate::pager::{Pager, OVERFLOW_FLAG, OVERFLOW_META_SIZE};
+use crate::pager::{OVERFLOW_FLAG, OVERFLOW_META_SIZE, Pager};
 use crate::types::{FREE_LIST_PAGE_NUM, Key, NodePtr};
 use crate::util::is_overlap;
 
@@ -225,14 +225,14 @@ impl<const N: usize> Btree<N> {
         loop {
             if depth == 0 {
                 // Splitting the root — create a new internal root
-                let right_content = self.pager.owned_node(cur_right_page)?;
+                let right_content = self.pager.read_node(cur_right_page)?;
                 let right_max_key = match right_content.page_type() {
                     PageType::Leaf => {
-                        let r: LeafPage<N> = right_content.try_into().unwrap();
+                        let r: &LeafPage<N> = right_content.try_into().unwrap();
                         r.key(r.len() - 1)
                     }
                     PageType::Internal => {
-                        let r: InternalPage<N> = right_content.try_into().unwrap();
+                        let r: &InternalPage<N> = right_content.try_into().unwrap();
                         r.key(r.len() - 1)
                     }
                     _ => unreachable!(),
@@ -1027,7 +1027,8 @@ impl<const N: usize> Btree<N> {
                     // Insert left_max_key for left_page
                     if IndexInternalPage::<N>::needs_overflow(left_max_key.len()) {
                         let start_page = self.pager.write_overflow(&left_max_key)?;
-                        let meta = Pager::<N>::make_overflow_meta(start_page, left_max_key.len() as u64);
+                        let meta =
+                            Pager::<N>::make_overflow_meta(start_page, left_max_key.len() as u64);
                         let idx = parent.len(); // append at end, will re-sort
                         parent.insert_raw_at(
                             idx,
