@@ -889,8 +889,7 @@ impl<const N: usize> Btree<N> {
                             }
                             let insert_idx = result.unwrap_or(leaf.len());
                             let can_insert = leaf.can_insert(value.len());
-                            let needs_overflow =
-                                IndexLeafPage::<N>::needs_overflow(value.len());
+                            let needs_overflow = IndexLeafPage::<N>::needs_overflow(value.len());
                             // Borrow from read_node ends after last use of leaf above
 
                             if can_insert {
@@ -1043,26 +1042,17 @@ impl<const N: usize> Btree<N> {
                                     if internal.len() == 0 {
                                         let new_leaf_page = self.pager.alloc_page()?;
                                         let mut new_leaf = IndexLeafPage::<N>::new();
-                                        new_leaf
-                                            .insert_entry(value, key, &mut self.pager)?;
-                                        self.pager
-                                            .write_node(new_leaf_page, new_leaf.into())?;
-                                        internal.insert(
-                                            value,
-                                            new_leaf_page,
-                                            &mut self.pager,
-                                        )?;
-                                        self.pager
-                                            .write_node(current, internal.into())?;
+                                        new_leaf.insert_entry(value, key, &mut self.pager)?;
+                                        self.pager.write_node(new_leaf_page, new_leaf.into())?;
+                                        internal.insert(value, new_leaf_page, &mut self.pager)?;
+                                        self.pager.write_node(current, internal.into())?;
                                         return Ok(true);
                                     } else {
                                         let last_idx = internal.len() - 1;
                                         let next = internal.ptr(last_idx);
                                         internal.remove(last_idx);
-                                        internal
-                                            .insert(value, next, &mut self.pager)?;
-                                        self.pager
-                                            .write_node(current, internal.into())?;
+                                        internal.insert(value, next, &mut self.pager)?;
+                                        self.pager.write_node(current, internal.into())?;
                                         current = next;
                                     }
                                 }
@@ -1255,8 +1245,7 @@ impl<const N: usize> Btree<N> {
 
                             {
                                 let p = self.pager.mut_node(current)?;
-                                let leaf_mut: &mut IndexLeafPage<N> =
-                                    p.try_into().unwrap();
+                                let leaf_mut: &mut IndexLeafPage<N> = p.try_into().unwrap();
                                 leaf_mut.remove(idx);
                             }
                             self.index_merge_leaf(&path)?;
@@ -1269,9 +1258,7 @@ impl<const N: usize> Btree<N> {
                             // Has overflow keys: fallback
                             let leaf: IndexLeafPage<N> =
                                 self.pager.owned_node(current)?.try_into().unwrap();
-                            if let Some(idx) =
-                                leaf.find_entry(value, key, &mut self.pager)?
-                            {
+                            if let Some(idx) = leaf.find_entry(value, key, &mut self.pager)? {
                                 let overflow_meta = if leaf.is_overflow(idx) {
                                     Some(Pager::<N>::parse_overflow_meta(leaf.key(idx)))
                                 } else {
@@ -1279,14 +1266,12 @@ impl<const N: usize> Btree<N> {
                                 };
                                 {
                                     let p = self.pager.mut_node(current)?;
-                                    let leaf_mut: &mut IndexLeafPage<N> =
-                                        p.try_into().unwrap();
+                                    let leaf_mut: &mut IndexLeafPage<N> = p.try_into().unwrap();
                                     leaf_mut.remove(idx);
                                 }
                                 self.index_merge_leaf(&path)?;
                                 if let Some((start_page, total_len)) = overflow_meta {
-                                    self.pager
-                                        .free_overflow_pages(start_page, total_len)?;
+                                    self.pager.free_overflow_pages(start_page, total_len)?;
                                 }
                                 return Ok(true);
                             }
@@ -1600,14 +1585,8 @@ impl<const N: usize> Btree<N> {
         Ok(true)
     }
 
-    pub fn index_read<T>(
-        &mut self,
-        root: NodePtr,
-        value: &[u8],
-        f: impl FnOnce(Option<Key>) -> T,
-    ) -> Result<T, TreeError> {
+    pub fn index_read(&mut self, root: NodePtr, value: &[u8]) -> Result<Option<Key>, TreeError> {
         let mut current = root;
-        let mut ff = Some(f);
 
         loop {
             let page = self.pager.owned_node(current)?;
@@ -1615,15 +1594,15 @@ impl<const N: usize> Btree<N> {
                 PageType::IndexLeaf => {
                     let leaf: IndexLeafPage<N> = page.try_into().unwrap();
                     if let Some(key) = leaf.get(value, &mut self.pager)? {
-                        return Ok(ff.take().unwrap()(Some(key)));
+                        return Ok(Some(key));
                     }
-                    return Ok(ff.take().unwrap()(None));
+                    return Ok(None);
                 }
                 PageType::IndexInternal => {
                     let internal: IndexInternalPage<N> = page.try_into().unwrap();
                     match internal.find_child(value, &mut self.pager)? {
                         Some(next) => current = next,
-                        None => return Ok(ff.take().unwrap()(None)),
+                        None => return Ok(None),
                     }
                 }
                 _ => {
@@ -2585,7 +2564,7 @@ mod tests {
         root: NodePtr,
         value: &[u8],
     ) -> Option<Key> {
-        btree.index_read(root, value, |k| k).unwrap()
+        btree.index_read(root, value).unwrap()
     }
 
     #[test]
@@ -2812,7 +2791,7 @@ mod tests {
         let big_value = vec![42u8; 4096];
         assert!(btree.index_insert(root, 1, big_value.as_slice()).unwrap());
 
-        let found = btree.index_read(root, &big_value, |k| k).unwrap();
+        let found = btree.index_read(root, &big_value).unwrap();
         assert_eq!(found, Some(1));
     }
 

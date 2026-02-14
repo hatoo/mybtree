@@ -378,7 +378,7 @@ impl<'a, const N: usize> Transaction<'a, N> {
         }
 
         // Read from btree
-        let btree_key = inner.btree.index_read(idx_root, value, |k| k)?;
+        let btree_key = inner.btree.index_read(idx_root, value)?;
 
         if let Some(key) = btree_key {
             if let Some(op) = inner.active_transactions.get(&self.tx_id) {
