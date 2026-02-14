@@ -64,7 +64,7 @@ fn bench_sequential_insert(c: &mut Criterion) {
             b.iter(|| {
                 for i in 0..n as u64 {
                     value[0..8].copy_from_slice(&i.to_be_bytes());
-                    btree.index_insert(root, i, value.clone()).unwrap();
+                    btree.index_insert(root, i, &value).unwrap();
                 }
                 // flush on drop
             });

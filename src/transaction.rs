@@ -472,7 +472,7 @@ impl<'a, const N: usize> Transaction<'a, N> {
         // Apply deferred index operations
         for ((idx_root, value_bytes, key), is_insert) in current_op.index_ops {
             if is_insert {
-                inner.btree.index_insert(idx_root, key, value_bytes)?;
+                inner.btree.index_insert(idx_root, key, &value_bytes)?;
             } else {
                 inner.btree.index_remove(idx_root, &value_bytes, key)?;
             }

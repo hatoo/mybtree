@@ -865,7 +865,7 @@ impl<const N: usize> Btree<N> {
         &mut self,
         root: NodePtr,
         key: Key,
-        value: Vec<u8>,
+        value: &[u8],
     ) -> Result<bool, TreeError> {
         let mut current = root;
         let mut path = vec![];
@@ -894,7 +894,7 @@ impl<const N: usize> Btree<N> {
                     let mut right = leaf.split();
                     // Determine which half to insert into
                     let split_key_bytes = leaf.resolved_key(leaf.len() - 1, &mut self.pager)?;
-                    let cmp = value.as_slice().cmp(split_key_bytes.as_ref());
+                    let cmp = value.cmp(split_key_bytes.as_ref());
                     if cmp == std::cmp::Ordering::Less
                         || (cmp == std::cmp::Ordering::Equal && key <= leaf.value(leaf.len() - 1))
                     {
@@ -2407,23 +2407,23 @@ mod tests {
     #[test]
     fn test_index_insert_and_read() {
         let (mut btree, root) = new_index_btree::<4096>();
-        assert!(btree.index_insert(root, 42, b"hello".to_vec()).unwrap());
+        assert!(btree.index_insert(root, 42, b"hello").unwrap());
         assert_eq!(index_read_key(&mut btree, root, b"hello"), Some(42));
     }
 
     #[test]
     fn test_index_insert_duplicate_returns_false() {
         let (mut btree, root) = new_index_btree::<4096>();
-        assert!(btree.index_insert(root, 1, b"val".to_vec()).unwrap());
-        assert!(!btree.index_insert(root, 1, b"val".to_vec()).unwrap());
+        assert!(btree.index_insert(root, 1, b"val").unwrap());
+        assert!(!btree.index_insert(root, 1, b"val").unwrap());
     }
 
     #[test]
     fn test_index_same_value_different_keys() {
         let (mut btree, root) = new_index_btree::<4096>();
-        assert!(btree.index_insert(root, 1, b"dup".to_vec()).unwrap());
-        assert!(btree.index_insert(root, 2, b"dup".to_vec()).unwrap());
-        assert!(btree.index_insert(root, 3, b"dup".to_vec()).unwrap());
+        assert!(btree.index_insert(root, 1, b"dup").unwrap());
+        assert!(btree.index_insert(root, 2, b"dup").unwrap());
+        assert!(btree.index_insert(root, 3, b"dup").unwrap());
 
         let key = index_read_key(&mut btree, root, b"dup");
         assert!(key == Some(1) || key == Some(2) || key == Some(3));
@@ -2432,15 +2432,15 @@ mod tests {
     #[test]
     fn test_index_read_absent() {
         let (mut btree, root) = new_index_btree::<4096>();
-        btree.index_insert(root, 1, b"exists".to_vec()).unwrap();
+        btree.index_insert(root, 1, b"exists").unwrap();
         assert_eq!(index_read_key(&mut btree, root, b"missing"), None);
     }
 
     #[test]
     fn test_index_remove() {
         let (mut btree, root) = new_index_btree::<4096>();
-        btree.index_insert(root, 1, b"alpha".to_vec()).unwrap();
-        btree.index_insert(root, 2, b"beta".to_vec()).unwrap();
+        btree.index_insert(root, 1, b"alpha").unwrap();
+        btree.index_insert(root, 2, b"beta").unwrap();
 
         assert!(btree.index_remove(root, b"alpha", 1).unwrap());
         assert_eq!(index_read_key(&mut btree, root, b"alpha"), None);
@@ -2450,7 +2450,7 @@ mod tests {
     #[test]
     fn test_index_remove_absent() {
         let (mut btree, root) = new_index_btree::<4096>();
-        btree.index_insert(root, 1, b"data".to_vec()).unwrap();
+        btree.index_insert(root, 1, b"data").unwrap();
 
         assert!(!btree.index_remove(root, b"nonexistent", 1).unwrap());
     }
@@ -2458,8 +2458,8 @@ mod tests {
     #[test]
     fn test_index_remove_wrong_key_same_value() {
         let (mut btree, root) = new_index_btree::<4096>();
-        btree.index_insert(root, 1, b"shared".to_vec()).unwrap();
-        btree.index_insert(root, 2, b"shared".to_vec()).unwrap();
+        btree.index_insert(root, 1, b"shared").unwrap();
+        btree.index_insert(root, 2, b"shared").unwrap();
 
         assert!(!btree.index_remove(root, b"shared", 99).unwrap());
 
@@ -2478,7 +2478,7 @@ mod tests {
             (b"elderberry", 5),
         ];
         for (v, k) in &values {
-            btree.index_insert(root, *k, v.to_vec()).unwrap();
+            btree.index_insert(root, *k, *v).unwrap();
         }
 
         for (v, k) in &values {
@@ -2493,12 +2493,12 @@ mod tests {
 
         for i in 0u64..256 {
             let value = format!("value-{:04}", i).as_bytes().to_vec();
-            btree.index_insert(root, i, value.clone()).unwrap();
+            btree.index_insert(root, i, value.as_slice()).unwrap();
             map.insert(value, i);
         }
 
         for (value, key) in &map {
-            let found = index_read_key(&mut btree, root, value);
+            let found = index_read_key(&mut btree, root, value.as_slice());
             assert_eq!(found, Some(*key), "Failed to find value {:?}", value);
         }
     }
@@ -2515,17 +2515,17 @@ mod tests {
         entries.shuffle(&mut rng);
 
         for (k, v) in &entries {
-            assert!(btree.index_insert(root, *k, v.clone()).unwrap());
+            assert!(btree.index_insert(root, *k, v.as_slice()).unwrap());
         }
 
         for (k, v) in &entries {
-            assert_eq!(index_read_key(&mut btree, root, v), Some(*k));
+            assert_eq!(index_read_key(&mut btree, root, v.as_slice()), Some(*k));
         }
 
         entries.shuffle(&mut rng);
         for (k, v) in &entries {
-            assert!(btree.index_remove(root, v, *k).unwrap());
-            assert_eq!(index_read_key(&mut btree, root, v), None);
+            assert!(btree.index_remove(root, v.as_slice(), *k).unwrap());
+            assert_eq!(index_read_key(&mut btree, root, v.as_slice()), None);
         }
     }
 
@@ -2533,11 +2533,11 @@ mod tests {
     fn test_index_read_range() {
         let (mut btree, root) = new_index_btree::<4096>();
 
-        btree.index_insert(root, 1, b"aaa".to_vec()).unwrap();
-        btree.index_insert(root, 2, b"bbb".to_vec()).unwrap();
-        btree.index_insert(root, 3, b"ccc".to_vec()).unwrap();
-        btree.index_insert(root, 4, b"ddd".to_vec()).unwrap();
-        btree.index_insert(root, 5, b"eee".to_vec()).unwrap();
+        btree.index_insert(root, 1, b"aaa").unwrap();
+        btree.index_insert(root, 2, b"bbb").unwrap();
+        btree.index_insert(root, 3, b"ccc").unwrap();
+        btree.index_insert(root, 4, b"ddd").unwrap();
+        btree.index_insert(root, 5, b"eee").unwrap();
 
         let mut results = Vec::new();
         btree
@@ -2557,7 +2557,7 @@ mod tests {
         let (mut btree, root) = new_index_btree::<4096>();
         for i in 0u64..10 {
             btree
-                .index_insert(root, i, format!("{:02}", i).into_bytes())
+                .index_insert(root, i, format!("{:02}", i).into_bytes().as_slice())
                 .unwrap();
         }
 
@@ -2571,7 +2571,7 @@ mod tests {
     #[test]
     fn test_index_read_range_empty() {
         let (mut btree, root) = new_index_btree::<4096>();
-        btree.index_insert(root, 1, b"aaa".to_vec()).unwrap();
+        btree.index_insert(root, 1, b"aaa").unwrap();
 
         let mut results = Vec::new();
         btree
@@ -2587,13 +2587,13 @@ mod tests {
         let (mut btree, root) = new_index_btree::<4096>();
         assert_eq!(btree.index_available_key(root).unwrap(), 0);
 
-        btree.index_insert(root, 5, b"aaa".to_vec()).unwrap();
+        btree.index_insert(root, 5, b"aaa").unwrap();
         assert_eq!(btree.index_available_key(root).unwrap(), 6);
 
-        btree.index_insert(root, 10, b"bbb".to_vec()).unwrap();
+        btree.index_insert(root, 10, b"bbb").unwrap();
         assert_eq!(btree.index_available_key(root).unwrap(), 11);
 
-        btree.index_insert(root, 7, b"ccc".to_vec()).unwrap();
+        btree.index_insert(root, 7, b"ccc").unwrap();
         assert_eq!(btree.index_available_key(root).unwrap(), 11);
     }
 
@@ -2602,7 +2602,7 @@ mod tests {
         let (mut btree, root) = new_index_btree::<256>();
         for i in 0u64..100 {
             btree
-                .index_insert(root, i, format!("v-{}", i).into_bytes())
+                .index_insert(root, i, format!("v-{}", i).into_bytes().as_slice())
                 .unwrap();
         }
         let pages_before = btree.pager.total_page_count();
@@ -2613,7 +2613,7 @@ mod tests {
         let root2 = btree.init_index().unwrap();
         for i in 0u64..100 {
             btree
-                .index_insert(root2, i, format!("v-{}", i).into_bytes())
+                .index_insert(root2, i, format!("v-{}", i).into_bytes().as_slice())
                 .unwrap();
         }
         assert!(
@@ -2626,7 +2626,7 @@ mod tests {
     fn test_index_big_values() {
         let (mut btree, root) = new_index_btree::<256>();
         let big_value = vec![42u8; 4096];
-        assert!(btree.index_insert(root, 1, big_value.clone()).unwrap());
+        assert!(btree.index_insert(root, 1, big_value.as_slice()).unwrap());
 
         let found = btree.index_read(root, &big_value, |k| k).unwrap();
         assert_eq!(found, Some(1));
@@ -2636,7 +2636,7 @@ mod tests {
     fn test_index_big_value_remove() {
         let (mut btree, root) = new_index_btree::<256>();
         let big_value = vec![42u8; 4096];
-        btree.index_insert(root, 1, big_value.clone()).unwrap();
+        btree.index_insert(root, 1, big_value.as_slice()).unwrap();
 
         assert!(btree.index_remove(root, &big_value, 1).unwrap());
     }
@@ -2646,7 +2646,7 @@ mod tests {
         let (mut btree, root) = new_index_btree::<256>();
         for i in 0u64..256 {
             btree
-                .index_insert(root, i, format!("v-{:04}", i).into_bytes())
+                .index_insert(root, i, format!("v-{:04}", i).into_bytes().as_slice())
                 .unwrap();
         }
         btree.assert_no_page_leak_index(root);
@@ -2660,10 +2660,10 @@ mod tests {
             .collect();
 
         for (k, v) in &entries {
-            btree.index_insert(root, *k, v.clone()).unwrap();
+            btree.index_insert(root, *k, v.as_slice()).unwrap();
         }
         for (k, v) in &entries {
-            btree.index_remove(root, v, *k).unwrap();
+            btree.index_remove(root, v.as_slice(), *k).unwrap();
         }
         btree.assert_no_page_leak_index(root);
     }
@@ -2678,12 +2678,12 @@ mod tests {
             .collect();
         entries.shuffle(&mut rng);
         for (k, v) in &entries {
-            btree.index_insert(root, *k, v.clone()).unwrap();
+            btree.index_insert(root, *k, v.as_slice()).unwrap();
         }
 
         entries.shuffle(&mut rng);
         for (k, v) in &entries {
-            btree.index_remove(root, v, *k).unwrap();
+            btree.index_remove(root, v.as_slice(), *k).unwrap();
         }
         btree.assert_no_page_leak_index(root);
     }
@@ -2696,12 +2696,12 @@ mod tests {
             .collect();
 
         for (k, v) in &entries {
-            btree.index_insert(root, *k, v.clone()).unwrap();
+            btree.index_insert(root, *k, v.as_slice()).unwrap();
         }
         btree.assert_no_page_leak_index(root);
 
         for (k, v) in &entries {
-            btree.index_remove(root, v, *k).unwrap();
+            btree.index_remove(root, v.as_slice(), *k).unwrap();
         }
         btree.assert_no_page_leak_index(root);
     }
@@ -2715,7 +2715,7 @@ mod tests {
             .map(|i| format!("{:04}", i).into_bytes())
             .collect();
         for (i, v) in values.iter().enumerate() {
-            btree.index_insert(root, i as u64, v.clone()).unwrap();
+            btree.index_insert(root, i as u64, v.as_slice()).unwrap();
         }
 
         let mut result = Vec::new();
@@ -2737,7 +2737,7 @@ mod tests {
 
         for i in 0u64..200 {
             btree
-                .index_insert(root, i, format!("{:04}", i).into_bytes())
+                .index_insert(root, i, format!("{:04}", i).into_bytes().as_slice())
                 .unwrap();
         }
 
