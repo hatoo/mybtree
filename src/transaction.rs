@@ -167,9 +167,7 @@ impl<'a, const N: usize> Transaction<'a, N> {
                 return Ok(value.clone());
             }
         }
-        let value = inner
-            .btree
-            .read(root, key, |f: Option<&[u8]>| f.map(|v| v.to_vec()))?;
+        let value = inner.btree.read(root, key)?.map(|v| v.to_vec());
         Ok(value)
     }
 

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io;
 use std::ops::{Bound, RangeBounds};
 
@@ -672,39 +673,36 @@ impl<const N: usize> Btree<N> {
     //  Primary tree: read
     // ────────────────────────────────────────────────────────────────────
 
-    pub fn read<T>(
-        &mut self,
-        root: NodePtr,
-        key: Key,
-        f: impl FnOnce(Option<&[u8]>) -> T,
-    ) -> Result<T, TreeError> {
+    pub fn read(&mut self, root: NodePtr, key: Key) -> Result<Option<Cow<'_, [u8]>>, TreeError> {
         let mut current = root;
 
         loop {
-            let page = self.pager.owned_node(current)?;
+            let page: &AnyPage<N> = self.pager.read_node(current)?;
 
             match page.page_type() {
                 PageType::Leaf => {
-                    let leaf: LeafPage<N> = page.try_into().unwrap();
+                    let leaf: &'_ LeafPage<N> = page.try_into().unwrap();
                     match leaf.search_key(key) {
                         Ok(index) => {
                             if leaf.is_overflow(index) {
                                 let (start_page, total_len) =
                                     Pager::<N>::parse_overflow_meta(leaf.value(index));
+
                                 let data = self.pager.read_overflow(start_page, total_len)?;
-                                return Ok(f(Some(&data)));
+                                return Ok(Some(Cow::Owned(data)));
                             } else {
-                                return Ok(f(Some(leaf.value(index))));
+                                let leaf: &LeafPage<N> = unsafe { std::mem::transmute(leaf) };
+                                return Ok(Some(Cow::Borrowed(leaf.value(index))));
                             }
                         }
-                        Err(_) => return Ok(f(None)),
+                        Err(_) => return Ok(None),
                     }
                 }
                 PageType::Internal => {
-                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    let internal: &InternalPage<N> = page.try_into().unwrap();
                     match internal.search_index(key) {
                         Some(idx) => current = internal.ptr(idx),
-                        None => return Ok(f(None)),
+                        None => return Ok(None),
                     }
                 }
                 _ => {
@@ -1780,7 +1778,7 @@ mod tests {
         root: NodePtr,
         key: Key,
     ) -> Option<Vec<u8>> {
-        btree.read(root, key, |v| v.map(|b| b.to_vec())).unwrap()
+        btree.read(root, key).unwrap().map(|v| v.to_vec())
     }
 
     fn assert_read_eq<const N: usize>(
@@ -1789,8 +1787,9 @@ mod tests {
         key: Key,
         expected: &[u8],
     ) {
-        assert!(
-            btree.read(root, key, |v| v == Some(expected)).unwrap(),
+        assert_eq!(
+            btree.read(root, key).unwrap().unwrap(),
+            expected,
             "Key {} value mismatch",
             key
         );
@@ -1798,7 +1797,7 @@ mod tests {
 
     fn assert_key_exists<const N: usize>(btree: &mut Btree<N>, root: NodePtr, key: Key) {
         assert!(
-            btree.read(root, key, |v| v.is_some()).unwrap(),
+            btree.read(root, key).unwrap().is_some(),
             "Key {} should exist",
             key
         );
@@ -1806,7 +1805,7 @@ mod tests {
 
     fn assert_key_absent<const N: usize>(btree: &mut Btree<N>, root: NodePtr, key: Key) {
         assert!(
-            btree.read(root, key, |v| v.is_none()).unwrap(),
+            btree.read(root, key).unwrap().is_none(),
             "Key {} should be absent",
             key
         );
