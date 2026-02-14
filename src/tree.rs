@@ -320,35 +320,25 @@ impl<const N: usize> Btree<N> {
 
         loop {
             path.push(current);
-            let page = self.pager.owned_node(current)?;
+            let page = self.pager.mut_node(current)?;
 
             match page.page_type() {
                 PageType::Leaf => {
-                    let leaf: LeafPage<N> = page.try_into().unwrap();
+                    let leaf: &mut LeafPage<N> = page.try_into().unwrap();
                     match leaf.search_key(key) {
                         Ok(index) => {
-                            let old_bytes = self.read_leaf_value(&leaf, index)?;
-                            let overflow_meta = if leaf.is_overflow(index) {
-                                Some(Pager::<N>::parse_overflow_meta(leaf.value(index)))
-                            } else {
-                                None
-                            };
-                            {
-                                let p = self.pager.mut_node(current)?;
-                                let leaf_mut: &mut LeafPage<N> = p.try_into().unwrap();
-                                leaf_mut.remove(index);
-                            }
+                            let value_token = leaf.value_token(index);
+                            leaf.remove(index);
+                            let old_bytes =
+                                value_token.into_value_and_free_overflow_pages(&mut self.pager)?;
                             self.merge_leaf(&path)?;
-                            if let Some((start_page, total_len)) = overflow_meta {
-                                self.pager.free_overflow_pages(start_page, total_len)?;
-                            }
                             return Ok(Some(old_bytes));
                         }
                         Err(_) => return Ok(None),
                     }
                 }
                 PageType::Internal => {
-                    let internal: InternalPage<N> = page.try_into().unwrap();
+                    let internal: &mut InternalPage<N> = page.try_into().unwrap();
                     match internal.search_index(key) {
                         Some(idx) => current = internal.ptr(idx),
                         None => return Ok(None),
