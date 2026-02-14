@@ -822,28 +822,34 @@ impl<const N: usize> Btree<N> {
     pub fn free_index_tree(&mut self, root: NodePtr) -> Result<(), TreeError> {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            let page = self.pager.owned_node(node)?;
+            let page = self.pager.read_node(node)?;
             match page.page_type() {
                 PageType::IndexLeaf => {
-                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                    for i in 0..leaf.len() {
-                        if leaf.is_overflow(i) {
-                            let (start_page, total_len) =
-                                Pager::<N>::parse_overflow_meta(leaf.key(i));
-                            self.pager.free_overflow_pages(start_page, total_len)?;
-                        }
+                    let leaf: &IndexLeafPage<N> = page.try_into().unwrap();
+                    let overflow_pages_to_free = (0..leaf.len())
+                        .filter(|&i| leaf.is_overflow(i))
+                        .map(|i| Pager::<N>::parse_overflow_meta(leaf.key(i)))
+                        .collect::<Vec<_>>();
+                    self.pager.free_page(node)?;
+                    for (start_page, total_len) in overflow_pages_to_free {
+                        self.pager.free_overflow_pages(start_page, total_len)?;
                     }
                 }
                 PageType::IndexInternal => {
-                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
+                    let internal: &IndexInternalPage<N> = page.try_into().unwrap();
+                    let mut overflow_pages_to_free = Vec::new();
                     for i in 0..internal.len() {
                         if internal.is_overflow(i) {
                             let (start_page, total_len) =
                                 Pager::<N>::parse_overflow_meta(internal.key(i));
-                            self.pager.free_overflow_pages(start_page, total_len)?;
+                            overflow_pages_to_free.push((start_page, total_len));
                         }
                         stack.push(internal.ptr(i));
                     }
+                    for (start_page, total_len) in overflow_pages_to_free {
+                        self.pager.free_overflow_pages(start_page, total_len)?;
+                    }
+                    self.pager.free_page(node)?;
                 }
                 _ => {
                     return Err(TreeError::UnexpectedPageType {
@@ -851,7 +857,6 @@ impl<const N: usize> Btree<N> {
                     });
                 }
             }
-            self.pager.free_page(node)?;
         }
         Ok(())
     }
