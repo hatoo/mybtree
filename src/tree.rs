@@ -101,18 +101,22 @@ impl<const N: usize> Btree<N> {
 
             match page.page_type() {
                 PageType::Leaf => {
-                    let mut leaf: LeafPage<N> = page.clone().try_into().unwrap();
+                    let leaf: &LeafPage<N> = page.try_into().unwrap();
                     match leaf.search_key(key) {
                         Ok(index) => {
+                            let value_token = leaf.value_token(index);
                             // Key exists — read old value, remove old entry, insert new
-                            let old_bytes = self.read_leaf_value(&leaf, index)?;
+                            let old_bytes = value_token.into_value(&mut self.pager);
+
+                            let leaf: &mut LeafPage<N> =
+                                self.pager.mut_node(current)?.try_into().unwrap();
                             let overflow_meta = if leaf.is_overflow(index) {
                                 Some(Self::parse_overflow_meta(leaf.value(index)))
                             } else {
                                 None
                             };
                             leaf.remove(index);
-                            self.leaf_insert_and_propagate(root, &path, leaf, key, &value)?;
+                            self.leaf_insert_and_propagate(root, &path, current, key, &value)?;
                             if let Some((start_page, total_len)) = overflow_meta {
                                 self.free_overflow_pages(start_page, total_len)?;
                             }
@@ -120,7 +124,7 @@ impl<const N: usize> Btree<N> {
                         }
                         Err(_) => {
                             // New key
-                            self.leaf_insert_and_propagate(root, &path, leaf, key, &value)?;
+                            self.leaf_insert_and_propagate(root, &path, current, key, &value)?;
                             return Ok(None);
                         }
                     }
@@ -169,10 +173,11 @@ impl<const N: usize> Btree<N> {
         &mut self,
         root: NodePtr,
         path: &[NodePtr],
-        mut leaf: LeafPage<N>,
+        leaf_page: NodePtr,
         key: Key,
         value: &[u8],
     ) -> Result<(), TreeError> {
+        let mut leaf: LeafPage<N> = self.pager.owned_node(leaf_page)?.try_into().unwrap();
         if leaf.can_insert(value.len()) {
             self.leaf_insert_entry(&mut leaf, key, value)?;
             let page = *path.last().unwrap();
