@@ -360,9 +360,20 @@ impl<const N: usize> fmt::Debug for InternalPage<N> {
     }
 }
 
-pub enum ValueToken {
+pub enum ValueToken<const N: usize> {
     Inline(Vec<u8>),
-    Overflow(NodePtr, usize), // (start_page, total_len)
+    Overflow(NodePtr, u64), // (start_page, total_len)
+}
+
+impl<const N: usize> ValueToken<N> {
+    pub fn into_value(self, pager: &mut Pager<N>) -> Vec<u8> {
+        match self {
+            ValueToken::Inline(data) => data,
+            ValueToken::Overflow(start_page, total_len) => {
+                pager.read_overflow(start_page, total_len)
+            }
+        }
+    }
 }
 
 impl<const N: usize> LeafPage<N> {
@@ -446,14 +457,14 @@ impl<const N: usize> LeafPage<N> {
         &self.page[value_offset..value_offset + value_len]
     }
 
-    pub fn value_token(&self, index: usize) -> ValueToken {
+    pub fn value_token(&self, index: usize) -> ValueToken<N> {
         debug_assert!(index < self.len());
 
         if self.is_overflow(index) {
             let value = self.value(index);
-            let start_page = u64::from_le_bytes(value[0..8].try_into().unwrap());
+            let start_page = Key::from_le_bytes(value[0..8].try_into().unwrap());
             let total_len = u64::from_le_bytes(value[8..16].try_into().unwrap());
-            ValueToken::Overflow(start_page, total_len as usize)
+            ValueToken::Overflow(start_page, total_len)
         } else {
             ValueToken::Inline(self.value(index).to_vec())
         }
