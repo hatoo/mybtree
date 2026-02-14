@@ -69,6 +69,24 @@ fn bench_sequential_insert(c: &mut Criterion) {
                 // flush on drop
             });
         });
+
+        c.bench_function(&format!("sequential_index_remove_{n}"), |b| {
+            let (mut btree, root) = setup_index_tree();
+            let mut value = vec![0u8; 64];
+
+            for i in 0..n as u64 {
+                value[0..8].copy_from_slice(&i.to_be_bytes());
+                btree.index_insert(root, i, &value).unwrap();
+            }
+
+            b.iter(|| {
+                for i in 0..n as u64 {
+                    value[0..8].copy_from_slice(&i.to_be_bytes());
+                    btree.index_remove(root, &value, i).unwrap();
+                }
+                // flush on drop
+            });
+        });
     }
 }
 
