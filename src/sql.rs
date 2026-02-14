@@ -278,7 +278,7 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                         "only single-column indexes are supported".into(),
                     ));
                 }
-                let column_name = match &ci.columns[0].expr {
+                let column_name = match &ci.columns[0].column.expr {
                     Expr::Identifier(ident) => ident.value.clone(),
                     other => {
                         return Err(SqlError::UnsupportedExpression(other.to_string()));
