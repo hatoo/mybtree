@@ -97,29 +97,18 @@ impl<const N: usize> Btree<N> {
 
         loop {
             path.push(current);
-            let page = self.pager.read_node(current)?;
+            let page = self.pager.mut_node(current)?;
 
             match page.page_type() {
                 PageType::Leaf => {
-                    let leaf: &LeafPage<N> = page.try_into().unwrap();
+                    let leaf: &mut LeafPage<N> = page.try_into().unwrap();
                     match leaf.search_key(key) {
                         Ok(index) => {
                             let value_token = leaf.value_token(index);
-                            // Key exists — read old value, remove old entry, insert new
-                            let old_bytes = value_token.into_value(&mut self.pager)?;
-
-                            let leaf: &mut LeafPage<N> =
-                                self.pager.mut_node(current)?.try_into().unwrap();
-                            let overflow_meta = if leaf.is_overflow(index) {
-                                Some(Pager::<N>::parse_overflow_meta(leaf.value(index)))
-                            } else {
-                                None
-                            };
                             leaf.remove(index);
+                            let old_bytes =
+                                value_token.into_value_and_free_overflow_pages(&mut self.pager)?;
                             self.leaf_insert_and_propagate(root, &path, key, &value)?;
-                            if let Some((start_page, total_len)) = overflow_meta {
-                                self.pager.free_overflow_pages(start_page, total_len)?;
-                            }
                             return Ok(Some(old_bytes));
                         }
                         Err(_) => {
@@ -130,7 +119,7 @@ impl<const N: usize> Btree<N> {
                     }
                 }
                 PageType::Internal => {
-                    let internal: &InternalPage<N> = page.try_into().unwrap();
+                    let internal: &mut InternalPage<N> = page.try_into().unwrap();
                     match internal.search_index(key) {
                         Some(idx) => {
                             current = internal.ptr(idx);
@@ -873,7 +862,8 @@ impl<const N: usize> Btree<N> {
                     let leaf: IndexLeafPage<N> = page.try_into().unwrap();
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
-                            let (start_page, total_len) = Pager::<N>::parse_overflow_meta(leaf.key(i));
+                            let (start_page, total_len) =
+                                Pager::<N>::parse_overflow_meta(leaf.key(i));
                             self.pager.free_overflow_pages(start_page, total_len)?;
                         }
                     }
@@ -1703,7 +1693,8 @@ impl<const N: usize> Btree<N> {
                     let leaf: LeafPage<N> = page.try_into().unwrap();
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
-                            let (start_page, total_len) = Pager::<N>::parse_overflow_meta(leaf.value(i));
+                            let (start_page, total_len) =
+                                Pager::<N>::parse_overflow_meta(leaf.value(i));
                             self.collect_overflow_pages(start_page, total_len, pages);
                         }
                     }
@@ -1723,7 +1714,8 @@ impl<const N: usize> Btree<N> {
                     let leaf: IndexLeafPage<N> = page.try_into().unwrap();
                     for i in 0..leaf.len() {
                         if leaf.is_overflow(i) {
-                            let (start_page, total_len) = Pager::<N>::parse_overflow_meta(leaf.key(i));
+                            let (start_page, total_len) =
+                                Pager::<N>::parse_overflow_meta(leaf.key(i));
                             self.collect_overflow_pages(start_page, total_len, pages);
                         }
                     }

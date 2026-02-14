@@ -374,6 +374,17 @@ impl<const N: usize> ValueToken<N> {
             }
         }
     }
+
+    pub fn into_value_and_free_overflow_pages(self, pager: &mut Pager<N>) -> io::Result<Vec<u8>> {
+        match self {
+            ValueToken::Inline(data) => Ok(data),
+            ValueToken::Overflow(start_page, total_len) => {
+                let data = pager.read_overflow(start_page, total_len)?;
+                pager.free_overflow_pages(start_page, total_len)?;
+                Ok(data)
+            }
+        }
+    }
 }
 
 impl<const N: usize> LeafPage<N> {
