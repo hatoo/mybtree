@@ -106,7 +106,7 @@ impl<const N: usize> Btree<N> {
                         Ok(index) => {
                             let value_token = leaf.value_token(index);
                             // Key exists — read old value, remove old entry, insert new
-                            let old_bytes = value_token.into_value(&mut self.pager);
+                            let old_bytes = value_token.into_value(&mut self.pager)?;
 
                             let leaf: &mut LeafPage<N> =
                                 self.pager.mut_node(current)?.try_into().unwrap();
@@ -1001,7 +1001,7 @@ impl<const N: usize> Btree<N> {
                     let mut leaf: IndexLeafPage<N> = page.try_into().unwrap();
 
                     // Check if exact (value, key) already exists
-                    if leaf.find_entry(&value, key, &mut self.pager).is_some() {
+                    if leaf.find_entry(&value, key, &mut self.pager)?.is_some() {
                         return Ok(false);
                     }
 
@@ -1015,7 +1015,7 @@ impl<const N: usize> Btree<N> {
                     // Need to split
                     let mut right = leaf.split();
                     // Determine which half to insert into
-                    let split_key_bytes = leaf.resolved_key(leaf.len() - 1, &mut self.pager);
+                    let split_key_bytes = leaf.resolved_key(leaf.len() - 1, &mut self.pager)?;
                     let cmp = value.as_slice().cmp(split_key_bytes.as_ref());
                     if cmp == std::cmp::Ordering::Less
                         || (cmp == std::cmp::Ordering::Equal && key <= leaf.value(leaf.len() - 1))
@@ -1037,7 +1037,7 @@ impl<const N: usize> Btree<N> {
                 }
                 PageType::IndexInternal => {
                     let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                    match internal.find_child(&value, &mut self.pager) {
+                    match internal.find_child(&value, &mut self.pager)? {
                         Some(next) => current = next,
                         None => {
                             // Value is beyond all entries
@@ -1085,13 +1085,13 @@ impl<const N: usize> Btree<N> {
         let left_max_key: Vec<u8> = match left_any.page_type() {
             PageType::IndexLeaf => {
                 let leaf: IndexLeafPage<N> = left_any.try_into().unwrap();
-                leaf.resolved_key(leaf.len() - 1, &mut self.pager)
+                leaf.resolved_key(leaf.len() - 1, &mut self.pager)?
                     .into_owned()
             }
             PageType::IndexInternal => {
                 let internal: IndexInternalPage<N> = left_any.try_into().unwrap();
                 internal
-                    .resolved_key(internal.len() - 1, &mut self.pager)
+                    .resolved_key(internal.len() - 1, &mut self.pager)?
                     .into_owned()
             }
             _ => unreachable!(),
@@ -1104,7 +1104,7 @@ impl<const N: usize> Btree<N> {
             // Find the entry for left_page and update
             for i in 0..parent.len() {
                 if parent.ptr(i) == left_page {
-                    let old_key = parent.resolved_key(i, &mut self.pager).into_owned();
+                    let old_key = parent.resolved_key(i, &mut self.pager)?.into_owned();
                     let (_, raw_kl, _) = parent.read_slot(i);
                     // Remove old entry, re-insert with new max key for left
                     parent.remove(i);
@@ -1140,7 +1140,7 @@ impl<const N: usize> Btree<N> {
                     } else {
                         // Find correct position
                         let idx = parent
-                            .search(&left_max_key, &mut self.pager)
+                            .search(&left_max_key, &mut self.pager)?
                             .unwrap_or(parent.len());
                         parent.insert_raw_at(
                             idx,
@@ -1159,7 +1159,7 @@ impl<const N: usize> Btree<N> {
                         let mut right_parent = parent.split();
                         // Determine which half gets the new entry
                         let split_key = parent
-                            .resolved_key(parent.len() - 1, &mut self.pager)
+                            .resolved_key(parent.len() - 1, &mut self.pager)?
                             .into_owned();
                         if old_key.as_slice() <= split_key.as_slice() {
                             parent.insert(&old_key, right_page, &mut self.pager);
@@ -1185,13 +1185,13 @@ impl<const N: usize> Btree<N> {
             let right_max_key: Vec<u8> = match right_any.page_type() {
                 PageType::IndexLeaf => {
                     let leaf: IndexLeafPage<N> = right_any.try_into().unwrap();
-                    leaf.resolved_key(leaf.len() - 1, &mut self.pager)
+                    leaf.resolved_key(leaf.len() - 1, &mut self.pager)?
                         .into_owned()
                 }
                 PageType::IndexInternal => {
                     let internal: IndexInternalPage<N> = right_any.try_into().unwrap();
                     internal
-                        .resolved_key(internal.len() - 1, &mut self.pager)
+                        .resolved_key(internal.len() - 1, &mut self.pager)?
                         .into_owned()
                 }
                 _ => unreachable!(),
@@ -1226,7 +1226,7 @@ impl<const N: usize> Btree<N> {
             match page.page_type() {
                 PageType::IndexLeaf => {
                     let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                    if let Some(idx) = leaf.find_entry(value, key, &mut self.pager) {
+                    if let Some(idx) = leaf.find_entry(value, key, &mut self.pager)? {
                         let overflow_meta = if leaf.is_overflow(idx) {
                             Some(Self::parse_overflow_meta(leaf.key(idx)))
                         } else {
@@ -1247,7 +1247,7 @@ impl<const N: usize> Btree<N> {
                 }
                 PageType::IndexInternal => {
                     let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                    match internal.find_child(value, &mut self.pager) {
+                    match internal.find_child(value, &mut self.pager)? {
                         Some(next) => current = next,
                         None => return Ok(false),
                     }
@@ -1553,14 +1553,14 @@ impl<const N: usize> Btree<N> {
             match page.page_type() {
                 PageType::IndexLeaf => {
                     let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                    if let Some(key) = leaf.get(value, &mut self.pager) {
+                    if let Some(key) = leaf.get(value, &mut self.pager)? {
                         return Ok(ff.take().unwrap()(Some(key)));
                     }
                     return Ok(ff.take().unwrap()(None));
                 }
                 PageType::IndexInternal => {
                     let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                    match internal.find_child(value, &mut self.pager) {
+                    match internal.find_child(value, &mut self.pager)? {
                         Some(next) => current = next,
                         None => return Ok(ff.take().unwrap()(None)),
                     }
@@ -1595,7 +1595,7 @@ impl<const N: usize> Btree<N> {
             PageType::IndexLeaf => {
                 let leaf: IndexLeafPage<N> = page.try_into().unwrap();
                 for i in 0..leaf.len() {
-                    let key_bytes = leaf.resolved_key(i, &mut self.pager).into_owned();
+                    let key_bytes = leaf.resolved_key(i, &mut self.pager)?.into_owned();
                     if range.contains(&key_bytes) {
                         f(&key_bytes, leaf.value(i));
                     }
@@ -1604,7 +1604,7 @@ impl<const N: usize> Btree<N> {
             PageType::IndexInternal => {
                 let internal: IndexInternalPage<N> = page.try_into().unwrap();
                 for i in 0..internal.len() {
-                    let max_bytes = internal.resolved_key(i, &mut self.pager).into_owned();
+                    let max_bytes = internal.resolved_key(i, &mut self.pager)?.into_owned();
                     let ptr = internal.ptr(i);
 
                     let below_start = match range.start_bound() {
@@ -1617,7 +1617,7 @@ impl<const N: usize> Btree<N> {
                     }
 
                     if i > 0 {
-                        let prev_max = internal.resolved_key(i - 1, &mut self.pager).into_owned();
+                        let prev_max = internal.resolved_key(i - 1, &mut self.pager)?.into_owned();
                         let beyond_end = match range.end_bound() {
                             Bound::Included(e) => prev_max.as_slice() > e.as_slice(),
                             Bound::Excluded(e) => prev_max.as_slice() >= e.as_slice(),

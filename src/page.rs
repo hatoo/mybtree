@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use std::fmt;
+use std::{borrow::Cow, io};
 
 use crate::{Key, NodePtr, Pager};
 
@@ -366,11 +366,11 @@ pub enum ValueToken<const N: usize> {
 }
 
 impl<const N: usize> ValueToken<N> {
-    pub fn into_value(self, pager: &mut Pager<N>) -> Vec<u8> {
+    pub fn into_value(self, pager: &mut Pager<N>) -> io::Result<Vec<u8>> {
         match self {
-            ValueToken::Inline(data) => data,
+            ValueToken::Inline(data) => Ok(data),
             ValueToken::Overflow(start_page, total_len) => {
-                pager.read_overflow(start_page, total_len)
+                Ok(pager.read_overflow(start_page, total_len)?)
             }
         }
     }
@@ -521,19 +521,24 @@ impl<const N: usize> LeafPage<N> {
         }
     }
 
-    pub fn get(&self, key: Key, pager: &mut Pager<N>) -> Option<Cow<'_, [u8]>> {
-        let idx = self.search(key)?;
-        if self.key(idx) == key {
-            if self.is_overflow(idx) {
-                let meta = self.value(idx);
-                let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-                let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                Some(Cow::Owned(pager.read_overflow(start_page, total_len)))
+    pub fn get(&self, key: Key, pager: &mut Pager<N>) -> io::Result<Option<Cow<'_, [u8]>>> {
+        if let Some(idx) = self.search(key) {
+            if self.key(idx) == key {
+                if self.is_overflow(idx) {
+                    let meta = self.value(idx);
+                    let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                    let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                    Ok(Some(Cow::Owned(
+                        pager.read_overflow(start_page, total_len)?,
+                    )))
+                } else {
+                    Ok(Some(Cow::Borrowed(self.value(idx))))
+                }
             } else {
-                Some(Cow::Borrowed(self.value(idx)))
+                Ok(None)
             }
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -606,11 +611,11 @@ impl<const N: usize> LeafPage<N> {
         self.set_len(len + 1);
     }
 
-    pub fn insert(&mut self, key: Key, value: &[u8], pager: &mut Pager<N>) {
+    pub fn insert(&mut self, key: Key, value: &[u8], pager: &mut Pager<N>) -> io::Result<()> {
         debug_assert!(self.can_insert(value.len()));
 
         if Self::needs_overflow(value.len()) {
-            let start_page = pager.write_overflow(value);
+            let start_page = pager.write_overflow(value)?;
             let mut meta = [0u8; 16];
             meta[0..8].copy_from_slice(&start_page.to_le_bytes());
             meta[8..16].copy_from_slice(&(value.len() as u64).to_le_bytes());
@@ -618,6 +623,8 @@ impl<const N: usize> LeafPage<N> {
         } else {
             self.insert_raw(key, value, value.len() as u16);
         }
+
+        Ok(())
     }
 
     pub fn remove(&mut self, index: usize) {
@@ -751,30 +758,38 @@ macro_rules! impl_bytes_keyed_page {
                 (ko, kl, v)
             }
 
-            pub fn resolved_key<'a>(&'a self, index: usize, pager: &mut Pager<N>) -> Cow<'a, [u8]> {
+            pub fn resolved_key<'a>(
+                &'a self,
+                index: usize,
+                pager: &mut Pager<N>,
+            ) -> io::Result<Cow<'a, [u8]>> {
                 if self.is_overflow(index) {
                     let meta = self.key(index);
                     let start_page = u64::from_le_bytes(meta[0..8].try_into().unwrap());
                     let total_len = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-                    Cow::Owned(pager.read_overflow(start_page, total_len))
+                    Ok(Cow::Owned(pager.read_overflow(start_page, total_len)?))
                 } else {
-                    Cow::Borrowed(self.key(index))
+                    Ok(Cow::Borrowed(self.key(index)))
                 }
             }
 
-            pub fn search(&self, target: &[u8], pager: &mut Pager<N>) -> Option<usize> {
+            pub fn search(&self, target: &[u8], pager: &mut Pager<N>) -> io::Result<Option<usize>> {
                 let mut left = 0;
                 let mut right = self.len();
                 while left < right {
                     let mid = (left + right) / 2;
-                    let mid_key = self.resolved_key(mid, pager);
+                    let mid_key = self.resolved_key(mid, pager)?;
                     if mid_key.as_ref() < target {
                         left = mid + 1;
                     } else {
                         right = mid;
                     }
                 }
-                if left == self.len() { None } else { Some(left) }
+                if left == self.len() {
+                    Ok(None)
+                } else {
+                    Ok(Some(left))
+                }
             }
 
             fn contiguous_free_space(&self) -> usize {
@@ -848,16 +863,22 @@ macro_rules! impl_bytes_keyed_page {
                 raw_key_len: u16,
                 value: u64,
                 pager: &mut Pager<N>,
-            ) {
-                let idx = self.search(key_bytes, pager).unwrap_or(self.len());
+            ) -> io::Result<()> {
+                let idx = self.search(key_bytes, pager)?.unwrap_or(self.len());
                 self.insert_raw_at(idx, key_bytes, raw_key_len, value);
+                Ok(())
             }
 
-            pub fn insert(&mut self, key: &[u8], value: u64, pager: &mut Pager<N>) {
+            pub fn insert(
+                &mut self,
+                key: &[u8],
+                value: u64,
+                pager: &mut Pager<N>,
+            ) -> io::Result<()> {
                 debug_assert!(self.can_insert(key.len()));
 
                 if Self::needs_overflow(key.len()) {
-                    let start_page = pager.write_overflow(key);
+                    let start_page = pager.write_overflow(key)?;
                     let mut meta = [0u8; 16];
                     meta[0..8].copy_from_slice(&start_page.to_le_bytes());
                     meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
@@ -866,10 +887,11 @@ macro_rules! impl_bytes_keyed_page {
                         OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG,
                         value,
                         pager,
-                    );
+                    )?;
                 } else {
-                    self.insert_raw(key, key.len() as u16, value, pager);
+                    self.insert_raw(key, key.len() as u16, value, pager)?;
                 }
+                Ok(())
             }
 
             pub fn remove(&mut self, index: usize) {
@@ -919,10 +941,10 @@ impl<const N: usize> IndexInternalPage<N> {
         self.slot_value(index)
     }
 
-    pub fn find_child(&self, target: &[u8], pager: &mut Pager<N>) -> Option<NodePtr> {
-        match self.search(target, pager) {
-            Some(idx) => Some(self.ptr(idx)),
-            None => None,
+    pub fn find_child(&self, target: &[u8], pager: &mut Pager<N>) -> io::Result<Option<NodePtr>> {
+        match self.search(target, pager)? {
+            Some(idx) => Ok(Some(self.ptr(idx))),
+            None => Ok(None),
         }
     }
 }
@@ -933,13 +955,16 @@ impl<const N: usize> IndexLeafPage<N> {
         self.slot_value(index)
     }
 
-    pub fn get(&self, target: &[u8], pager: &mut Pager<N>) -> Option<Key> {
-        let idx = self.search(target, pager)?;
-        let resolved = self.resolved_key(idx, pager);
-        if resolved.as_ref() == target {
-            Some(self.value(idx))
+    pub fn get(&self, target: &[u8], pager: &mut Pager<N>) -> io::Result<Option<Key>> {
+        if let Some(idx) = self.search(target, pager)? {
+            let resolved = self.resolved_key(idx, pager)?;
+            if resolved.as_ref() == target {
+                Ok(Some(self.value(idx)))
+            } else {
+                Ok(None)
+            }
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -951,12 +976,12 @@ impl<const N: usize> IndexLeafPage<N> {
         target: &[u8],
         target_key: Key,
         pager: &mut Pager<N>,
-    ) -> Option<usize> {
+    ) -> io::Result<Option<usize>> {
         let mut left = 0;
         let mut right = self.len();
         while left < right {
             let mid = (left + right) / 2;
-            let mid_key_bytes = self.resolved_key(mid, pager);
+            let mid_key_bytes = self.resolved_key(mid, pager)?;
             let mid_value = self.value(mid);
             match mid_key_bytes
                 .as_ref()
@@ -967,7 +992,11 @@ impl<const N: usize> IndexLeafPage<N> {
                 _ => right = mid,
             }
         }
-        if left == self.len() { None } else { Some(left) }
+        if left == self.len() {
+            Ok(None)
+        } else {
+            Ok(Some(left))
+        }
     }
 
     /// Find the exact entry matching `(target, target_key)`.
@@ -977,47 +1006,62 @@ impl<const N: usize> IndexLeafPage<N> {
         target: &[u8],
         target_key: Key,
         pager: &mut Pager<N>,
-    ) -> Option<usize> {
-        let idx = self.search_entry(target, target_key, pager)?;
-        let resolved = self.resolved_key(idx, pager);
-        if resolved.as_ref() == target && self.value(idx) == target_key {
-            Some(idx)
+    ) -> io::Result<Option<usize>> {
+        if let Some(idx) = self.search_entry(target, target_key, pager)? {
+            let resolved = self.resolved_key(idx, pager)?;
+            if resolved.as_ref() == target && self.value(idx) == target_key {
+                Ok(Some(idx))
+            } else {
+                Ok(None)
+            }
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Insert using composite `(bytes_key, key)` ordering,
     /// allowing multiple entries with the same byte key but different Key values.
-    pub fn insert_entry(&mut self, key: &[u8], entry_key: Key, pager: &mut Pager<N>) {
+    pub fn insert_entry(
+        &mut self,
+        key: &[u8],
+        entry_key: Key,
+        pager: &mut Pager<N>,
+    ) -> io::Result<()> {
         debug_assert!(self.can_insert(key.len()));
 
         if Self::needs_overflow(key.len()) {
-            let start_page = pager.write_overflow(key);
+            let start_page = pager.write_overflow(key)?;
             let mut meta = [0u8; 16];
             meta[0..8].copy_from_slice(&start_page.to_le_bytes());
             meta[8..16].copy_from_slice(&(key.len() as u64).to_le_bytes());
             let raw_key_len = OVERFLOW_META_SIZE as u16 | OVERFLOW_FLAG;
             let idx = self
-                .search_entry(&meta, entry_key, pager)
+                .search_entry(&meta, entry_key, pager)?
                 .unwrap_or(self.len());
             self.insert_raw_at(idx, &meta, raw_key_len, entry_key);
         } else {
             let idx = self
-                .search_entry(key, entry_key, pager)
+                .search_entry(key, entry_key, pager)?
                 .unwrap_or(self.len());
             self.insert_raw_at(idx, key, key.len() as u16, entry_key);
         }
+
+        Ok(())
     }
 
     /// Remove the entry matching `(target, target_key)`.
     /// Returns `true` if an entry was removed.
-    pub fn remove_entry(&mut self, target: &[u8], target_key: Key, pager: &mut Pager<N>) -> bool {
-        if let Some(idx) = self.find_entry(target, target_key, pager) {
+    pub fn remove_entry(
+        &mut self,
+        target: &[u8],
+        target_key: Key,
+        pager: &mut Pager<N>,
+    ) -> io::Result<bool> {
+        if let Some(idx) = self.find_entry(target, target_key, pager)? {
             self.remove(idx);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 }
@@ -1222,7 +1266,7 @@ mod tests {
         assert!(page.is_overflow(0));
 
         // get should read back the full value from overflow pages
-        let retrieved = page.get(42, &mut pager).unwrap();
+        let retrieved = page.get(42, &mut pager).unwrap().unwrap();
         assert_eq!(retrieved.as_ref(), &big_value[..]);
     }
 
@@ -1242,9 +1286,18 @@ mod tests {
         assert!(page.is_overflow(1));
         assert!(!page.is_overflow(2));
 
-        assert_eq!(page.get(10, &mut pager).unwrap().as_ref(), b"hello");
-        assert_eq!(page.get(20, &mut pager).unwrap().as_ref(), &big_value[..]);
-        assert_eq!(page.get(30, &mut pager).unwrap().as_ref(), b"world");
+        assert_eq!(
+            page.get(10, &mut pager).unwrap().unwrap().as_ref(),
+            b"hello"
+        );
+        assert_eq!(
+            page.get(20, &mut pager).unwrap().unwrap().as_ref(),
+            &big_value[..]
+        );
+        assert_eq!(
+            page.get(30, &mut pager).unwrap().unwrap().as_ref(),
+            b"world"
+        );
     }
 
     #[test]
@@ -1265,7 +1318,7 @@ mod tests {
         // Verify overflow entry is preserved in the right page
         // mid = 3, so right has keys 30, 40, 50
         assert!(right.is_overflow(1)); // key 40
-        let retrieved = right.get(40, &mut pager).unwrap();
+        let retrieved = right.get(40, &mut pager).unwrap().unwrap();
         assert_eq!(retrieved.as_ref(), &big_value[..]);
     }
 
@@ -1311,19 +1364,19 @@ mod tests {
         page.insert(b"fff", 300, &mut pager);
 
         // Exact match
-        assert_eq!(page.find_child(b"bbb", &mut pager), Some(100));
-        assert_eq!(page.find_child(b"ddd", &mut pager), Some(200));
-        assert_eq!(page.find_child(b"fff", &mut pager), Some(300));
+        assert_eq!(page.find_child(b"bbb", &mut pager).unwrap(), Some(100));
+        assert_eq!(page.find_child(b"ddd", &mut pager).unwrap(), Some(200));
+        assert_eq!(page.find_child(b"fff", &mut pager).unwrap(), Some(300));
 
         // Key before first -> routes to first
-        assert_eq!(page.find_child(b"aaa", &mut pager), Some(100));
+        assert_eq!(page.find_child(b"aaa", &mut pager).unwrap(), Some(100));
 
         // Key between entries -> routes to next >= entry
-        assert_eq!(page.find_child(b"ccc", &mut pager), Some(200));
-        assert_eq!(page.find_child(b"eee", &mut pager), Some(300));
+        assert_eq!(page.find_child(b"ccc", &mut pager).unwrap(), Some(200));
+        assert_eq!(page.find_child(b"eee", &mut pager).unwrap(), Some(300));
 
         // Key after all -> None
-        assert_eq!(page.find_child(b"zzz", &mut pager), None);
+        assert_eq!(page.find_child(b"zzz", &mut pager).unwrap(), None);
     }
 
     #[test]
@@ -1380,10 +1433,10 @@ mod tests {
         assert_eq!(page.len(), 1);
         assert!(page.is_overflow(0));
 
-        let resolved = page.resolved_key(0, &mut pager);
+        let resolved = page.resolved_key(0, &mut pager).unwrap();
         assert_eq!(resolved.as_ref(), &big_key[..]);
 
-        assert_eq!(page.find_child(&big_key, &mut pager), Some(42));
+        assert_eq!(page.find_child(&big_key, &mut pager).unwrap(), Some(42));
     }
 
     #[test]
@@ -1427,11 +1480,11 @@ mod tests {
         page.insert(b"bbb", 20, &mut pager);
         page.insert(b"ccc", 30, &mut pager);
 
-        assert_eq!(page.get(b"aaa", &mut pager), Some(10));
-        assert_eq!(page.get(b"bbb", &mut pager), Some(20));
-        assert_eq!(page.get(b"ccc", &mut pager), Some(30));
-        assert_eq!(page.get(b"ddd", &mut pager), None);
-        assert_eq!(page.get(b"ab", &mut pager), None);
+        assert_eq!(page.get(b"aaa", &mut pager).unwrap(), Some(10));
+        assert_eq!(page.get(b"bbb", &mut pager).unwrap(), Some(20));
+        assert_eq!(page.get(b"ccc", &mut pager).unwrap(), Some(30));
+        assert_eq!(page.get(b"ddd", &mut pager).unwrap(), None);
+        assert_eq!(page.get(b"ab", &mut pager).unwrap(), None);
     }
 
     #[test]
@@ -1488,10 +1541,10 @@ mod tests {
         assert_eq!(page.len(), 1);
         assert!(page.is_overflow(0));
 
-        let resolved = page.resolved_key(0, &mut pager);
+        let resolved = page.resolved_key(0, &mut pager).unwrap();
         assert_eq!(resolved.as_ref(), &big_key[..]);
 
-        assert_eq!(page.get(&big_key, &mut pager), Some(42));
+        assert_eq!(page.get(&big_key, &mut pager).unwrap(), Some(42));
     }
 
     #[test]
@@ -1542,11 +1595,11 @@ mod tests {
         page.insert_entry(b"aaa", 20, &mut pager);
         page.insert_entry(b"bbb", 10, &mut pager);
 
-        assert_eq!(page.find_entry(b"aaa", 10, &mut pager), Some(0));
-        assert_eq!(page.find_entry(b"aaa", 20, &mut pager), Some(1));
-        assert_eq!(page.find_entry(b"bbb", 10, &mut pager), Some(2));
-        assert_eq!(page.find_entry(b"aaa", 99, &mut pager), None);
-        assert_eq!(page.find_entry(b"ccc", 10, &mut pager), None);
+        assert_eq!(page.find_entry(b"aaa", 10, &mut pager).unwrap(), Some(0));
+        assert_eq!(page.find_entry(b"aaa", 20, &mut pager).unwrap(), Some(1));
+        assert_eq!(page.find_entry(b"bbb", 10, &mut pager).unwrap(), Some(2));
+        assert_eq!(page.find_entry(b"aaa", 99, &mut pager).unwrap(), None);
+        assert_eq!(page.find_entry(b"ccc", 10, &mut pager).unwrap(), None);
     }
 
     #[test]
@@ -1558,12 +1611,12 @@ mod tests {
         page.insert_entry(b"aaa", 20, &mut pager);
         page.insert_entry(b"aaa", 30, &mut pager);
 
-        assert!(page.remove_entry(b"aaa", 20, &mut pager));
+        assert!(page.remove_entry(b"aaa", 20, &mut pager).unwrap());
         assert_eq!(page.len(), 2);
         assert_eq!(page.value(0), 10);
         assert_eq!(page.value(1), 30);
 
-        assert!(!page.remove_entry(b"aaa", 99, &mut pager));
+        assert!(!page.remove_entry(b"aaa", 99, &mut pager).unwrap());
         assert_eq!(page.len(), 2);
     }
 
@@ -1577,13 +1630,13 @@ mod tests {
         page.insert_entry(b"bbb", 5, &mut pager);
 
         // First entry >= (aaa, 10) is at index 0
-        assert_eq!(page.search_entry(b"aaa", 10, &mut pager), Some(0));
+        assert_eq!(page.search_entry(b"aaa", 10, &mut pager).unwrap(), Some(0));
         // First entry >= (aaa, 15) is at index 1 (aaa,20)
-        assert_eq!(page.search_entry(b"aaa", 15, &mut pager), Some(1));
+        assert_eq!(page.search_entry(b"aaa", 15, &mut pager).unwrap(), Some(1));
         // First entry >= (aaa, 21) is at index 2 (bbb,5)
-        assert_eq!(page.search_entry(b"aaa", 21, &mut pager), Some(2));
+        assert_eq!(page.search_entry(b"aaa", 21, &mut pager).unwrap(), Some(2));
         // All entries are less than (ccc, 0)
-        assert_eq!(page.search_entry(b"ccc", 0, &mut pager), None);
+        assert_eq!(page.search_entry(b"ccc", 0, &mut pager).unwrap(), None);
     }
 
     // ── Edge case tests ──────────────────────────────────────────────
@@ -1651,14 +1704,14 @@ mod tests {
         let mut page = LeafPage::<4096>::new();
         let mut pager = test_pager();
         page.insert(10, b"hello", &mut pager);
-        assert!(page.get(999, &mut pager).is_none());
+        assert!(page.get(999, &mut pager).unwrap().is_none());
     }
 
     #[test]
     fn leaf_page_get_empty_page() {
         let page = LeafPage::<4096>::new();
         let mut pager = test_pager();
-        assert!(page.get(10, &mut pager).is_none());
+        assert!(page.get(10, &mut pager).unwrap().is_none());
     }
 
     #[test]
@@ -1668,7 +1721,7 @@ mod tests {
         page.insert(1, b"", &mut pager);
         assert_eq!(page.len(), 1);
         assert_eq!(page.value(0), b"");
-        assert_eq!(page.get(1, &mut pager).unwrap().as_ref(), b"");
+        assert_eq!(page.get(1, &mut pager).unwrap().unwrap().as_ref(), b"");
     }
 
     #[test]
@@ -1734,7 +1787,10 @@ mod tests {
         assert!(!page.can_insert(3));
         // All entries should be readable
         for j in 0..i {
-            assert_eq!(page.get(j, &mut pager).unwrap().as_ref(), &[0xAA; 3]);
+            assert_eq!(
+                page.get(j, &mut pager).unwrap().unwrap().as_ref(),
+                &[0xAA; 3]
+            );
         }
     }
 
@@ -1742,7 +1798,7 @@ mod tests {
     fn index_internal_page_find_child_empty() {
         let page = IndexInternalPage::<4096>::new();
         let mut pager = test_pager();
-        assert_eq!(page.find_child(b"anything", &mut pager), None);
+        assert_eq!(page.find_child(b"anything", &mut pager).unwrap(), None);
     }
 
     #[test]
@@ -1751,9 +1807,9 @@ mod tests {
         let mut pager = test_pager();
         page.insert(b"mmm", 42, &mut pager);
 
-        assert_eq!(page.find_child(b"aaa", &mut pager), Some(42));
-        assert_eq!(page.find_child(b"mmm", &mut pager), Some(42));
-        assert_eq!(page.find_child(b"zzz", &mut pager), None);
+        assert_eq!(page.find_child(b"aaa", &mut pager).unwrap(), Some(42));
+        assert_eq!(page.find_child(b"mmm", &mut pager).unwrap(), Some(42));
+        assert_eq!(page.find_child(b"zzz", &mut pager).unwrap(), None);
     }
 
     #[test]
@@ -1765,7 +1821,7 @@ mod tests {
         assert_eq!(page.len(), 2);
         assert_eq!(page.key(0), b"");
         assert_eq!(page.ptr(0), 10);
-        assert_eq!(page.find_child(b"", &mut pager), Some(10));
+        assert_eq!(page.find_child(b"", &mut pager).unwrap(), Some(10));
     }
 
     #[test]
@@ -1865,7 +1921,7 @@ mod tests {
     fn index_leaf_page_get_empty() {
         let page = IndexLeafPage::<4096>::new();
         let mut pager = test_pager();
-        assert_eq!(page.get(b"anything", &mut pager), None);
+        assert_eq!(page.get(b"anything", &mut pager).unwrap(), None);
     }
 
     #[test]
@@ -1875,7 +1931,7 @@ mod tests {
         page.insert(b"", 10, &mut pager);
         assert_eq!(page.len(), 1);
         assert_eq!(page.key(0), b"");
-        assert_eq!(page.get(b"", &mut pager), Some(10));
+        assert_eq!(page.get(b"", &mut pager).unwrap(), Some(10));
     }
 
     #[test]
@@ -1959,30 +2015,30 @@ mod tests {
     fn index_leaf_page_search_entry_empty() {
         let page = IndexLeafPage::<4096>::new();
         let mut pager = test_pager();
-        assert_eq!(page.search_entry(b"aaa", 0, &mut pager), None);
+        assert_eq!(page.search_entry(b"aaa", 0, &mut pager).unwrap(), None);
     }
 
     #[test]
     fn index_leaf_page_find_entry_empty() {
         let page = IndexLeafPage::<4096>::new();
         let mut pager = test_pager();
-        assert_eq!(page.find_entry(b"aaa", 0, &mut pager), None);
+        assert_eq!(page.find_entry(b"aaa", 0, &mut pager).unwrap(), None);
     }
 
     #[test]
     fn index_leaf_page_remove_entry_empty() {
         let mut page = IndexLeafPage::<4096>::new();
         let mut pager = test_pager();
-        assert!(!page.remove_entry(b"aaa", 0, &mut pager));
+        assert!(!page.remove_entry(b"aaa", 0, &mut pager).unwrap());
     }
 
     #[test]
     fn index_leaf_page_insert_entry_with_max_key_values() {
         let mut page = IndexLeafPage::<4096>::new();
         let mut pager = test_pager();
-        page.insert_entry(b"x", u64::MAX, &mut pager);
-        page.insert_entry(b"x", 0, &mut pager);
-        page.insert_entry(b"x", u64::MAX - 1, &mut pager);
+        page.insert_entry(b"x", u64::MAX, &mut pager).unwrap();
+        page.insert_entry(b"x", 0, &mut pager).unwrap();
+        page.insert_entry(b"x", u64::MAX - 1, &mut pager).unwrap();
 
         assert_eq!(page.len(), 3);
         assert_eq!(page.value(0), 0);
@@ -2011,7 +2067,7 @@ mod tests {
         let mut pager = test_pager();
         // Fill up
         for i in 0..5u64 {
-            page.insert(&[b'a' + i as u8; 3], i, &mut pager);
+            page.insert(&[b'a' + i as u8; 3], i, &mut pager).unwrap();
         }
         let free_before = page.free_space();
         // Remove some to create dead space
@@ -2021,8 +2077,8 @@ mod tests {
         assert!(free_after > free_before);
         // Should be able to insert again
         assert!(page.can_insert(3));
-        page.insert(b"zzz", 99, &mut pager);
-        assert_eq!(page.get(b"zzz", &mut pager), Some(99));
+        page.insert(b"zzz", 99, &mut pager).unwrap();
+        assert_eq!(page.get(b"zzz", &mut pager).unwrap(), Some(99));
     }
 
     #[test]
@@ -2030,13 +2086,13 @@ mod tests {
         let mut page = IndexInternalPage::<128>::new();
         let mut pager = test_pager();
         for i in 0..5u64 {
-            page.insert(&[b'a' + i as u8; 3], i, &mut pager);
+            page.insert(&[b'a' + i as u8; 3], i, &mut pager).unwrap();
         }
         page.remove(1);
         page.remove(1);
         // Insert should trigger compaction and succeed
         assert!(page.can_insert(3));
-        page.insert(b"zzz", 99, &mut pager);
-        assert_eq!(page.find_child(b"zzz", &mut pager), Some(99));
+        page.insert(b"zzz", 99, &mut pager).unwrap();
+        assert_eq!(page.find_child(b"zzz", &mut pager).unwrap(), Some(99));
     }
 }
