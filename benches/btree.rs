@@ -127,7 +127,7 @@ fn bench_sequential_insert(c: &mut Criterion) {
                                 Bound::Included(value.as_slice()),
                                 Bound::Included(value.as_slice()),
                             ),
-                            |_| {},
+                            |_, _| {},
                         )
                         .unwrap();
                 }
