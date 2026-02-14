@@ -392,7 +392,7 @@ impl<'a, const N: usize> Transaction<'a, N> {
         Ok(None)
     }
 
-    pub fn index_read_range<R: RangeBounds<Vec<u8>>>(
+    pub fn index_read_range<'b, R: RangeBounds<&'b [u8]>>(
         &self,
         idx_root: NodePtr,
         range: R,
@@ -401,8 +401,11 @@ impl<'a, const N: usize> Transaction<'a, N> {
         let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
 
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
-            op.index_range_reads
-                .push((idx_root, range_bound.0.clone(), range_bound.1.clone()));
+            op.index_range_reads.push((
+                idx_root,
+                range_bound.0.map(|v| v.to_vec()),
+                range_bound.1.map(|v| v.to_vec()),
+            ));
         }
 
         // Read from btree: collect (value_bytes, key) pairs
@@ -427,7 +430,7 @@ impl<'a, const N: usize> Transaction<'a, N> {
 
             // Add locally inserted entries whose value is in range
             for ((root, val, key), is_insert) in &op.index_ops {
-                if *root == idx_root && *is_insert && range_bound.contains(val) {
+                if *root == idx_root && *is_insert && range_bound.contains(&val.as_slice()) {
                     if !result_keys.contains(key) {
                         result_keys.push(*key);
                     }

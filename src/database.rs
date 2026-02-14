@@ -466,11 +466,11 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
 
     /// Scan rows by an indexed column value range.
     /// Returns `(key, row)` pairs for rows whose indexed column value falls within `range`.
-    pub fn scan_by_index(
+    pub fn scan_by_index<'b>(
         &self,
         table_name: &str,
         column_name: &str,
-        range: impl RangeBounds<Vec<u8>>,
+        range: impl RangeBounds<&'b [u8]>,
     ) -> Result<Vec<(Key, Row)>, DatabaseError> {
         let meta = self
             .find_table_meta(table_name)?
@@ -1193,7 +1193,7 @@ mod tests {
 
         let tx = db.begin_transaction();
         let results = tx
-            .scan_by_index("users", "name", b"Bob".to_vec()..=b"Charlie".to_vec())
+            .scan_by_index("users", "name", &b"Bob"[..]..=&b"Charlie"[..])
             .unwrap();
         assert_eq!(results.len(), 2);
         let names: Vec<_> = results.iter().map(|(_, r)| &r.values[0]).collect();
@@ -1210,7 +1210,7 @@ mod tests {
 
         let tx = db.begin_transaction();
         let err = tx
-            .scan_by_index("users", "name", b"A".to_vec()..b"Z".to_vec())
+            .scan_by_index("users", "name", &b"A"[..]..&b"Z"[..])
             .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
@@ -1235,7 +1235,7 @@ mod tests {
 
         let tx = db.begin_transaction();
         let results = tx
-            .scan_by_index("users", "name", b"Diana".to_vec()..=b"Diana".to_vec())
+            .scan_by_index("users", "name", &b"Diana"[..]..=&b"Diana"[..])
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1.values[0], DbValue::Text("Diana".into()));
@@ -1266,7 +1266,7 @@ mod tests {
 
         let tx = db.begin_transaction();
         let results = tx
-            .scan_by_index("users", "name", b"Eve".to_vec()..=b"Eve".to_vec())
+            .scan_by_index("users", "name", &b"Eve"[..]..=&b"Eve"[..])
             .unwrap();
         assert!(results.is_empty());
     }
@@ -1305,13 +1305,13 @@ mod tests {
         // Frank should be gone from index
         let tx = db.begin_transaction();
         let results = tx
-            .scan_by_index("users", "name", b"Frank".to_vec()..=b"Frank".to_vec())
+            .scan_by_index("users", "name", &b"Frank"[..]..=&b"Frank"[..])
             .unwrap();
         assert!(results.is_empty());
 
         // George should be found
         let results = tx
-            .scan_by_index("users", "name", b"George".to_vec()..=b"George".to_vec())
+            .scan_by_index("users", "name", &b"George"[..]..=&b"George"[..])
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1.values[0], DbValue::Text("George".into()));
@@ -1350,7 +1350,7 @@ mod tests {
         // The back-filled data should be queryable
         let tx = db.begin_transaction();
         let results = tx
-            .scan_by_index("users", "name", b"Alice".to_vec()..=b"Bob".to_vec())
+            .scan_by_index("users", "name", &b"Alice"[..]..=&b"Bob"[..])
             .unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -1547,7 +1547,7 @@ mod tests {
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", b"A".to_vec()..b"Z".to_vec())
+        tx1.scan_by_index("users", "name", &b"A"[..]..&b"Z"[..])
             .unwrap();
 
         tx2.insert(
@@ -1574,7 +1574,7 @@ mod tests {
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", b"Alice".to_vec()..=b"Alice".to_vec())
+        tx1.scan_by_index("users", "name", &b"Alice"[..]..=&b"Alice"[..])
             .unwrap();
 
         tx2.insert(
@@ -1698,7 +1698,7 @@ mod tests {
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", b"A".to_vec()..b"C".to_vec())
+        tx1.scan_by_index("users", "name", &b"A"[..]..&b"C"[..])
             .unwrap();
 
         tx2.insert(
@@ -1769,7 +1769,7 @@ mod tests {
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", b"B".to_vec()..b"C".to_vec())
+        tx1.scan_by_index("users", "name", &b"B"[..]..&b"C"[..])
             .unwrap();
 
         tx2.update(
@@ -1920,7 +1920,7 @@ mod tests {
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", b"A".to_vec()..b"Z".to_vec())
+        tx1.scan_by_index("users", "name", &b"A"[..]..&b"Z"[..])
             .unwrap();
         tx2.drop_index("users", "name").unwrap();
 
@@ -1986,14 +1986,14 @@ mod tests {
         // Query by name
         let tx = db.begin_transaction();
         let by_name = tx
-            .scan_by_index("users", "name", b"Alice".to_vec()..=b"Alice".to_vec())
+            .scan_by_index("users", "name", &b"Alice"[..]..=&b"Alice"[..])
             .unwrap();
         assert_eq!(by_name.len(), 1);
 
         // Query by age (i64 big-endian bytes for 25)
         let age_25 = 25i64.to_be_bytes().to_vec();
         let age_30 = 30i64.to_be_bytes().to_vec();
-        let by_age = tx.scan_by_index("users", "age", age_25..=age_30).unwrap();
+        let by_age = tx.scan_by_index("users", "age", age_25.as_slice()..=age_30.as_slice()).unwrap();
         assert_eq!(by_age.len(), 2);
     }
 
@@ -2051,7 +2051,7 @@ mod tests {
         let key_1 = 1i64.to_be_bytes().to_vec();
         let meta = tx.find_table_meta("t").unwrap().unwrap();
         let _idx_root = meta.index_trees.iter().find(|(c, _)| c == "x").unwrap().1;
-        let rows = tx.scan_by_index("t", "x", key_1.clone()..=key_1).unwrap();
+        let rows = tx.scan_by_index("t", "x", key_1.as_slice()..=key_1.as_slice()).unwrap();
         let mut values: Vec<String> = rows
             .iter()
             .map(|(_, row)| match &row.values[1] {

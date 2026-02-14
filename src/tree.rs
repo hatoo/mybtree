@@ -1635,7 +1635,7 @@ impl<const N: usize> Btree<N> {
         }
     }
 
-    pub fn index_read_range<R: RangeBounds<Vec<u8>>>(
+    pub fn index_read_range<'a, R: RangeBounds<&'a [u8]>>(
         &mut self,
         root: NodePtr,
         range: R,
@@ -1644,7 +1644,7 @@ impl<const N: usize> Btree<N> {
         self.index_read_range_at(root, &range, &mut f)
     }
 
-    fn index_read_range_at<R: RangeBounds<Vec<u8>>>(
+    fn index_read_range_at<'a, R: RangeBounds<&'a [u8]>>(
         &mut self,
         node_ptr: NodePtr,
         range: &R,
@@ -1657,7 +1657,7 @@ impl<const N: usize> Btree<N> {
                 let leaf: IndexLeafPage<N> = page.try_into().unwrap();
                 for i in 0..leaf.len() {
                     let key_bytes = leaf.resolved_key(i, &mut self.pager)?.into_owned();
-                    if range.contains(&key_bytes) {
+                    if range.contains(&key_bytes.as_slice()) {
                         f(&key_bytes, leaf.value(i));
                     }
                 }
@@ -1669,8 +1669,8 @@ impl<const N: usize> Btree<N> {
                     let ptr = internal.ptr(i);
 
                     let below_start = match range.start_bound() {
-                        Bound::Included(s) => max_bytes.as_slice() < s.as_slice(),
-                        Bound::Excluded(s) => max_bytes.as_slice() <= s.as_slice(),
+                        Bound::Included(s) => max_bytes.as_slice() < *s,
+                        Bound::Excluded(s) => max_bytes.as_slice() <= *s,
                         Bound::Unbounded => false,
                     };
                     if below_start {
@@ -1680,8 +1680,8 @@ impl<const N: usize> Btree<N> {
                     if i > 0 {
                         let prev_max = internal.resolved_key(i - 1, &mut self.pager)?.into_owned();
                         let beyond_end = match range.end_bound() {
-                            Bound::Included(e) => prev_max.as_slice() > e.as_slice(),
-                            Bound::Excluded(e) => prev_max.as_slice() >= e.as_slice(),
+                            Bound::Included(e) => prev_max.as_slice() > *e,
+                            Bound::Excluded(e) => prev_max.as_slice() >= *e,
                             Bound::Unbounded => false,
                         };
                         if beyond_end {
@@ -2725,7 +2725,7 @@ mod tests {
 
         let mut results = Vec::new();
         btree
-            .index_read_range(root, b"bbb".to_vec()..=b"ddd".to_vec(), |v, k| {
+            .index_read_range(root, b"bbb".as_ref()..=b"ddd".as_ref(), |v, k| {
                 results.push((v.to_vec(), k))
             })
             .unwrap();
@@ -2759,7 +2759,7 @@ mod tests {
 
         let mut results = Vec::new();
         btree
-            .index_read_range(root, b"zzz".to_vec()..=b"zzzz".to_vec(), |v, k| {
+            .index_read_range(root, b"zzz".as_ref()..=b"zzzz".as_ref(), |v, k| {
                 results.push((v.to_vec(), k))
             })
             .unwrap();
@@ -2927,7 +2927,7 @@ mod tests {
 
         let mut results = Vec::new();
         btree
-            .index_read_range(root, b"0050".to_vec()..b"0150".to_vec(), |v, _k| {
+            .index_read_range(root, b"0050".as_ref()..b"0150".as_ref(), |v, _k| {
                 results.push(v.to_vec())
             })
             .unwrap();

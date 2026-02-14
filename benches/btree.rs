@@ -1,3 +1,5 @@
+use std::ops::Bound;
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use mybtree::{Btree, Pager};
 
@@ -101,6 +103,33 @@ fn bench_sequential_insert(c: &mut Criterion) {
                 for i in 0..n as u64 {
                     value[0..8].copy_from_slice(&i.to_be_bytes());
                     btree.index_read(root, &value).unwrap();
+                }
+                // flush on drop
+            });
+        });
+
+        c.bench_function(&format!("sequential_index_read_range_{n}"), |b| {
+            let (mut btree, root) = setup_index_tree();
+            let mut value = vec![0u8; 64];
+
+            for i in 0..n as u64 {
+                value[0..8].copy_from_slice(&i.to_be_bytes());
+                btree.index_insert(root, i, &value).unwrap();
+            }
+
+            b.iter(|| {
+                for i in 0..n as u64 {
+                    value[0..8].copy_from_slice(&i.to_be_bytes());
+                    btree
+                        .index_read_range(
+                            root,
+                            (
+                                Bound::Included(value.as_slice()),
+                                Bound::Included(value.as_slice()),
+                            ),
+                            |_| {},
+                        )
+                        .unwrap();
                 }
                 // flush on drop
             });

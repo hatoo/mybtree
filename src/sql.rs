@@ -578,7 +578,7 @@ mod tests {
 
         // Index should be usable via scan_by_index
         let rows = tx
-            .scan_by_index("users", "name", b"Alice".to_vec()..=b"Alice".to_vec())
+            .scan_by_index("users", "name", b"Alice".as_ref()..=b"Alice".as_ref())
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[0], DbValue::Text("Alice".into()));
@@ -593,7 +593,9 @@ mod tests {
         execute(&tx, "CREATE INDEX idx_x ON t (x)").unwrap();
 
         let key_20 = 20i64.to_be_bytes().to_vec();
-        let rows = tx.scan_by_index("t", "x", key_20.clone()..=key_20).unwrap();
+        let rows = tx
+            .scan_by_index("t", "x", key_20.as_slice()..=key_20.as_slice())
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[0], DbValue::Integer(20));
     }
@@ -614,7 +616,7 @@ mod tests {
 
         let tx = db.begin_transaction();
         let rows = tx
-            .scan_by_index("t", "name", b"Bob".to_vec()..=b"Bob".to_vec())
+            .scan_by_index("t", "name", b"Bob".as_ref()..=b"Bob".as_ref())
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[1], DbValue::Integer(25));
