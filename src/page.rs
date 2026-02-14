@@ -360,6 +360,11 @@ impl<const N: usize> fmt::Debug for InternalPage<N> {
     }
 }
 
+pub enum ValueToken {
+    Inline(Vec<u8>),
+    Overflow(NodePtr, usize), // (start_page, total_len)
+}
+
 impl<const N: usize> LeafPage<N> {
     const LEN_OFFSET: usize = 4;
     const DATA_OFFSET: usize = 6;
@@ -439,6 +444,19 @@ impl<const N: usize> LeafPage<N> {
         let raw_value_len = u16::from_le_bytes([self.page[slot + 2], self.page[slot + 3]]);
         let value_len = Self::inline_len(raw_value_len);
         &self.page[value_offset..value_offset + value_len]
+    }
+
+    pub fn value_token(&self, index: usize) -> ValueToken {
+        debug_assert!(index < self.len());
+
+        if self.is_overflow(index) {
+            let value = self.value(index);
+            let start_page = u64::from_le_bytes(value[0..8].try_into().unwrap());
+            let total_len = u64::from_le_bytes(value[8..16].try_into().unwrap());
+            ValueToken::Overflow(start_page, total_len as usize)
+        } else {
+            ValueToken::Inline(self.value(index).to_vec())
+        }
     }
 
     fn write_slot(&mut self, index: usize, key: Key, value_offset: u16, value_len: u16) {
