@@ -136,8 +136,6 @@ impl<const N: usize> Btree<N> {
                                 self.leaf_insert_entry(new_leaf_page, key, &value)?;
                                 return Ok(None);
                             } else {
-                                let internal: &mut InternalPage<N> =
-                                    self.pager.mut_node(current)?.try_into().unwrap();
                                 let last_idx = internal.len() - 1;
                                 let next = internal.ptr(last_idx);
                                 // Update the last key to accommodate the new key
