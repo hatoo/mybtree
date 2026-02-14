@@ -772,6 +772,29 @@ macro_rules! impl_bytes_keyed_page {
                 }
             }
 
+            /// Binary search without pager access. Returns `Err(())` if an overflow key is encountered.
+            pub fn search_inline(&self, target: &[u8]) -> Result<Option<usize>, ()> {
+                let mut left = 0;
+                let mut right = self.len();
+                while left < right {
+                    let mid = (left + right) / 2;
+                    if self.is_overflow(mid) {
+                        return Err(());
+                    }
+                    let mid_key = self.key(mid);
+                    if mid_key < target {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                if left == self.len() {
+                    Ok(None)
+                } else {
+                    Ok(Some(left))
+                }
+            }
+
             fn contiguous_free_space(&self) -> usize {
                 let slots_end = Self::HEADER_SIZE + self.len() * Self::SLOT_SIZE;
                 self.data_offset().saturating_sub(slots_end)
@@ -963,6 +986,37 @@ impl<const N: usize> IndexLeafPage<N> {
             let mid_value = self.value(mid);
             match mid_key_bytes
                 .as_ref()
+                .cmp(target)
+                .then(mid_value.cmp(&target_key))
+            {
+                std::cmp::Ordering::Less => left = mid + 1,
+                _ => right = mid,
+            }
+        }
+        if left == self.len() {
+            Ok(None)
+        } else {
+            Ok(Some(left))
+        }
+    }
+
+    /// Binary search using composite ordering without pager access.
+    /// Returns `Err(())` if an overflow key is encountered.
+    pub fn search_entry_inline(
+        &self,
+        target: &[u8],
+        target_key: Key,
+    ) -> Result<Option<usize>, ()> {
+        let mut left = 0;
+        let mut right = self.len();
+        while left < right {
+            let mid = (left + right) / 2;
+            if self.is_overflow(mid) {
+                return Err(());
+            }
+            let mid_key_bytes = self.key(mid);
+            let mid_value = self.value(mid);
+            match mid_key_bytes
                 .cmp(target)
                 .then(mid_value.cmp(&target_key))
             {

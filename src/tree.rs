@@ -872,71 +872,200 @@ impl<const N: usize> Btree<N> {
 
         loop {
             path.push(current);
-            let page = self.pager.owned_node(current)?;
+            let page = self.pager.read_node(current)?;
 
             match page.page_type() {
                 PageType::IndexLeaf => {
-                    let mut leaf: IndexLeafPage<N> = page.try_into().unwrap();
+                    let leaf: &IndexLeafPage<N> = page.try_into().unwrap();
 
-                    // Check if exact (value, key) already exists
-                    if leaf.find_entry(&value, key, &mut self.pager)?.is_some() {
-                        return Ok(false);
+                    // Try inline search to avoid cloning the page
+                    match leaf.search_entry_inline(value, key) {
+                        Ok(result) => {
+                            // Check for duplicate
+                            if let Some(idx) = result {
+                                if leaf.key(idx) == value && leaf.value(idx) == key {
+                                    return Ok(false);
+                                }
+                            }
+                            let insert_idx = result.unwrap_or(leaf.len());
+                            let can_insert = leaf.can_insert(value.len());
+                            let needs_overflow =
+                                IndexLeafPage::<N>::needs_overflow(value.len());
+                            // Borrow from read_node ends after last use of leaf above
+
+                            if can_insert {
+                                if !needs_overflow {
+                                    // Fast path: in-place insert via mut_node, no clone
+                                    let page_mut = self.pager.mut_node(current)?;
+                                    let leaf_mut: &mut IndexLeafPage<N> =
+                                        page_mut.try_into().unwrap();
+                                    leaf_mut.insert_raw_at(
+                                        insert_idx,
+                                        value,
+                                        value.len() as u16,
+                                        key,
+                                    );
+                                    return Ok(true);
+                                }
+                                // Overflow key: need owned page for pager access
+                                let mut leaf: IndexLeafPage<N> =
+                                    self.pager.owned_node(current)?.try_into().unwrap();
+                                leaf.insert_entry(value, key, &mut self.pager)?;
+                                self.pager.write_node(current, leaf.into())?;
+                                return Ok(true);
+                            }
+
+                            // Need to split
+                            let mut leaf: IndexLeafPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+                            let mut right = leaf.split();
+                            let split_key_bytes =
+                                leaf.resolved_key(leaf.len() - 1, &mut self.pager)?;
+                            let cmp = value.cmp(split_key_bytes.as_ref());
+                            if cmp == std::cmp::Ordering::Less
+                                || (cmp == std::cmp::Ordering::Equal
+                                    && key <= leaf.value(leaf.len() - 1))
+                            {
+                                leaf.insert_entry(value, key, &mut self.pager)?;
+                            } else {
+                                right.insert_entry(value, key, &mut self.pager)?;
+                            }
+
+                            let page_num = *path.last().unwrap();
+                            let parents = &path[..path.len() - 1];
+                            let right_page = self.pager.alloc_page()?;
+                            self.pager.write_node(right_page, right.into())?;
+                            self.pager.write_node(page_num, leaf.into())?;
+                            self.index_propagate_split(root, parents, page_num, right_page)?;
+                            return Ok(true);
+                        }
+                        Err(()) => {
+                            // Has overflow keys: fallback to original approach
+                            let mut leaf: IndexLeafPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+
+                            if leaf.find_entry(value, key, &mut self.pager)?.is_some() {
+                                return Ok(false);
+                            }
+
+                            if leaf.can_insert(value.len()) {
+                                leaf.insert_entry(value, key, &mut self.pager)?;
+                                self.pager.write_node(current, leaf.into())?;
+                                return Ok(true);
+                            }
+
+                            // Need to split
+                            let mut right = leaf.split();
+                            let split_key_bytes =
+                                leaf.resolved_key(leaf.len() - 1, &mut self.pager)?;
+                            let cmp = value.cmp(split_key_bytes.as_ref());
+                            if cmp == std::cmp::Ordering::Less
+                                || (cmp == std::cmp::Ordering::Equal
+                                    && key <= leaf.value(leaf.len() - 1))
+                            {
+                                leaf.insert_entry(value, key, &mut self.pager)?;
+                            } else {
+                                right.insert_entry(value, key, &mut self.pager)?;
+                            }
+
+                            let page_num = *path.last().unwrap();
+                            let parents = &path[..path.len() - 1];
+                            let right_page = self.pager.alloc_page()?;
+                            self.pager.write_node(right_page, right.into())?;
+                            self.pager.write_node(page_num, leaf.into())?;
+                            self.index_propagate_split(root, parents, page_num, right_page)?;
+                            return Ok(true);
+                        }
                     }
-
-                    if leaf.can_insert(value.len()) {
-                        leaf.insert_entry(&value, key, &mut self.pager)?;
-                        let page_num = *path.last().unwrap();
-                        self.pager.write_node(page_num, leaf.into())?;
-                        return Ok(true);
-                    }
-
-                    // Need to split
-                    let mut right = leaf.split();
-                    // Determine which half to insert into
-                    let split_key_bytes = leaf.resolved_key(leaf.len() - 1, &mut self.pager)?;
-                    let cmp = value.cmp(split_key_bytes.as_ref());
-                    if cmp == std::cmp::Ordering::Less
-                        || (cmp == std::cmp::Ordering::Equal && key <= leaf.value(leaf.len() - 1))
-                    {
-                        leaf.insert_entry(&value, key, &mut self.pager)?;
-                    } else {
-                        right.insert_entry(&value, key, &mut self.pager)?;
-                    }
-
-                    let page_num = *path.last().unwrap();
-                    let parents = &path[..path.len() - 1];
-                    let right_page = self.pager.alloc_page()?;
-
-                    self.pager.write_node(right_page, right.into())?;
-                    self.pager.write_node(page_num, leaf.into())?;
-
-                    self.index_propagate_split(root, parents, page_num, right_page)?;
-                    return Ok(true);
                 }
                 PageType::IndexInternal => {
-                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                    match internal.find_child(&value, &mut self.pager)? {
-                        Some(next) => current = next,
-                        None => {
+                    let internal: &IndexInternalPage<N> = page.try_into().unwrap();
+
+                    match internal.search_inline(value) {
+                        Ok(Some(idx)) => {
+                            // Fast path: follow child without cloning the page
+                            current = internal.ptr(idx);
+                        }
+                        Ok(None) => {
                             // Value is beyond all entries
-                            let mut internal: IndexInternalPage<N> =
-                                self.pager.owned_node(current)?.try_into().unwrap();
-                            if internal.len() == 0 {
+                            let len = internal.len();
+                            let last_ptr = if len > 0 {
+                                Some(internal.ptr(len - 1))
+                            } else {
+                                None
+                            };
+                            // Borrow from read_node ends after last use of internal above
+
+                            if len == 0 {
+                                let mut internal: IndexInternalPage<N> =
+                                    self.pager.owned_node(current)?.try_into().unwrap();
                                 let new_leaf_page = self.pager.alloc_page()?;
                                 let mut new_leaf = IndexLeafPage::<N>::new();
-                                new_leaf.insert_entry(&value, key, &mut self.pager)?;
+                                new_leaf.insert_entry(value, key, &mut self.pager)?;
                                 self.pager.write_node(new_leaf_page, new_leaf.into())?;
-                                internal.insert(&value, new_leaf_page, &mut self.pager)?;
+                                internal.insert(value, new_leaf_page, &mut self.pager)?;
                                 self.pager.write_node(current, internal.into())?;
                                 return Ok(true);
+                            }
+
+                            let next = last_ptr.unwrap();
+                            let last_idx = len - 1;
+
+                            if !IndexInternalPage::<N>::needs_overflow(value.len()) {
+                                // Fast path: in-place update via mut_node
+                                let page_mut = self.pager.mut_node(current)?;
+                                let internal_mut: &mut IndexInternalPage<N> =
+                                    page_mut.try_into().unwrap();
+                                internal_mut.remove(last_idx);
+                                let insert_idx = internal_mut.len();
+                                internal_mut.insert_raw_at(
+                                    insert_idx,
+                                    value,
+                                    value.len() as u16,
+                                    next,
+                                );
                             } else {
-                                let last_idx = internal.len() - 1;
-                                let next = internal.ptr(last_idx);
-                                // Update last key to accommodate new value
+                                let mut internal: IndexInternalPage<N> =
+                                    self.pager.owned_node(current)?.try_into().unwrap();
                                 internal.remove(last_idx);
-                                internal.insert(&value, next, &mut self.pager)?;
+                                internal.insert(value, next, &mut self.pager)?;
                                 self.pager.write_node(current, internal.into())?;
-                                current = next;
+                            }
+                            current = next;
+                        }
+                        Err(()) => {
+                            // Has overflow keys: fallback to original approach
+                            let mut internal: IndexInternalPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+                            match internal.find_child(value, &mut self.pager)? {
+                                Some(next) => current = next,
+                                None => {
+                                    if internal.len() == 0 {
+                                        let new_leaf_page = self.pager.alloc_page()?;
+                                        let mut new_leaf = IndexLeafPage::<N>::new();
+                                        new_leaf
+                                            .insert_entry(value, key, &mut self.pager)?;
+                                        self.pager
+                                            .write_node(new_leaf_page, new_leaf.into())?;
+                                        internal.insert(
+                                            value,
+                                            new_leaf_page,
+                                            &mut self.pager,
+                                        )?;
+                                        self.pager
+                                            .write_node(current, internal.into())?;
+                                        return Ok(true);
+                                    } else {
+                                        let last_idx = internal.len() - 1;
+                                        let next = internal.ptr(last_idx);
+                                        internal.remove(last_idx);
+                                        internal
+                                            .insert(value, next, &mut self.pager)?;
+                                        self.pager
+                                            .write_node(current, internal.into())?;
+                                        current = next;
+                                    }
+                                }
                             }
                         }
                     }
