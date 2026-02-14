@@ -1227,35 +1227,90 @@ impl<const N: usize> Btree<N> {
 
         loop {
             path.push(current);
-            let page = self.pager.owned_node(current)?;
+            let page = self.pager.read_node(current)?;
 
             match page.page_type() {
                 PageType::IndexLeaf => {
-                    let leaf: IndexLeafPage<N> = page.try_into().unwrap();
-                    if let Some(idx) = leaf.find_entry(value, key, &mut self.pager)? {
-                        let overflow_meta = if leaf.is_overflow(idx) {
-                            Some(Pager::<N>::parse_overflow_meta(leaf.key(idx)))
-                        } else {
-                            None
-                        };
-                        {
-                            let p = self.pager.mut_node(current)?;
-                            let leaf_mut: &mut IndexLeafPage<N> = p.try_into().unwrap();
-                            leaf_mut.remove(idx);
+                    let leaf: &IndexLeafPage<N> = page.try_into().unwrap();
+
+                    match leaf.search_entry_inline(value, key) {
+                        Ok(result) => {
+                            let found_idx = result.and_then(|idx| {
+                                if leaf.key(idx) == value && leaf.value(idx) == key {
+                                    Some(idx)
+                                } else {
+                                    None
+                                }
+                            });
+                            if found_idx.is_none() {
+                                return Ok(false);
+                            }
+                            let idx = found_idx.unwrap();
+                            let overflow_meta = if leaf.is_overflow(idx) {
+                                Some(Pager::<N>::parse_overflow_meta(leaf.key(idx)))
+                            } else {
+                                None
+                            };
+                            // Borrow from read_node ends here
+
+                            {
+                                let p = self.pager.mut_node(current)?;
+                                let leaf_mut: &mut IndexLeafPage<N> =
+                                    p.try_into().unwrap();
+                                leaf_mut.remove(idx);
+                            }
+                            self.index_merge_leaf(&path)?;
+                            if let Some((start_page, total_len)) = overflow_meta {
+                                self.pager.free_overflow_pages(start_page, total_len)?;
+                            }
+                            return Ok(true);
                         }
-                        self.index_merge_leaf(&path)?;
-                        if let Some((start_page, total_len)) = overflow_meta {
-                            self.pager.free_overflow_pages(start_page, total_len)?;
+                        Err(()) => {
+                            // Has overflow keys: fallback
+                            let leaf: IndexLeafPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+                            if let Some(idx) =
+                                leaf.find_entry(value, key, &mut self.pager)?
+                            {
+                                let overflow_meta = if leaf.is_overflow(idx) {
+                                    Some(Pager::<N>::parse_overflow_meta(leaf.key(idx)))
+                                } else {
+                                    None
+                                };
+                                {
+                                    let p = self.pager.mut_node(current)?;
+                                    let leaf_mut: &mut IndexLeafPage<N> =
+                                        p.try_into().unwrap();
+                                    leaf_mut.remove(idx);
+                                }
+                                self.index_merge_leaf(&path)?;
+                                if let Some((start_page, total_len)) = overflow_meta {
+                                    self.pager
+                                        .free_overflow_pages(start_page, total_len)?;
+                                }
+                                return Ok(true);
+                            }
+                            return Ok(false);
                         }
-                        return Ok(true);
                     }
-                    return Ok(false);
                 }
                 PageType::IndexInternal => {
-                    let internal: IndexInternalPage<N> = page.try_into().unwrap();
-                    match internal.find_child(value, &mut self.pager)? {
-                        Some(next) => current = next,
-                        None => return Ok(false),
+                    let internal: &IndexInternalPage<N> = page.try_into().unwrap();
+
+                    match internal.search_inline(value) {
+                        Ok(Some(idx)) => {
+                            current = internal.ptr(idx);
+                        }
+                        Ok(None) => return Ok(false),
+                        Err(()) => {
+                            // Has overflow keys: fallback
+                            let internal: IndexInternalPage<N> =
+                                self.pager.owned_node(current)?.try_into().unwrap();
+                            match internal.find_child(value, &mut self.pager)? {
+                                Some(next) => current = next,
+                                None => return Ok(false),
+                            }
+                        }
                     }
                 }
                 _ => {
