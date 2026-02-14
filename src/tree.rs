@@ -83,12 +83,7 @@ impl<const N: usize> Btree<N> {
     //  Primary tree: insert
     // ────────────────────────────────────────────────────────────────────
 
-    pub fn insert(
-        &mut self,
-        root: NodePtr,
-        key: Key,
-        value: &[u8],
-    ) -> Result<Option<Vec<u8>>, TreeError> {
+    pub fn insert(&mut self, root: NodePtr, key: Key, value: &[u8]) -> Result<(), TreeError> {
         let mut current = root;
         let mut path = vec![];
 
@@ -101,17 +96,22 @@ impl<const N: usize> Btree<N> {
                     let leaf: &mut LeafPage<N> = page.try_into().unwrap();
                     match leaf.search_key(key) {
                         Ok(index) => {
-                            let value_token = leaf.value_token(index);
+                            let overflow_meta = if leaf.is_overflow(index) {
+                                Some(Pager::<N>::parse_overflow_meta(leaf.value(index)))
+                            } else {
+                                None
+                            };
                             leaf.remove(index);
-                            let old_bytes =
-                                value_token.into_value_and_free_overflow_pages(&mut self.pager)?;
+                            if let Some((start_page, total_len)) = overflow_meta {
+                                self.pager.free_overflow_pages(start_page, total_len)?;
+                            }
                             self.leaf_insert_and_propagate(root, &path, key, value)?;
-                            return Ok(Some(old_bytes));
+                            return Ok(());
                         }
                         Err(_) => {
                             // New key
                             self.leaf_insert_and_propagate(root, &path, key, value)?;
-                            return Ok(None);
+                            return Ok(());
                         }
                     }
                 }
@@ -131,7 +131,7 @@ impl<const N: usize> Btree<N> {
                                 let new_leaf = LeafPage::<N>::new();
                                 self.pager.write_node(new_leaf_page, new_leaf.into())?;
                                 self.leaf_insert_entry(new_leaf_page, key, value)?;
-                                return Ok(None);
+                                return Ok(());
                             } else {
                                 let last_idx = internal.len() - 1;
                                 let next = internal.ptr(last_idx);
@@ -2081,8 +2081,7 @@ mod tests {
         btree.insert(root, 1, &big_value).unwrap();
 
         let bigger_value = vec![99u8; 8192];
-        let old = btree.insert(root, 1, &bigger_value).unwrap();
-        assert_eq!(old, Some(big_value));
+        btree.insert(root, 1, &bigger_value).unwrap();
         assert_eq!(read_value(&mut btree, root, 1), Some(bigger_value));
     }
 
@@ -2145,8 +2144,7 @@ mod tests {
         let big_value = vec![42u8; 4096];
         btree.insert(root, 1, &big_value).unwrap();
 
-        let old = btree.insert(root, 1, b"tiny").unwrap();
-        assert_eq!(old, Some(big_value));
+        btree.insert(root, 1, b"tiny").unwrap();
         assert_read_eq(&mut btree, root, 1, b"tiny");
     }
 
