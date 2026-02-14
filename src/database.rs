@@ -1993,7 +1993,9 @@ mod tests {
         // Query by age (i64 big-endian bytes for 25)
         let age_25 = 25i64.to_be_bytes().to_vec();
         let age_30 = 30i64.to_be_bytes().to_vec();
-        let by_age = tx.scan_by_index("users", "age", age_25.as_slice()..=age_30.as_slice()).unwrap();
+        let by_age = tx
+            .scan_by_index("users", "age", age_25.as_slice()..=age_30.as_slice())
+            .unwrap();
         assert_eq!(by_age.len(), 2);
     }
 
@@ -2051,7 +2053,9 @@ mod tests {
         let key_1 = 1i64.to_be_bytes().to_vec();
         let meta = tx.find_table_meta("t").unwrap().unwrap();
         let _idx_root = meta.index_trees.iter().find(|(c, _)| c == "x").unwrap().1;
-        let rows = tx.scan_by_index("t", "x", key_1.as_slice()..=key_1.as_slice()).unwrap();
+        let rows = tx
+            .scan_by_index("t", "x", key_1.as_slice()..=key_1.as_slice())
+            .unwrap();
         let mut values: Vec<String> = rows
             .iter()
             .map(|(_, row)| match &row.values[1] {
