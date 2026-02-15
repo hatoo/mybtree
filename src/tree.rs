@@ -1814,8 +1814,7 @@ impl<const N: usize> Btree<N> {
             }
 
             if i > 0 {
-                let prev_max =
-                    internal.resolved_key(i - 1, &mut self.pager)?.into_owned();
+                let prev_max = internal.resolved_key(i - 1, &mut self.pager)?.into_owned();
                 let beyond_end = match range.end_bound() {
                     Bound::Included(e) => prev_max.as_slice() > *e,
                     Bound::Excluded(e) => prev_max.as_slice() >= *e,

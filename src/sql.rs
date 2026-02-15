@@ -180,9 +180,10 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                 let mut primary_key = None;
                 for (i, col_def) in ct.columns.iter().enumerate() {
                     let column_type = map_data_type(&col_def.data_type)?;
-                    let is_pk = col_def.options.iter().any(|opt| {
-                        matches!(opt.option, ColumnOption::PrimaryKey { .. })
-                    });
+                    let is_pk = col_def
+                        .options
+                        .iter()
+                        .any(|opt| matches!(opt.option, ColumnOption::PrimaryKey { .. }));
                     let nullable = if is_pk {
                         false
                     } else {
@@ -223,7 +224,8 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
 
                 // Detect whether the table has an implicit _rowid column
                 // that the user is not explicitly providing.
-                let has_implicit_rowid = schema.columns.first().map_or(false, |c| c.name == "_rowid");
+                let has_implicit_rowid =
+                    schema.columns.first().map_or(false, |c| c.name == "_rowid");
 
                 let column_map = if ins.columns.is_empty() {
                     None
@@ -914,12 +916,12 @@ mod tests {
                 "t",
                 &Row {
                     values: vec![
-                        DbValue::Null,               // _rowid
-                        DbValue::Integer(42),         // BIGINT → Integer
-                        DbValue::Text("hi".into()),   // CHAR → Text
-                        DbValue::Float(1.0),          // DOUBLE → Float
-                        DbValue::Float(2.0),          // REAL → Float
-                        DbValue::Bool(false),         // BOOL → Bool
+                        DbValue::Null,              // _rowid
+                        DbValue::Integer(42),       // BIGINT → Integer
+                        DbValue::Text("hi".into()), // CHAR → Text
+                        DbValue::Float(1.0),        // DOUBLE → Float
+                        DbValue::Float(2.0),        // REAL → Float
+                        DbValue::Bool(false),       // BOOL → Bool
                     ],
                 },
             )
@@ -982,7 +984,10 @@ mod tests {
         .unwrap();
         execute(&tx, "INSERT INTO items VALUES (1, 'a')").unwrap();
         let err = execute(&tx, "INSERT INTO items VALUES (1, 'b')").unwrap_err();
-        assert!(matches!(err, SqlError::Database(DatabaseError::DuplicateKey(1))));
+        assert!(matches!(
+            err,
+            SqlError::Database(DatabaseError::DuplicateKey(1))
+        ));
     }
 
     #[test]

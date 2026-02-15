@@ -1002,11 +1002,7 @@ impl<const N: usize> IndexLeafPage<N> {
 
     /// Binary search using composite ordering without pager access.
     /// Returns `Err(())` if an overflow key is encountered.
-    pub fn search_entry_inline(
-        &self,
-        target: &[u8],
-        target_key: Key,
-    ) -> Result<Option<usize>, ()> {
+    pub fn search_entry_inline(&self, target: &[u8], target_key: Key) -> Result<Option<usize>, ()> {
         let mut left = 0;
         let mut right = self.len();
         while left < right {
@@ -1016,10 +1012,7 @@ impl<const N: usize> IndexLeafPage<N> {
             }
             let mid_key_bytes = self.key(mid);
             let mid_value = self.value(mid);
-            match mid_key_bytes
-                .cmp(target)
-                .then(mid_value.cmp(&target_key))
-            {
+            match mid_key_bytes.cmp(target).then(mid_value.cmp(&target_key)) {
                 std::cmp::Ordering::Less => left = mid + 1,
                 _ => right = mid,
             }

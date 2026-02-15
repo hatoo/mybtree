@@ -1871,28 +1871,44 @@ mod tests {
         tx.insert(
             "t",
             &Row {
-                values: vec![DbValue::Null, DbValue::Integer(1), DbValue::Text("a".into())],
+                values: vec![
+                    DbValue::Null,
+                    DbValue::Integer(1),
+                    DbValue::Text("a".into()),
+                ],
             },
         )
         .unwrap();
         tx.insert(
             "t",
             &Row {
-                values: vec![DbValue::Null, DbValue::Integer(1), DbValue::Text("b".into())],
+                values: vec![
+                    DbValue::Null,
+                    DbValue::Integer(1),
+                    DbValue::Text("b".into()),
+                ],
             },
         )
         .unwrap();
         tx.insert(
             "t",
             &Row {
-                values: vec![DbValue::Null, DbValue::Integer(2), DbValue::Text("c".into())],
+                values: vec![
+                    DbValue::Null,
+                    DbValue::Integer(2),
+                    DbValue::Text("c".into()),
+                ],
             },
         )
         .unwrap();
         tx.insert(
             "t",
             &Row {
-                values: vec![DbValue::Null, DbValue::Integer(1), DbValue::Text("d".into())],
+                values: vec![
+                    DbValue::Null,
+                    DbValue::Integer(1),
+                    DbValue::Text("d".into()),
+                ],
             },
         )
         .unwrap();
