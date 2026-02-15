@@ -500,10 +500,8 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
         let mut names = Vec::new();
         for (_, bytes) in &entries {
             let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(bytes)?;
-            let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
-            names.push(meta.name);
+            names.push(archived.name.to_string());
         }
-        names.sort();
         Ok(names)
     }
 
