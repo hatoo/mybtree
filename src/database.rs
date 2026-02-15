@@ -37,6 +37,9 @@ pub struct Column {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct Schema {
     pub columns: Vec<Column>,
+    /// Index of the primary key column. `None` means no explicit PK was given
+    /// (an implicit `_rowid` column will be prepended by `create_table`).
+    pub primary_key: Option<usize>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -54,6 +57,8 @@ pub enum DatabaseError {
     TableAlreadyExists(String),
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
+    #[error("duplicate primary key: {0}")]
+    DuplicateKey(Key),
     #[error("transaction error: {0}")]
     Transaction(#[from] TransactionError),
     #[error("internal error: {0}")]
@@ -208,9 +213,36 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
         Ok(meta.schema)
     }
 
-    pub fn create_table(&self, name: &str, schema: Schema) -> Result<(), DatabaseError> {
+    pub fn create_table(&self, name: &str, mut schema: Schema) -> Result<(), DatabaseError> {
         if self.find_table_meta(name)?.is_some() {
             return Err(DatabaseError::TableAlreadyExists(name.to_string()));
+        }
+
+        // If no explicit primary key, prepend an implicit `_rowid` column.
+        if schema.primary_key.is_none() {
+            schema.columns.insert(
+                0,
+                Column {
+                    name: "_rowid".to_string(),
+                    column_type: ColumnType::Integer,
+                    nullable: false,
+                },
+            );
+            schema.primary_key = Some(0);
+        }
+
+        // Validate PK column is integer and not nullable.
+        let pk_idx = schema.primary_key.unwrap();
+        let pk_col = &schema.columns[pk_idx];
+        if pk_col.column_type != ColumnType::Integer {
+            return Err(DatabaseError::SchemaMismatch(
+                "primary key column must be INTEGER".to_string(),
+            ));
+        }
+        if pk_col.nullable {
+            return Err(DatabaseError::SchemaMismatch(
+                "primary key column must be NOT NULL".to_string(),
+            ));
         }
 
         let root_page = self.tx.init_tree()?;
@@ -340,10 +372,38 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
         let meta = self
             .find_table_meta(table_name)?
             .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-        validate_row(row, &meta.schema)?;
-        let key = self
-            .tx
-            .insert(meta.root_page, rkyv::to_bytes::<Error>(row)?.to_vec())?;
+
+        let pk_idx = meta.schema.primary_key.unwrap();
+        let mut row = row.clone();
+
+        // Handle auto-assign for implicit _rowid (Null in PK position).
+        if row.values[pk_idx] == DbValue::Null {
+            let next = self.tx.available_key(meta.root_page)?;
+            row.values[pk_idx] = DbValue::Integer(next as i64);
+        }
+
+        validate_row(&row, &meta.schema)?;
+
+        // Extract PK value and convert to B-tree key.
+        let key = match &row.values[pk_idx] {
+            DbValue::Integer(i) => {
+                if *i < 0 {
+                    return Err(DatabaseError::SchemaMismatch(
+                        "primary key value must be non-negative".to_string(),
+                    ));
+                }
+                *i as Key
+            }
+            _ => unreachable!("PK column validated as integer"),
+        };
+
+        // Check for duplicate key.
+        if self.tx.read(meta.root_page, key)?.is_some() {
+            return Err(DatabaseError::DuplicateKey(key));
+        }
+
+        self.tx
+            .write(meta.root_page, key, rkyv::to_bytes::<Error>(&row)?.to_vec());
 
         // Update index trees
         for (col_name, idx_root) in &meta.index_trees {
@@ -545,6 +605,18 @@ mod tests {
                     nullable: false,
                 },
             ],
+            primary_key: None,
+        }
+    }
+
+    /// Build a Row for a table with implicit `_rowid` (Null triggers auto-assign).
+    fn user_row(name: &str, age: i64) -> Row {
+        Row {
+            values: vec![
+                DbValue::Null, // _rowid auto-assign
+                DbValue::Text(name.into()),
+                DbValue::Integer(age),
+            ],
         }
     }
 
@@ -555,7 +627,10 @@ mod tests {
         let tx = db.begin_transaction();
         tx.create_table("users", users_schema()).unwrap();
         let meta = tx.find_table_meta("users").unwrap().unwrap();
-        assert_eq!(meta.schema.columns.len(), 2);
+        // 3 columns: _rowid (implicit) + name + age
+        assert_eq!(meta.schema.columns.len(), 3);
+        assert_eq!(meta.schema.columns[0].name, "_rowid");
+        assert_eq!(meta.schema.primary_key, Some(0));
     }
 
     #[test]
@@ -578,17 +653,14 @@ mod tests {
         tx.create_table("users", users_schema()).unwrap();
         tx.commit().unwrap();
 
-        let row = Row {
-            values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-        };
-
         let tx = db.begin_transaction();
-        let key = tx.insert("users", &row).unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let fetched = tx.get("users", key).unwrap().unwrap();
-        assert_eq!(fetched, row);
+        assert_eq!(fetched.values[1], DbValue::Text("Alice".into()));
+        assert_eq!(fetched.values[2], DbValue::Integer(30));
     }
 
     // 3. Insert with schema mismatch
@@ -599,8 +671,9 @@ mod tests {
         tx.create_table("users", users_schema()).unwrap();
         tx.commit().unwrap();
 
+        // _rowid + wrong type for name + age
         let bad_row = Row {
-            values: vec![DbValue::Integer(123), DbValue::Integer(30)],
+            values: vec![DbValue::Null, DbValue::Integer(123), DbValue::Integer(30)],
         };
 
         let tx = db.begin_transaction();
@@ -633,37 +706,16 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let k1 = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
-        let k2 = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
-                },
-            )
-            .unwrap();
-        let _k3 = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Charlie".into()), DbValue::Integer(35)],
-                },
-            )
-            .unwrap();
+        let k1 = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let k2 = tx.insert("users", &user_row("Bob", 25)).unwrap();
+        let _k3 = tx.insert("users", &user_row("Charlie", 35)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
         let results = tx.scan("users", k1..=k2).unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].1.values[0], DbValue::Text("Alice".into()));
-        assert_eq!(results[1].1.values[0], DbValue::Text("Bob".into()));
+        assert_eq!(results[0].1.values[1], DbValue::Text("Alice".into()));
+        assert_eq!(results[1].1.values[1], DbValue::Text("Bob".into()));
     }
 
     // 5. Update and delete rows
@@ -675,14 +727,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -690,7 +735,11 @@ mod tests {
             "users",
             key,
             &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+                values: vec![
+                    DbValue::Integer(key as i64),
+                    DbValue::Text("Alice".into()),
+                    DbValue::Integer(31),
+                ],
             },
         )
         .unwrap();
@@ -698,7 +747,7 @@ mod tests {
 
         let tx = db.begin_transaction();
         let fetched = tx.get("users", key).unwrap().unwrap();
-        assert_eq!(fetched.values[1], DbValue::Integer(31));
+        assert_eq!(fetched.values[2], DbValue::Integer(31));
     }
 
     #[test]
@@ -709,14 +758,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -748,25 +790,23 @@ mod tests {
                         nullable: false,
                     },
                 ],
+                primary_key: None,
             },
         )
         .unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let uk = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let uk = tx.insert("users", &user_row("Alice", 30)).unwrap();
         let pk = tx
             .insert(
                 "products",
                 &Row {
-                    values: vec![DbValue::Text("Widget".into()), DbValue::Float(9.99)],
+                    values: vec![
+                        DbValue::Null, // _rowid
+                        DbValue::Text("Widget".into()),
+                        DbValue::Float(9.99),
+                    ],
                 },
             )
             .unwrap();
@@ -775,8 +815,8 @@ mod tests {
         let tx = db.begin_transaction();
         let user = tx.get("users", uk).unwrap().unwrap();
         let product = tx.get("products", pk).unwrap().unwrap();
-        assert_eq!(user.values[0], DbValue::Text("Alice".into()));
-        assert_eq!(product.values[0], DbValue::Text("Widget".into()));
+        assert_eq!(user.values[1], DbValue::Text("Alice".into()));
+        assert_eq!(product.values[1], DbValue::Text("Widget".into()));
     }
 
     // 7. Transaction commit/rollback behavior
@@ -788,14 +828,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Ghost".into()), DbValue::Integer(0)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Ghost", 0)).unwrap();
         drop(tx); // rollback
 
         let tx = db.begin_transaction();
@@ -810,14 +843,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Persist".into()), DbValue::Integer(1)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Persist", 1)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -844,6 +870,7 @@ mod tests {
                         nullable: true,
                     },
                 ],
+                primary_key: None,
             },
         )
         .unwrap();
@@ -854,7 +881,11 @@ mod tests {
             .insert(
                 "events",
                 &Row {
-                    values: vec![DbValue::Text("Launch".into()), DbValue::Null],
+                    values: vec![
+                        DbValue::Null, // _rowid
+                        DbValue::Text("Launch".into()),
+                        DbValue::Null,
+                    ],
                 },
             )
             .unwrap();
@@ -862,7 +893,7 @@ mod tests {
 
         let tx = db.begin_transaction();
         let row = tx.get("events", key).unwrap().unwrap();
-        assert_eq!(row.values[1], DbValue::Null);
+        assert_eq!(row.values[2], DbValue::Null);
     }
 
     #[test]
@@ -873,11 +904,12 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
+        // name (index 1) is NOT NULL — should reject
         let err = tx
             .insert(
                 "users",
                 &Row {
-                    values: vec![DbValue::Null, DbValue::Integer(30)],
+                    values: vec![DbValue::Null, DbValue::Null, DbValue::Integer(30)],
                 },
             )
             .unwrap_err();
@@ -930,6 +962,7 @@ mod tests {
                     column_type: ColumnType::Bool,
                     nullable: false,
                 }],
+                primary_key: None,
             },
         )
         .unwrap();
@@ -940,7 +973,7 @@ mod tests {
             .insert(
                 "flags",
                 &Row {
-                    values: vec![DbValue::Bool(true)],
+                    values: vec![DbValue::Null, DbValue::Bool(true)],
                 },
             )
             .unwrap();
@@ -948,7 +981,7 @@ mod tests {
             .insert(
                 "flags",
                 &Row {
-                    values: vec![DbValue::Bool(false)],
+                    values: vec![DbValue::Null, DbValue::Bool(false)],
                 },
             )
             .unwrap();
@@ -956,11 +989,11 @@ mod tests {
 
         let tx = db.begin_transaction();
         assert_eq!(
-            tx.get("flags", k1).unwrap().unwrap().values[0],
+            tx.get("flags", k1).unwrap().unwrap().values[1],
             DbValue::Bool(true)
         );
         assert_eq!(
-            tx.get("flags", k2).unwrap().unwrap().values[0],
+            tx.get("flags", k2).unwrap().unwrap().values[1],
             DbValue::Bool(false)
         );
     }
@@ -983,16 +1016,8 @@ mod tests {
         // Insert many rows to allocate several pages
         let tx = db.begin_transaction();
         for i in 0..100 {
-            tx.insert(
-                "users",
-                &Row {
-                    values: vec![
-                        DbValue::Text(format!("user_{}", i)),
-                        DbValue::Integer(i as i64),
-                    ],
-                },
-            )
-            .unwrap();
+            tx.insert("users", &user_row(&format!("user_{}", i), i as i64))
+                .unwrap();
         }
         tx.commit().unwrap();
 
@@ -1009,16 +1034,8 @@ mod tests {
 
         let tx = db.begin_transaction();
         for i in 0..100 {
-            tx.insert(
-                "users2",
-                &Row {
-                    values: vec![
-                        DbValue::Text(format!("user_{}", i)),
-                        DbValue::Integer(i as i64),
-                    ],
-                },
-            )
-            .unwrap();
+            tx.insert("users2", &user_row(&format!("user_{}", i), i as i64))
+                .unwrap();
         }
         tx.commit().unwrap();
 
@@ -1052,16 +1069,8 @@ mod tests {
         // Insert many rows to allocate pages for data + both indexes
         let tx = db.begin_transaction();
         for i in 0..100 {
-            tx.insert(
-                "users",
-                &Row {
-                    values: vec![
-                        DbValue::Text(format!("user_{}", i)),
-                        DbValue::Integer(i as i64),
-                    ],
-                },
-            )
-            .unwrap();
+            tx.insert("users", &user_row(&format!("user_{}", i), i as i64))
+                .unwrap();
         }
         tx.commit().unwrap();
 
@@ -1080,16 +1089,8 @@ mod tests {
 
         let tx = db.begin_transaction();
         for i in 0..100 {
-            tx.insert(
-                "users2",
-                &Row {
-                    values: vec![
-                        DbValue::Text(format!("user_{}", i)),
-                        DbValue::Integer(i as i64),
-                    ],
-                },
-            )
-            .unwrap();
+            tx.insert("users2", &user_row(&format!("user_{}", i), i as i64))
+                .unwrap();
         }
         tx.commit().unwrap();
 
@@ -1166,27 +1167,9 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
-            },
-        )
-        .unwrap();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Charlie".into()), DbValue::Integer(35)],
-            },
-        )
-        .unwrap();
+        tx.insert("users", &user_row("Alice", 30)).unwrap();
+        tx.insert("users", &user_row("Bob", 25)).unwrap();
+        tx.insert("users", &user_row("Charlie", 35)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1194,7 +1177,7 @@ mod tests {
             .scan_by_index("users", "name", &b"Bob"[..]..=&b"Charlie"[..])
             .unwrap();
         assert_eq!(results.len(), 2);
-        let names: Vec<_> = results.iter().map(|(_, r)| &r.values[0]).collect();
+        let names: Vec<_> = results.iter().map(|(_, r)| &r.values[1]).collect();
         assert!(names.contains(&&DbValue::Text("Bob".into())));
         assert!(names.contains(&&DbValue::Text("Charlie".into())));
     }
@@ -1222,13 +1205,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Diana".into()), DbValue::Integer(28)],
-            },
-        )
-        .unwrap();
+        tx.insert("users", &user_row("Diana", 28)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1236,7 +1213,7 @@ mod tests {
             .scan_by_index("users", "name", &b"Diana"[..]..=&b"Diana"[..])
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1.values[0], DbValue::Text("Diana".into()));
+        assert_eq!(results[0].1.values[1], DbValue::Text("Diana".into()));
     }
 
     #[test]
@@ -1248,14 +1225,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Eve".into()), DbValue::Integer(22)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Eve", 22)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1278,14 +1248,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Frank".into()), DbValue::Integer(40)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Frank", 40)).unwrap();
         tx.commit().unwrap();
 
         // Update name from Frank to George
@@ -1294,7 +1257,11 @@ mod tests {
             "users",
             key,
             &Row {
-                values: vec![DbValue::Text("George".into()), DbValue::Integer(40)],
+                values: vec![
+                    DbValue::Integer(key as i64),
+                    DbValue::Text("George".into()),
+                    DbValue::Integer(40),
+                ],
             },
         )
         .unwrap();
@@ -1312,7 +1279,7 @@ mod tests {
             .scan_by_index("users", "name", &b"George"[..]..=&b"George"[..])
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1.values[0], DbValue::Text("George".into()));
+        assert_eq!(results[0].1.values[1], DbValue::Text("George".into()));
     }
 
     #[test]
@@ -1324,20 +1291,8 @@ mod tests {
 
         // Insert rows before creating the index
         let tx = db.begin_transaction();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
-            },
-        )
-        .unwrap();
+        tx.insert("users", &user_row("Alice", 30)).unwrap();
+        tx.insert("users", &user_row("Bob", 25)).unwrap();
         tx.commit().unwrap();
 
         // Create index after data exists
@@ -1362,13 +1317,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
+        tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1389,14 +1338,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // Two concurrent transactions update the same row
@@ -1407,7 +1349,11 @@ mod tests {
             "users",
             key,
             &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+                values: vec![
+                    DbValue::Integer(key as i64),
+                    DbValue::Text("Alice".into()),
+                    DbValue::Integer(31),
+                ],
             },
         )
         .unwrap();
@@ -1416,7 +1362,11 @@ mod tests {
             "users",
             key,
             &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(32)],
+                values: vec![
+                    DbValue::Integer(key as i64),
+                    DbValue::Text("Alice".into()),
+                    DbValue::Integer(32),
+                ],
             },
         )
         .unwrap();
@@ -1435,14 +1385,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 reads a row, tx2 writes (updates) the same row
@@ -1455,7 +1398,11 @@ mod tests {
             "users",
             key,
             &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+                values: vec![
+                    DbValue::Integer(key as i64),
+                    DbValue::Text("Alice".into()),
+                    DbValue::Integer(31),
+                ],
             },
         )
         .unwrap();
@@ -1473,14 +1420,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 reads the row, tx2 deletes it
@@ -1502,14 +1442,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let k1 = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let k1 = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 does a range scan, tx2 inserts a row whose key falls in that range
@@ -1518,14 +1451,7 @@ mod tests {
 
         tx1.scan("users", k1..).unwrap();
 
-        let k2 = tx2
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
-                },
-            )
-            .unwrap();
+        let k2 = tx2.insert("users", &user_row("Bob", 25)).unwrap();
         // The new key should be >= k1 so it falls in the scanned range
         assert!(k2 >= k1);
 
@@ -1548,13 +1474,7 @@ mod tests {
         tx1.scan_by_index("users", "name", &b"A"[..]..&b"Z"[..])
             .unwrap();
 
-        tx2.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
-            },
-        )
-        .unwrap();
+        tx2.insert("users", &user_row("Bob", 25)).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -1575,13 +1495,7 @@ mod tests {
         tx1.scan_by_index("users", "name", &b"Alice"[..]..=&b"Alice"[..])
             .unwrap();
 
-        tx2.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
+        tx2.insert("users", &user_row("Alice", 30)).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -1595,22 +1509,8 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let k1 = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
-        let k2 = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
-                },
-            )
-            .unwrap();
+        let k1 = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let k2 = tx.insert("users", &user_row("Bob", 25)).unwrap();
         tx.commit().unwrap();
 
         // tx1 reads row k1, tx2 reads row k2 — no overlap
@@ -1624,7 +1524,11 @@ mod tests {
             "users",
             k1,
             &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+                values: vec![
+                    DbValue::Integer(k1 as i64),
+                    DbValue::Text("Alice".into()),
+                    DbValue::Integer(31),
+                ],
             },
         )
         .unwrap();
@@ -1633,7 +1537,11 @@ mod tests {
             "users",
             k2,
             &Row {
-                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(26)],
+                values: vec![
+                    DbValue::Integer(k2 as i64),
+                    DbValue::Text("Bob".into()),
+                    DbValue::Integer(26),
+                ],
             },
         )
         .unwrap();
@@ -1650,14 +1558,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 commits before tx2 starts — no conflict possible
@@ -1666,7 +1567,11 @@ mod tests {
             "users",
             key,
             &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+                values: vec![
+                    DbValue::Integer(key as i64),
+                    DbValue::Text("Alice".into()),
+                    DbValue::Integer(31),
+                ],
             },
         )
         .unwrap();
@@ -1677,7 +1582,11 @@ mod tests {
             "users",
             key,
             &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(32)],
+                values: vec![
+                    DbValue::Integer(key as i64),
+                    DbValue::Text("Alice".into()),
+                    DbValue::Integer(32),
+                ],
             },
         )
         .unwrap();
@@ -1699,13 +1608,7 @@ mod tests {
         tx1.scan_by_index("users", "name", &b"A"[..]..&b"C"[..])
             .unwrap();
 
-        tx2.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Zara".into()), DbValue::Integer(20)],
-            },
-        )
-        .unwrap();
+        tx2.insert("users", &user_row("Zara", 20)).unwrap();
 
         tx2.commit().unwrap();
         tx1.commit().unwrap(); // should succeed — "Zara" is outside A..C
@@ -1723,21 +1626,8 @@ mod tests {
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
 
-        tx1.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
-
-        tx2.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(25)],
-            },
-        )
-        .unwrap();
+        tx1.insert("users", &user_row("Alice", 30)).unwrap();
+        tx2.insert("users", &user_row("Alice", 25)).unwrap();
 
         // First to commit fails — both wrote to same index value
         tx1.commit().unwrap_err();
@@ -1753,14 +1643,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 scans index range including "Bob", tx2 updates Alice → Bob
@@ -1774,7 +1657,11 @@ mod tests {
             "users",
             key,
             &Row {
-                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(30)],
+                values: vec![
+                    DbValue::Integer(key as i64),
+                    DbValue::Text("Bob".into()),
+                    DbValue::Integer(30),
+                ],
             },
         )
         .unwrap();
@@ -1842,13 +1729,7 @@ mod tests {
         let tx2 = db.begin_transaction();
 
         tx1.drop_table("users").unwrap();
-        tx2.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
+        tx2.insert("users", &user_row("Alice", 30)).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -1866,13 +1747,7 @@ mod tests {
         let tx2 = db.begin_transaction();
 
         tx1.create_index("users", "name").unwrap();
-        tx2.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
+        tx2.insert("users", &user_row("Alice", 30)).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -1905,13 +1780,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
+        tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 scans the index, tx2 drops it (modifying catalog metadata)
@@ -1934,14 +1803,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-                },
-            )
-            .unwrap();
+        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 reads a row, tx2 drops the whole table
@@ -1965,20 +1827,8 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
-            },
-        )
-        .unwrap();
-        tx.insert(
-            "users",
-            &Row {
-                values: vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
-            },
-        )
-        .unwrap();
+        tx.insert("users", &user_row("Alice", 30)).unwrap();
+        tx.insert("users", &user_row("Bob", 25)).unwrap();
         tx.commit().unwrap();
 
         // Query by name
@@ -2014,34 +1864,35 @@ mod tests {
                     nullable: false,
                 },
             ],
+            primary_key: None,
         };
         tx.create_table("t", schema).unwrap();
         tx.create_index("t", "x").unwrap();
         tx.insert(
             "t",
             &Row {
-                values: vec![DbValue::Integer(1), DbValue::Text("a".into())],
+                values: vec![DbValue::Null, DbValue::Integer(1), DbValue::Text("a".into())],
             },
         )
         .unwrap();
         tx.insert(
             "t",
             &Row {
-                values: vec![DbValue::Integer(1), DbValue::Text("b".into())],
+                values: vec![DbValue::Null, DbValue::Integer(1), DbValue::Text("b".into())],
             },
         )
         .unwrap();
         tx.insert(
             "t",
             &Row {
-                values: vec![DbValue::Integer(2), DbValue::Text("c".into())],
+                values: vec![DbValue::Null, DbValue::Integer(2), DbValue::Text("c".into())],
             },
         )
         .unwrap();
         tx.insert(
             "t",
             &Row {
-                values: vec![DbValue::Integer(1), DbValue::Text("d".into())],
+                values: vec![DbValue::Null, DbValue::Integer(1), DbValue::Text("d".into())],
             },
         )
         .unwrap();
@@ -2056,12 +1907,229 @@ mod tests {
             .unwrap();
         let mut values: Vec<String> = rows
             .iter()
-            .map(|(_, row)| match &row.values[1] {
+            .map(|(_, row)| match &row.values[2] {
                 DbValue::Text(s) => s.clone(),
                 _ => panic!("not text"),
             })
             .collect();
         values.sort();
         assert_eq!(values, vec!["a", "b", "d"]);
+    }
+
+    // ── Primary key tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_explicit_primary_key() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table(
+            "items",
+            Schema {
+                columns: vec![
+                    Column {
+                        name: "id".into(),
+                        column_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    Column {
+                        name: "name".into(),
+                        column_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                ],
+                primary_key: Some(0),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let key = tx
+            .insert(
+                "items",
+                &Row {
+                    values: vec![DbValue::Integer(42), DbValue::Text("widget".into())],
+                },
+            )
+            .unwrap();
+        // The B-tree key should equal the PK value
+        assert_eq!(key, 42);
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let row = tx.get("items", 42).unwrap().unwrap();
+        assert_eq!(row.values[0], DbValue::Integer(42));
+        assert_eq!(row.values[1], DbValue::Text("widget".into()));
+    }
+
+    #[test]
+    fn test_explicit_pk_no_rowid_prepended() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table(
+            "t",
+            Schema {
+                columns: vec![
+                    Column {
+                        name: "id".into(),
+                        column_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    Column {
+                        name: "val".into(),
+                        column_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                ],
+                primary_key: Some(0),
+            },
+        )
+        .unwrap();
+
+        let meta = tx.find_table_meta("t").unwrap().unwrap();
+        // No _rowid prepended when explicit PK is given
+        assert_eq!(meta.schema.columns.len(), 2);
+        assert_eq!(meta.schema.columns[0].name, "id");
+        assert_eq!(meta.schema.primary_key, Some(0));
+    }
+
+    #[test]
+    fn test_duplicate_primary_key_rejected() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table(
+            "items",
+            Schema {
+                columns: vec![
+                    Column {
+                        name: "id".into(),
+                        column_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    Column {
+                        name: "name".into(),
+                        column_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                ],
+                primary_key: Some(0),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        tx.insert(
+            "items",
+            &Row {
+                values: vec![DbValue::Integer(1), DbValue::Text("a".into())],
+            },
+        )
+        .unwrap();
+        let err = tx
+            .insert(
+                "items",
+                &Row {
+                    values: vec![DbValue::Integer(1), DbValue::Text("b".into())],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, DatabaseError::DuplicateKey(1)));
+    }
+
+    #[test]
+    fn test_negative_pk_rejected() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table(
+            "items",
+            Schema {
+                columns: vec![Column {
+                    name: "id".into(),
+                    column_type: ColumnType::Integer,
+                    nullable: false,
+                }],
+                primary_key: Some(0),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let err = tx
+            .insert(
+                "items",
+                &Row {
+                    values: vec![DbValue::Integer(-1)],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
+    }
+
+    #[test]
+    fn test_implicit_rowid_auto_assigns() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let k1 = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let k2 = tx.insert("users", &user_row("Bob", 25)).unwrap();
+        // Auto-increment: k2 > k1
+        assert!(k2 > k1);
+
+        // _rowid is stored in the row
+        let row = tx.get("users", k1).unwrap().unwrap();
+        assert_eq!(row.values[0], DbValue::Integer(k1 as i64));
+    }
+
+    #[test]
+    fn test_implicit_rowid_explicit_value() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        tx.create_table("users", users_schema()).unwrap();
+        tx.commit().unwrap();
+
+        // Provide explicit _rowid value
+        let tx = db.begin_transaction();
+        let key = tx
+            .insert(
+                "users",
+                &Row {
+                    values: vec![
+                        DbValue::Integer(100),
+                        DbValue::Text("Alice".into()),
+                        DbValue::Integer(30),
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(key, 100);
+
+        let row = tx.get("users", 100).unwrap().unwrap();
+        assert_eq!(row.values[0], DbValue::Integer(100));
+        assert_eq!(row.values[1], DbValue::Text("Alice".into()));
+    }
+
+    #[test]
+    fn test_pk_non_integer_rejected() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        let err = tx
+            .create_table(
+                "bad",
+                Schema {
+                    columns: vec![Column {
+                        name: "id".into(),
+                        column_type: ColumnType::Text,
+                        nullable: false,
+                    }],
+                    primary_key: Some(0),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 }

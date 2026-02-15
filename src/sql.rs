@@ -177,19 +177,38 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
         match stmt {
             Statement::CreateTable(ct) => {
                 let mut columns = Vec::new();
-                for col_def in &ct.columns {
+                let mut primary_key = None;
+                for (i, col_def) in ct.columns.iter().enumerate() {
                     let column_type = map_data_type(&col_def.data_type)?;
-                    let nullable = !col_def
-                        .options
-                        .iter()
-                        .any(|opt| matches!(opt.option, ColumnOption::NotNull));
+                    let is_pk = col_def.options.iter().any(|opt| {
+                        matches!(opt.option, ColumnOption::PrimaryKey { .. })
+                    });
+                    let nullable = if is_pk {
+                        false
+                    } else {
+                        !col_def
+                            .options
+                            .iter()
+                            .any(|opt| matches!(opt.option, ColumnOption::NotNull))
+                    };
+                    if is_pk {
+                        if primary_key.is_some() {
+                            return Err(SqlError::UnsupportedExpression(
+                                "multiple PRIMARY KEY columns not supported".into(),
+                            ));
+                        }
+                        primary_key = Some(i);
+                    }
                     columns.push(Column {
                         name: col_def.name.value.clone(),
                         column_type,
                         nullable,
                     });
                 }
-                let schema = Schema { columns };
+                let schema = Schema {
+                    columns,
+                    primary_key,
+                };
                 tx.create_table(&ct.name.to_string(), schema)?;
             }
             Statement::Insert(ins) => {
@@ -200,10 +219,15 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                     _ => return Err(SqlError::UnsupportedStatement),
                 };
 
+                let schema = tx.get_schema(&table_name)?;
+
+                // Detect whether the table has an implicit _rowid column
+                // that the user is not explicitly providing.
+                let has_implicit_rowid = schema.columns.first().map_or(false, |c| c.name == "_rowid");
+
                 let column_map = if ins.columns.is_empty() {
                     None
                 } else {
-                    let schema = tx.get_schema(&table_name)?;
                     let mut map: Vec<usize> = Vec::with_capacity(ins.columns.len());
                     for col in &ins.columns {
                         let pos = schema
@@ -232,6 +256,13 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                         for (i, pos) in map.iter().enumerate() {
                             full[*pos] = values[i].clone();
                         }
+                        Row { values: full }
+                    } else if has_implicit_rowid {
+                        // User provided values without column list and table has
+                        // implicit _rowid — prepend Null so _rowid auto-assigns.
+                        let mut full = Vec::with_capacity(values.len() + 1);
+                        full.push(DbValue::Null);
+                        full.extend(values);
                         Row { values: full }
                     } else {
                         Row { values }
@@ -329,12 +360,13 @@ mod tests {
         )
         .unwrap();
 
-        // Verify by inserting a valid row with all types
+        // Verify by inserting a valid row with all types (prepend _rowid Null)
         let key = tx
             .insert(
                 "items",
                 &Row {
                     values: vec![
+                        DbValue::Null, // _rowid
                         DbValue::Integer(1),
                         DbValue::Text("widget".into()),
                         DbValue::Float(9.99),
@@ -344,16 +376,17 @@ mod tests {
             )
             .unwrap();
         let row = tx.get("items", key).unwrap().unwrap();
-        assert_eq!(row.values[0], DbValue::Integer(1));
-        assert_eq!(row.values[1], DbValue::Text("widget".into()));
-        assert_eq!(row.values[2], DbValue::Float(9.99));
-        assert_eq!(row.values[3], DbValue::Bool(true));
+        assert_eq!(row.values[1], DbValue::Integer(1));
+        assert_eq!(row.values[2], DbValue::Text("widget".into()));
+        assert_eq!(row.values[3], DbValue::Float(9.99));
+        assert_eq!(row.values[4], DbValue::Bool(true));
 
         // Nullable columns accept null
         tx.insert(
             "items",
             &Row {
                 values: vec![
+                    DbValue::Null, // _rowid
                     DbValue::Integer(2),
                     DbValue::Text("gadget".into()),
                     DbValue::Null,
@@ -363,12 +396,13 @@ mod tests {
         )
         .unwrap();
 
-        // NOT NULL columns reject null
+        // NOT NULL columns reject null (id column)
         let err = tx
             .insert(
                 "items",
                 &Row {
                     values: vec![
+                        DbValue::Null, // _rowid
                         DbValue::Null,
                         DbValue::Text("bad".into()),
                         DbValue::Null,
@@ -397,6 +431,7 @@ mod tests {
             "t",
             &Row {
                 values: vec![
+                    DbValue::Null, // _rowid
                     DbValue::Integer(1),
                     DbValue::Null, // b nullable
                     DbValue::Text("x".into()),
@@ -412,6 +447,7 @@ mod tests {
                 "t",
                 &Row {
                     values: vec![
+                        DbValue::Null, // _rowid
                         DbValue::Null,
                         DbValue::Integer(1),
                         DbValue::Text("x".into()),
@@ -428,6 +464,7 @@ mod tests {
                 "t",
                 &Row {
                     values: vec![
+                        DbValue::Null, // _rowid
                         DbValue::Integer(1),
                         DbValue::Null,
                         DbValue::Null,
@@ -452,8 +489,9 @@ mod tests {
 
         let rows = tx.scan("users", ..).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1.values[0], DbValue::Text("Alice".into()));
-        assert_eq!(rows[0].1.values[1], DbValue::Integer(30));
+        // values[0] = _rowid, values[1] = name, values[2] = age
+        assert_eq!(rows[0].1.values[1], DbValue::Text("Alice".into()));
+        assert_eq!(rows[0].1.values[2], DbValue::Integer(30));
     }
 
     #[test]
@@ -488,9 +526,10 @@ mod tests {
 
         let rows = tx.scan("users", ..).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1.values[0], DbValue::Text("Alice".into()));
-        assert_eq!(rows[0].1.values[1], DbValue::Null); // age omitted
-        assert_eq!(rows[0].1.values[2], DbValue::Bool(true));
+        // values[0] = _rowid, values[1] = name, values[2] = age, values[3] = active
+        assert_eq!(rows[0].1.values[1], DbValue::Text("Alice".into()));
+        assert_eq!(rows[0].1.values[2], DbValue::Null); // age omitted
+        assert_eq!(rows[0].1.values[3], DbValue::Bool(true));
     }
 
     #[test]
@@ -505,10 +544,10 @@ mod tests {
         execute(&tx, "INSERT INTO t VALUES (42, 3.14, 'hello', true)").unwrap();
 
         let rows = tx.scan("t", ..).unwrap();
-        assert_eq!(rows[0].1.values[0], DbValue::Integer(42));
-        assert_eq!(rows[0].1.values[1], DbValue::Float(3.14));
-        assert_eq!(rows[0].1.values[2], DbValue::Text("hello".into()));
-        assert_eq!(rows[0].1.values[3], DbValue::Bool(true));
+        assert_eq!(rows[0].1.values[1], DbValue::Integer(42));
+        assert_eq!(rows[0].1.values[2], DbValue::Float(3.14));
+        assert_eq!(rows[0].1.values[3], DbValue::Text("hello".into()));
+        assert_eq!(rows[0].1.values[4], DbValue::Bool(true));
     }
 
     #[test]
@@ -519,8 +558,8 @@ mod tests {
         execute(&tx, "INSERT INTO t VALUES (NULL, NULL)").unwrap();
 
         let rows = tx.scan("t", ..).unwrap();
-        assert_eq!(rows[0].1.values[0], DbValue::Null);
         assert_eq!(rows[0].1.values[1], DbValue::Null);
+        assert_eq!(rows[0].1.values[2], DbValue::Null);
     }
 
     #[test]
@@ -531,8 +570,8 @@ mod tests {
         execute(&tx, "INSERT INTO t VALUES (-42, -3.14)").unwrap();
 
         let rows = tx.scan("t", ..).unwrap();
-        assert_eq!(rows[0].1.values[0], DbValue::Integer(-42));
-        assert_eq!(rows[0].1.values[1], DbValue::Float(-3.14));
+        assert_eq!(rows[0].1.values[1], DbValue::Integer(-42));
+        assert_eq!(rows[0].1.values[2], DbValue::Float(-3.14));
     }
 
     #[test]
@@ -581,7 +620,7 @@ mod tests {
             .scan_by_index("users", "name", b"Alice".as_ref()..=b"Alice".as_ref())
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1.values[0], DbValue::Text("Alice".into()));
+        assert_eq!(rows[0].1.values[1], DbValue::Text("Alice".into()));
     }
 
     #[test]
@@ -597,7 +636,7 @@ mod tests {
             .scan_by_index("t", "x", key_20.as_slice()..=key_20.as_slice())
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1.values[0], DbValue::Integer(20));
+        assert_eq!(rows[0].1.values[1], DbValue::Integer(20));
     }
 
     #[test]
@@ -619,7 +658,7 @@ mod tests {
             .scan_by_index("t", "name", b"Bob".as_ref()..=b"Bob".as_ref())
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1.values[1], DbValue::Integer(25));
+        assert_eq!(rows[0].1.values[2], DbValue::Integer(25));
     }
 
     #[test]
@@ -645,7 +684,8 @@ mod tests {
 
         let rows = execute(&tx, "SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values.len(), 2);
+        // 3 columns: _rowid + name + age
+        assert_eq!(rows[0].values.len(), 3);
     }
 
     #[test]
@@ -719,7 +759,7 @@ mod tests {
 
         let rows = execute(&tx, "SELECT * FROM t WHERE a >= 2 AND b <= 20").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], DbValue::Integer(2));
+        assert_eq!(rows[0].values[1], DbValue::Integer(2));
 
         let rows = execute(&tx, "SELECT * FROM t WHERE a = 1 OR a = 3").unwrap();
         assert_eq!(rows.len(), 2);
@@ -738,7 +778,7 @@ mod tests {
 
         let rows = execute(&tx, "SELECT * FROM t WHERE b IS NULL").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], DbValue::Integer(2));
+        assert_eq!(rows[0].values[1], DbValue::Integer(2));
 
         let rows = execute(&tx, "SELECT * FROM t WHERE a IS NOT NULL").unwrap();
         assert_eq!(rows.len(), 2);
@@ -765,7 +805,7 @@ mod tests {
 
         let rows = execute(&tx, "SELECT * FROM t WHERE name = 'Bob'").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], DbValue::Text("Bob".into()));
+        assert_eq!(rows[0].values[1], DbValue::Text("Bob".into()));
     }
 
     #[test]
@@ -790,10 +830,10 @@ mod tests {
         let tx = db.begin_transaction();
         let rows = execute(&tx, "SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values[0], DbValue::Text("Alice".into()));
-        assert_eq!(rows[0].values[1], DbValue::Integer(30));
-        assert_eq!(rows[1].values[0], DbValue::Text("Bob".into()));
-        assert_eq!(rows[1].values[1], DbValue::Integer(25));
+        assert_eq!(rows[0].values[1], DbValue::Text("Alice".into()));
+        assert_eq!(rows[0].values[2], DbValue::Integer(30));
+        assert_eq!(rows[1].values[1], DbValue::Text("Bob".into()));
+        assert_eq!(rows[1].values[2], DbValue::Integer(25));
     }
 
     #[test]
@@ -825,7 +865,7 @@ mod tests {
         execute(&tx, "INSERT INTO t VALUES (42)").unwrap();
         let rows = execute(&tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], DbValue::Integer(42));
+        assert_eq!(rows[0].values[1], DbValue::Integer(42));
     }
 
     #[test]
@@ -868,26 +908,125 @@ mod tests {
         )
         .unwrap();
 
-        // Verify types by inserting matching values
+        // Verify types by inserting matching values (prepend _rowid Null)
         let key = tx
             .insert(
                 "t",
                 &Row {
                     values: vec![
-                        DbValue::Integer(42),       // BIGINT → Integer
-                        DbValue::Text("hi".into()), // CHAR → Text
-                        DbValue::Float(1.0),        // DOUBLE → Float
-                        DbValue::Float(2.0),        // REAL → Float
-                        DbValue::Bool(false),       // BOOL → Bool
+                        DbValue::Null,               // _rowid
+                        DbValue::Integer(42),         // BIGINT → Integer
+                        DbValue::Text("hi".into()),   // CHAR → Text
+                        DbValue::Float(1.0),          // DOUBLE → Float
+                        DbValue::Float(2.0),          // REAL → Float
+                        DbValue::Bool(false),         // BOOL → Bool
                     ],
                 },
             )
             .unwrap();
         let row = tx.get("t", key).unwrap().unwrap();
-        assert_eq!(row.values[0], DbValue::Integer(42));
-        assert_eq!(row.values[1], DbValue::Text("hi".into()));
-        assert_eq!(row.values[2], DbValue::Float(1.0));
-        assert_eq!(row.values[3], DbValue::Float(2.0));
-        assert_eq!(row.values[4], DbValue::Bool(false));
+        assert_eq!(row.values[1], DbValue::Integer(42));
+        assert_eq!(row.values[2], DbValue::Text("hi".into()));
+        assert_eq!(row.values[3], DbValue::Float(1.0));
+        assert_eq!(row.values[4], DbValue::Float(2.0));
+        assert_eq!(row.values[5], DbValue::Bool(false));
+    }
+
+    // ── Primary key SQL tests ──────────────────────────────────────
+
+    #[test]
+    fn test_sql_create_table_with_primary_key() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .unwrap();
+
+        let schema = tx.get_schema("items").unwrap();
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.columns[0].name, "id");
+        assert_eq!(schema.primary_key, Some(0));
+    }
+
+    #[test]
+    fn test_sql_insert_with_explicit_pk() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .unwrap();
+        execute(&tx, "INSERT INTO items VALUES (10, 'widget')").unwrap();
+        execute(&tx, "INSERT INTO items VALUES (20, 'gadget')").unwrap();
+
+        // B-tree key should match PK value
+        let row = tx.get("items", 10).unwrap().unwrap();
+        assert_eq!(row.values[0], DbValue::Integer(10));
+        assert_eq!(row.values[1], DbValue::Text("widget".into()));
+
+        let row = tx.get("items", 20).unwrap().unwrap();
+        assert_eq!(row.values[1], DbValue::Text("gadget".into()));
+    }
+
+    #[test]
+    fn test_sql_duplicate_pk_error() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+        execute(&tx, "INSERT INTO items VALUES (1, 'a')").unwrap();
+        let err = execute(&tx, "INSERT INTO items VALUES (1, 'b')").unwrap_err();
+        assert!(matches!(err, SqlError::Database(DatabaseError::DuplicateKey(1))));
+    }
+
+    #[test]
+    fn test_sql_select_with_pk_table() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .unwrap();
+        execute(&tx, "INSERT INTO items VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+
+        let rows = execute(&tx, "SELECT name FROM items WHERE id = 2").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Text("Bob".into()));
+    }
+
+    #[test]
+    fn test_sql_implicit_rowid_not_in_insert() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        // INSERT without column list should not require _rowid
+        execute(&tx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+
+        let rows = execute(&tx, "SELECT x, y FROM t").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], DbValue::Integer(1));
+        assert_eq!(rows[0].values[1], DbValue::Text("a".into()));
+    }
+
+    #[test]
+    fn test_sql_select_rowid() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (100)").unwrap();
+
+        // _rowid is queryable via SELECT
+        let rows = execute(&tx, "SELECT _rowid, x FROM t").unwrap();
+        assert_eq!(rows.len(), 1);
+        // _rowid should be auto-assigned (0)
+        assert_eq!(rows[0].values[0], DbValue::Integer(0));
+        assert_eq!(rows[0].values[1], DbValue::Integer(100));
     }
 }

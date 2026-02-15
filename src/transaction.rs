@@ -185,6 +185,28 @@ impl<'a, const N: usize> Transaction<'a, N> {
         }
     }
 
+    pub fn available_key(&self, root: NodePtr) -> Result<Key, TreeError> {
+        let mut inner = self.store.lock().unwrap();
+        let mut key = inner.btree.available_key(root)?;
+
+        // Also consider keys from all active transactions' writes for the same root
+        for op in inner.active_transactions.values() {
+            if let Some(&(_, max_write_key)) = op
+                .writes
+                .keys()
+                .rev()
+                .find(|&&(r, _k)| r == root && op.writes[&(r, _k)].is_some())
+            {
+                let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
+                if candidate > key {
+                    key = candidate;
+                }
+            }
+        }
+
+        Ok(key)
+    }
+
     pub fn insert(&self, root: NodePtr, value: Vec<u8>) -> Result<Key, TreeError> {
         let mut inner = self.store.lock().unwrap();
         let mut key = inner.btree.available_key(root)?;
