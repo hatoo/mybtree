@@ -176,7 +176,7 @@ fn validate_row(row: &Row, schema: &Schema) -> Result<(), DatabaseError> {
 }
 
 /// Convert a `DbValue` into a byte representation suitable for index tree keys.
-fn db_value_to_bytes(value: &DbValue) -> Vec<u8> {
+pub fn db_value_to_bytes(value: &DbValue) -> Vec<u8> {
     match value {
         DbValue::Integer(i) => i.to_be_bytes().to_vec(),
         DbValue::Text(s) => s.as_bytes().to_vec(),
@@ -553,6 +553,13 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
             }
         }
         Ok(result)
+    }
+
+    pub fn get_indexed_columns(&self, name: &str) -> Result<Vec<String>, DatabaseError> {
+        let meta = self
+            .find_table_meta(name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+        Ok(meta.index_trees.iter().map(|(c, _)| c.clone()).collect())
     }
 
     pub fn list_tables(&self) -> Result<Vec<String>, DatabaseError> {

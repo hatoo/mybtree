@@ -5,7 +5,9 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::database::{Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema};
+use crate::database::{
+    Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema, db_value_to_bytes,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
@@ -119,6 +121,29 @@ fn compare_dbvalues(a: &DbValue, b: &DbValue) -> Option<std::cmp::Ordering> {
         (DbValue::Bool(a), DbValue::Bool(b)) => Some(a.cmp(b)),
         _ => None,
     }
+}
+
+/// Try to extract a simple `col = literal` or `literal = col` pattern from a WHERE expression.
+/// Returns `(column_name, value)` if the expression is a simple equality check.
+fn try_extract_eq_condition(expr: &Expr) -> Option<(String, DbValue)> {
+    if let Expr::BinaryOp { left, op, right } = expr {
+        if *op != BinaryOperator::Eq {
+            return None;
+        }
+        // col = literal
+        if let Expr::Identifier(ident) = left.as_ref() {
+            if let Ok(val) = expr_to_dbvalue(right) {
+                return Some((ident.value.clone(), val));
+            }
+        }
+        // literal = col
+        if let Expr::Identifier(ident) = right.as_ref() {
+            if let Ok(val) = expr_to_dbvalue(left) {
+                return Some((ident.value.clone(), val));
+            }
+        }
+    }
+    None
 }
 
 fn eval_where(expr: &Expr, row: &Row, schema: &Schema) -> Result<bool, SqlError> {
@@ -289,9 +314,54 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
 
                 let schema = tx.get_schema(&table_name)?;
                 let col_indices = resolve_projection(&select.projection, &schema)?;
-                let all_rows = tx.scan(&table_name, ..)?;
 
-                for (_, row) in &all_rows {
+                // Try to use an index or PK for simple `col = value` WHERE clauses.
+                let eq_cond = select
+                    .selection
+                    .as_ref()
+                    .and_then(try_extract_eq_condition);
+
+                let rows: Vec<(crate::types::Key, Row)> = if let Some((ref col_name, ref value)) =
+                    eq_cond
+                {
+                    let col_idx = resolve_column(col_name, &schema)?;
+                    let pk_idx = schema.primary_key;
+
+                    if pk_idx == Some(col_idx) {
+                        // Primary key point lookup
+                        if let DbValue::Integer(i) = value {
+                            if *i >= 0 {
+                                match tx.get(&table_name, *i as u64)? {
+                                    Some(row) => vec![(*i as u64, row)],
+                                    None => vec![],
+                                }
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            // PK is always integer; non-integer value can't match
+                            vec![]
+                        }
+                    } else {
+                        let indexed_cols = tx.get_indexed_columns(&table_name)?;
+                        if indexed_cols.contains(&col_name.to_string()) {
+                            // Index scan
+                            let bytes = db_value_to_bytes(value);
+                            tx.scan_by_index(
+                                &table_name,
+                                col_name,
+                                bytes.as_slice()..=bytes.as_slice(),
+                            )?
+                        } else {
+                            // No index — fall back to full scan
+                            tx.scan(&table_name, ..)?
+                        }
+                    }
+                } else {
+                    tx.scan(&table_name, ..)?
+                };
+
+                for (_, row) in &rows {
                     let matches = match &select.selection {
                         Some(where_expr) => eval_where(where_expr, row, &schema)?,
                         None => true,
@@ -1033,5 +1103,87 @@ mod tests {
         // _rowid should be auto-assigned (0)
         assert_eq!(rows[0].values[0], DbValue::Integer(0));
         assert_eq!(rows[0].values[1], DbValue::Integer(100));
+    }
+
+    // ── Index-optimized SELECT tests ─────────────────────────────
+
+    #[test]
+    fn test_select_uses_index_for_eq() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(&tx, "CREATE INDEX idx_name ON users (name)").unwrap();
+        execute(
+            &tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 30)",
+        )
+        .unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM users WHERE name = 'Bob'").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[1], DbValue::Text("Bob".into()));
+        assert_eq!(rows[0].values[2], DbValue::Integer(25));
+    }
+
+    #[test]
+    fn test_select_uses_index_multiple_matches() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        execute(&tx, "CREATE INDEX idx_x ON t (x)").unwrap();
+        execute(
+            &tx,
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (1, 'c'), (3, 'd'), (1, 'e')",
+        )
+        .unwrap();
+
+        let rows = execute(&tx, "SELECT y FROM t WHERE x = 1").unwrap();
+        assert_eq!(rows.len(), 3);
+        let mut vals: Vec<String> = rows
+            .iter()
+            .map(|r| match &r.values[0] {
+                DbValue::Text(s) => s.clone(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        vals.sort();
+        assert_eq!(vals, vec!["a", "c", "e"]);
+    }
+
+    #[test]
+    fn test_select_pk_point_lookup() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .unwrap();
+        execute(
+            &tx,
+            "INSERT INTO items VALUES (10, 'widget'), (20, 'gadget'), (30, 'doohickey')",
+        )
+        .unwrap();
+
+        let rows = execute(&tx, "SELECT name FROM items WHERE id = 20").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Text("gadget".into()));
+
+        // Non-existent PK
+        let rows = execute(&tx, "SELECT name FROM items WHERE id = 99").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_select_eq_no_index_falls_back() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        // No index created
+        execute(&tx, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (1, 'c')").unwrap();
+
+        // Should still work via full scan fallback
+        let rows = execute(&tx, "SELECT y FROM t WHERE x = 1").unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }
