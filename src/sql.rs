@@ -316,50 +316,46 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                 let col_indices = resolve_projection(&select.projection, &schema)?;
 
                 // Try to use an index or PK for simple `col = value` WHERE clauses.
-                let eq_cond = select
-                    .selection
-                    .as_ref()
-                    .and_then(try_extract_eq_condition);
+                let eq_cond = select.selection.as_ref().and_then(try_extract_eq_condition);
 
-                let rows: Vec<(crate::types::Key, Row)> = if let Some((ref col_name, ref value)) =
-                    eq_cond
-                {
-                    let col_idx = resolve_column(col_name, &schema)?;
-                    let pk_idx = schema.primary_key;
+                let rows: Vec<(crate::types::Key, Row)> =
+                    if let Some((ref col_name, ref value)) = eq_cond {
+                        let col_idx = resolve_column(col_name, &schema)?;
+                        let pk_idx = schema.primary_key;
 
-                    if pk_idx == Some(col_idx) {
-                        // Primary key point lookup
-                        if let DbValue::Integer(i) = value {
-                            if *i >= 0 {
-                                match tx.get(&table_name, *i as u64)? {
-                                    Some(row) => vec![(*i as u64, row)],
-                                    None => vec![],
+                        if pk_idx == Some(col_idx) {
+                            // Primary key point lookup
+                            if let DbValue::Integer(i) = value {
+                                if *i >= 0 {
+                                    match tx.get(&table_name, *i as u64)? {
+                                        Some(row) => vec![(*i as u64, row)],
+                                        None => vec![],
+                                    }
+                                } else {
+                                    vec![]
                                 }
                             } else {
+                                // PK is always integer; non-integer value can't match
                                 vec![]
                             }
                         } else {
-                            // PK is always integer; non-integer value can't match
-                            vec![]
+                            let indexed_cols = tx.get_indexed_columns(&table_name)?;
+                            if indexed_cols.contains(&col_name.to_string()) {
+                                // Index scan
+                                let bytes = db_value_to_bytes(value);
+                                tx.scan_by_index(
+                                    &table_name,
+                                    col_name,
+                                    bytes.as_slice()..=bytes.as_slice(),
+                                )?
+                            } else {
+                                // No index — fall back to full scan
+                                tx.scan(&table_name, ..)?
+                            }
                         }
                     } else {
-                        let indexed_cols = tx.get_indexed_columns(&table_name)?;
-                        if indexed_cols.contains(&col_name.to_string()) {
-                            // Index scan
-                            let bytes = db_value_to_bytes(value);
-                            tx.scan_by_index(
-                                &table_name,
-                                col_name,
-                                bytes.as_slice()..=bytes.as_slice(),
-                            )?
-                        } else {
-                            // No index — fall back to full scan
-                            tx.scan(&table_name, ..)?
-                        }
-                    }
-                } else {
-                    tx.scan(&table_name, ..)?
-                };
+                        tx.scan(&table_name, ..)?
+                    };
 
                 for (_, row) in &rows {
                     let matches = match &select.selection {

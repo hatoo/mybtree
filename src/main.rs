@@ -31,7 +31,7 @@ fn format_value(v: &DbValue) -> String {
 
 fn resolve_db_path(path: &PathBuf) -> anyhow::Result<PathBuf> {
     let path_str = path.to_string_lossy();
-    
+
     // Handle special "tmp" keyword for temporary database
     if path_str == "tmp" {
         let temp_dir = std::env::temp_dir();
@@ -41,7 +41,7 @@ fn resolve_db_path(path: &PathBuf) -> anyhow::Result<PathBuf> {
         let db_name = format!("mybtree_{}.db", timestamp);
         return Ok(temp_dir.join(db_name));
     }
-    
+
     Ok(path.clone())
 }
 
