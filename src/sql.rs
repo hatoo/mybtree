@@ -385,6 +385,36 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                 };
                 tx.create_index(&table_name, &column_name)?;
             }
+            Statement::Delete(del) => {
+                let table_name = match del.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(table) => {
+                        table[0].relation.to_string()
+                    }
+                    _ => return Err(SqlError::UnsupportedStatement),
+                };
+
+                let schema = tx.get_schema(&table_name)?;
+
+                // Scan all rows
+                let rows: Vec<(crate::types::Key, Row)> = tx.scan(&table_name, ..)?;
+
+                // Collect keys to delete
+                let mut keys_to_delete = Vec::new();
+                for (key, row) in &rows {
+                    let matches = match &del.selection {
+                        Some(where_expr) => eval_where(where_expr, row, &schema)?,
+                        None => true,
+                    };
+                    if matches {
+                        keys_to_delete.push(*key);
+                    }
+                }
+
+                // Delete matching rows
+                for key in keys_to_delete {
+                    tx.delete(&table_name, key)?;
+                }
+            }
             _ => return Err(SqlError::UnsupportedStatement),
         }
     }
