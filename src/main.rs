@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process;
+use std::time::SystemTime;
 
 use clap::Parser;
 use mybtree::{Database, DbValue, Pager};
@@ -11,7 +12,7 @@ const PAGE_SIZE: usize = 4096;
 #[derive(Parser)]
 #[command(name = "mybtree", about = "Execute SQL operations on a database file")]
 struct Cli {
-    /// Path to the database file
+    /// Path to the database file (use "tmp" for a temporary database)
     db: PathBuf,
 
     /// SQL statement to execute, or path to SQL file (omit to enter REPL)
@@ -28,14 +29,31 @@ fn format_value(v: &DbValue) -> String {
     }
 }
 
+fn resolve_db_path(path: &PathBuf) -> anyhow::Result<PathBuf> {
+    let path_str = path.to_string_lossy();
+    
+    // Handle special "tmp" keyword for temporary database
+    if path_str == "tmp" {
+        let temp_dir = std::env::temp_dir();
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let db_name = format!("mybtree_{}.db", timestamp);
+        return Ok(temp_dir.join(db_name));
+    }
+    
+    Ok(path.clone())
+}
+
 fn open_db(path: &PathBuf) -> anyhow::Result<Database<PAGE_SIZE>> {
-    let create = !path.exists();
+    let resolved_path = resolve_db_path(path)?;
+    let create = !resolved_path.exists();
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)?;
+        .open(&resolved_path)?;
 
     let pager = Pager::<PAGE_SIZE>::new(file);
     if create {
