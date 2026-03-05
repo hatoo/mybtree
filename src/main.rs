@@ -14,7 +14,7 @@ struct Cli {
     /// Path to the database file
     db: PathBuf,
 
-    /// SQL statement to execute (omit to enter REPL)
+    /// SQL statement to execute, or path to SQL file (omit to enter REPL)
     sql: Option<String>,
 }
 
@@ -97,11 +97,40 @@ fn repl(db: &Database<PAGE_SIZE>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn execute_sql_file(db: &Database<PAGE_SIZE>, path: &str) -> anyhow::Result<()> {
+    let content = fs::read_to_string(path)?;
+
+    // Split by semicolons and execute each statement
+    for statement in content.split(';') {
+        // Remove comments (lines starting with --)
+        let lines: Vec<&str> = statement
+            .lines()
+            .filter(|line| !line.trim().starts_with("--"))
+            .collect();
+
+        let cleaned = lines.join(" ").trim().to_string();
+
+        if !cleaned.is_empty() {
+            execute_and_print(db, &cleaned)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn run(cli: Cli) -> anyhow::Result<()> {
     let db = open_db(&cli.db)?;
 
     match cli.sql {
-        Some(sql) => execute_and_print(&db, &sql),
+        Some(sql) => {
+            // Check if sql is a file path
+            if PathBuf::from(&sql).exists() && sql.ends_with(".sql") {
+                execute_sql_file(&db, &sql)?;
+            } else {
+                execute_and_print(&db, &sql)?;
+            }
+            Ok(())
+        }
         None => repl(&db),
     }
 }
