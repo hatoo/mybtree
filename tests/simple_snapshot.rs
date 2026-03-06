@@ -52,10 +52,11 @@ fn split_statements(sql: &str) -> Vec<String> {
     statements
 }
 
-#[test]
-fn test_simple_sql_snapshot() {
+/// Execute a SQL file and return formatted output for snapshotting
+fn execute_sql_file(sql_path: &str) -> String {
     // Read the SQL file
-    let sql_content = fs::read_to_string("tests/simple.sql").expect("Failed to read simple.sql");
+    let sql_content = fs::read_to_string(sql_path)
+        .unwrap_or_else(|_| panic!("Failed to read {}", sql_path));
 
     // Create a temporary database
     let temp = NamedTempFile::new().unwrap();
@@ -96,6 +97,17 @@ fn test_simple_sql_snapshot() {
         output.push('\n');
     }
 
-    // Snapshot the output
+    output
+}
+
+#[test]
+fn test_simple_sql_snapshot() {
+    let output = execute_sql_file("tests/sql/simple.sql");
     insta::assert_snapshot!("simple_sql_output", output);
+}
+
+#[test]
+fn test_index_sql_snapshot() {
+    let output = execute_sql_file("tests/sql/index_test.sql");
+    insta::assert_snapshot!("index_sql_output", output);
 }

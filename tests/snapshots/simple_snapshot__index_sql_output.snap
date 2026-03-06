@@ -1,0 +1,65 @@
+---
+source: tests/simple_snapshot.rs
+assertion_line: 112
+expression: output
+---
+-- Statement 1
+-- CREATE TABLE users(   id INTEGER,   name TEXT,   age INTEGER )
+-- OK (no results)
+
+-- Statement 2
+-- INSERT INTO users VALUES (1, 'alice', 20)
+-- OK (no results)
+
+-- Statement 3
+-- INSERT INTO users VALUES (2, 'bob', 25)
+-- OK (no results)
+
+-- Statement 4
+-- INSERT INTO users VALUES (3, 'carol', 30)
+-- OK (no results)
+
+-- Statement 5
+-- INSERT INTO users VALUES (4, 'dave', 35)
+-- OK (no results)
+
+-- Statement 6
+-- INSERT INTO users VALUES (5, 'eve', 40)
+-- OK (no results)
+
+-- Statement 7
+-- CREATE INDEX idx_users_id ON users(id)
+-- OK (no results)
+
+-- Statement 8
+-- SELECT * FROM users WHERE id = 3
+-- 2|3|carol|30
+
+-- Statement 9
+-- SELECT * FROM users WHERE id >= 2 AND id <= 4
+-- 1|2|bob|25
+-- 2|3|carol|30
+-- 3|4|dave|35
+
+-- Statement 10
+-- SELECT name FROM users WHERE id = 5
+-- eve
+
+-- Statement 11
+-- UPDATE users SET id = 6 WHERE id = 5
+-- OK (no results)
+
+-- Statement 12
+-- SELECT * FROM users WHERE id = 6
+-- 4|6|eve|40
+
+-- Statement 13
+-- DELETE FROM users WHERE id = 1
+-- OK (no results)
+
+-- Statement 14
+-- SELECT * FROM users
+-- 1|2|bob|25
+-- 2|3|carol|30
+-- 3|4|dave|35
+-- 4|6|eve|40
