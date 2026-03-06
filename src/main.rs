@@ -12,8 +12,13 @@ const PAGE_SIZE: usize = 4096;
 #[derive(Parser)]
 #[command(name = "mybtree", about = "Execute SQL operations on a database file")]
 struct Cli {
-    /// Path to the database file (use "tmp" for a temporary database)
-    db: PathBuf,
+    /// Path to the database file (required unless --tmp is used)
+    #[arg(value_name = "DB_PATH", required_unless_present = "tmp")]
+    db: Option<PathBuf>,
+
+    /// Use a temporary database file in the system temp directory
+    #[arg(long)]
+    tmp: bool,
 
     /// SQL statement to execute, or path to SQL file (omit to enter REPL)
     sql: Option<String>,
@@ -29,11 +34,8 @@ fn format_value(v: &DbValue) -> String {
     }
 }
 
-fn resolve_db_path(path: &PathBuf) -> anyhow::Result<PathBuf> {
-    let path_str = path.to_string_lossy();
-
-    // Handle special "tmp" keyword for temporary database
-    if path_str == "tmp" {
+fn resolve_db_path(path: Option<&PathBuf>, tmp: bool) -> anyhow::Result<PathBuf> {
+    if tmp {
         let temp_dir = std::env::temp_dir();
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
@@ -42,11 +44,12 @@ fn resolve_db_path(path: &PathBuf) -> anyhow::Result<PathBuf> {
         return Ok(temp_dir.join(db_name));
     }
 
-    Ok(path.clone())
+    path.cloned()
+        .ok_or_else(|| anyhow::anyhow!("database path is required unless --tmp is used"))
 }
 
-fn open_db(path: &PathBuf) -> anyhow::Result<Database<PAGE_SIZE>> {
-    let resolved_path = resolve_db_path(path)?;
+fn open_db(path: Option<&PathBuf>, tmp: bool) -> anyhow::Result<Database<PAGE_SIZE>> {
+    let resolved_path = resolve_db_path(path, tmp)?;
     let create = !resolved_path.exists();
     let file = fs::OpenOptions::new()
         .read(true)
@@ -137,9 +140,25 @@ fn execute_sql_file(db: &Database<PAGE_SIZE>, path: &str) -> anyhow::Result<()> 
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    let db = open_db(&cli.db)?;
+    let Cli { db, tmp, sql } = cli;
 
-    match cli.sql {
+    // With positional parsing, `mybtree --tmp "SQL"` is parsed as db=<SQL>, sql=None.
+    // Normalize that shape so tmp mode still accepts one positional SQL argument.
+    let sql = if tmp {
+        match (db.as_ref(), sql) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("when using --tmp, provide at most one positional SQL argument");
+            }
+            (Some(sql_like), None) => Some(sql_like.to_string_lossy().into_owned()),
+            (None, sql) => sql,
+        }
+    } else {
+        sql
+    };
+
+    let db = open_db(db.as_ref(), tmp)?;
+
+    match sql {
         Some(sql) => {
             // Check if sql is a file path
             if PathBuf::from(&sql).exists() && sql.ends_with(".sql") {
