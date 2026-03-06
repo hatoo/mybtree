@@ -416,6 +416,59 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                     tx.delete(&table_name, key)?;
                 }
             }
+            Statement::Update(upd) => {
+                // Extract table name from the table reference
+                let table_name = match &upd.table.relation {
+                    sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return Err(SqlError::UnsupportedStatement),
+                };
+
+                let schema = tx.get_schema(&table_name)?;
+
+                // Build a map of column index to new value expression
+                let mut assignments: std::collections::HashMap<usize, Expr> =
+                    std::collections::HashMap::new();
+                for assign in &upd.assignments {
+                    // Each assignment's target is the column(s) to update
+                    // For simple case, it's a single column identifier
+                    if let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assign.target {
+                        // ObjectName converts to string for table.column format
+                        let col_name = name.to_string();
+                        // Handle qualified names (table.column) by taking just the column part
+                        let col_name = if col_name.contains('.') {
+                            col_name.split('.').last().unwrap_or(&col_name).to_string()
+                        } else {
+                            col_name
+                        };
+                        let col_idx = resolve_column(&col_name, &schema)?;
+                        assignments.insert(col_idx, assign.value.clone());
+                    } else {
+                        return Err(SqlError::UnsupportedExpression(
+                            "complex column references in UPDATE not supported".into(),
+                        ));
+                    }
+                }
+
+                // Scan all rows
+                let rows: Vec<(crate::types::Key, Row)> = tx.scan(&table_name, ..)?;
+
+                // Update matching rows
+                for (key, mut row) in rows {
+                    let matches = match &upd.selection {
+                        Some(where_expr) => eval_where(where_expr, &row, &schema)?,
+                        None => true,
+                    };
+
+                    if matches {
+                        // Apply assignments
+                        for (&col_idx, expr) in &assignments {
+                            let new_value = eval_expr(expr, &row, &schema)?;
+                            row.values[col_idx] = new_value;
+                        }
+                        tx.update(&table_name, key, &row)?;
+                    }
+                }
+            }
             _ => return Err(SqlError::UnsupportedStatement),
         }
     }
@@ -702,8 +755,12 @@ mod tests {
     fn test_unsupported_statement() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        let err = execute(&tx, "DELETE FROM t WHERE id = 1").unwrap_err();
-        assert!(matches!(err, SqlError::UnsupportedStatement));
+        // Try to delete from non-existent table - should fail with table not found
+        let err = execute(&tx, "DELETE FROM nonexistent WHERE id = 1").unwrap_err();
+        assert!(matches!(
+            err,
+            SqlError::Database(DatabaseError::TableNotFound(_))
+        ));
     }
 
     #[test]
@@ -1212,5 +1269,225 @@ mod tests {
         // Should still work via full scan fallback
         let rows = execute(&tx, "SELECT y FROM t WHERE x = 1").unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    // ── UPDATE statement tests ────────────────────────────────────
+
+    #[test]
+    fn test_update_basic() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+
+        // Update a single column
+        execute(&tx, "UPDATE users SET age = 31 WHERE name = 'Alice'").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM users WHERE name = 'Alice'").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[1], DbValue::Text("Alice".into()));
+        assert_eq!(rows[0].values[2], DbValue::Integer(31));
+    }
+
+    #[test]
+    fn test_update_multiple_columns() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE users (name TEXT, age INTEGER, city TEXT)",
+        )
+        .unwrap();
+        execute(
+            &tx,
+            "INSERT INTO users VALUES ('Alice', 30, 'NYC'), ('Bob', 25, 'LA')",
+        )
+        .unwrap();
+
+        // Update multiple columns
+        execute(
+            &tx,
+            "UPDATE users SET age = 31, city = 'Boston' WHERE name = 'Alice'",
+        )
+        .unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM users WHERE name = 'Alice'").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[2], DbValue::Integer(31));
+        assert_eq!(rows[0].values[3], DbValue::Text("Boston".into()));
+    }
+
+    #[test]
+    fn test_update_all_rows() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+        // Update without WHERE clause updates all rows
+        execute(&tx, "UPDATE t SET x = 10").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(row.values[1], DbValue::Integer(10));
+        }
+    }
+
+    #[test]
+    fn test_update_multiple_rows() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER, active BOOLEAN)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1, true), (2, true), (3, false)").unwrap();
+
+        // Update multiple matching rows
+        execute(&tx, "UPDATE t SET active = false WHERE x <= 2").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // First two should be false now
+        for i in 0..2 {
+            assert_eq!(rows[i].values[2], DbValue::Bool(false));
+        }
+        // Third should still be false
+        assert_eq!(rows[2].values[2], DbValue::Bool(false));
+    }
+
+    #[test]
+    fn test_update_with_expression() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1, 'hello'), (2, 'world')").unwrap();
+
+        // Update with literal value (not computed expressions yet, but test existing value)
+        execute(&tx, "UPDATE t SET y = 'updated' WHERE x = 1").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t WHERE x = 1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[2], DbValue::Text("updated".into()));
+    }
+
+    #[test]
+    fn test_update_to_null() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1, 'hello')").unwrap();
+
+        // Update to NULL
+        execute(&tx, "UPDATE t SET y = NULL WHERE x = 1").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[2], DbValue::Null);
+    }
+
+    #[test]
+    fn test_update_no_matching_rows() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1), (2)").unwrap();
+
+        // This should succeed but update no rows
+        execute(&tx, "UPDATE t SET x = 99 WHERE x = 100").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[1], DbValue::Integer(1));
+        assert_eq!(rows[1].values[1], DbValue::Integer(2));
+    }
+
+    #[test]
+    fn test_update_with_complex_where() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT)").unwrap();
+        execute(
+            &tx,
+            "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 15, 'z')",
+        )
+        .unwrap();
+
+        // Update with AND condition
+        execute(&tx, "UPDATE t SET c = 'updated' WHERE a >= 2 AND b <= 20").unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert_eq!(rows.len(), 3);
+        // Should update rows 2 and 3 (a >= 2 AND b <= 20)
+        assert_eq!(rows[0].values[3], DbValue::Text("x".into())); // a=1, not updated
+        assert_eq!(rows[1].values[3], DbValue::Text("updated".into())); // a=2, b=20, updated
+        assert_eq!(rows[2].values[3], DbValue::Text("updated".into())); // a=3, b=15, updated
+    }
+
+    #[test]
+    fn test_update_with_pk_table() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)",
+        )
+        .unwrap();
+        execute(
+            &tx,
+            "INSERT INTO items VALUES (1, 'widget', 9.99), (2, 'gadget', 19.99)",
+        )
+        .unwrap();
+
+        // Update by PK
+        execute(&tx, "UPDATE items SET price = 15.50 WHERE id = 2").unwrap();
+
+        let row = tx.get("items", 2).unwrap().unwrap();
+        assert_eq!(row.values[0], DbValue::Integer(2)); // id column
+        assert_eq!(row.values[1], DbValue::Text("gadget".into())); // name column
+        assert_eq!(row.values[2], DbValue::Float(15.50)); // price column
+    }
+
+    #[test]
+    fn test_update_different_types() {
+        let (db, _tmp) = open_db();
+        let tx = db.begin_transaction();
+        execute(
+            &tx,
+            "CREATE TABLE t (i INTEGER, f FLOAT, t TEXT, b BOOLEAN)",
+        )
+        .unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1, 1.0, 'a', true)").unwrap();
+
+        // Update different column types
+        execute(
+            &tx,
+            "UPDATE t SET i = 42, f = 3.14, t = 'updated', b = false WHERE i = 1",
+        )
+        .unwrap();
+
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert_eq!(rows[0].values[1], DbValue::Integer(42));
+        assert_eq!(rows[0].values[2], DbValue::Float(3.14));
+        assert_eq!(rows[0].values[3], DbValue::Text("updated".into()));
+        assert_eq!(rows[0].values[4], DbValue::Bool(false));
+    }
+
+    #[test]
+    fn test_update_visible_after_commit() {
+        let (db, _tmp) = open_db();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&tx, "INSERT INTO t VALUES (1)").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        execute(&tx, "UPDATE t SET x = 99").unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.begin_transaction();
+        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[1], DbValue::Integer(99));
     }
 }
