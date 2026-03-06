@@ -1,0 +1,52 @@
+---
+source: tests/simple_snapshot.rs
+expression: output
+---
+-- Statement 1
+-- CREATE TABLE users(   id INTEGER,   name TEXT,   age INTEGER )
+-- OK (no results)
+
+-- Statement 2
+-- INSERT INTO users VALUES (1, 'alice', 20)
+-- OK (no results)
+
+-- Statement 3
+-- INSERT INTO users VALUES (2, 'bob', 25)
+-- OK (no results)
+
+-- Statement 4
+-- INSERT INTO users VALUES (3, 'carol', 30)
+-- OK (no results)
+
+-- Statement 5
+-- SELECT * FROM users
+-- 0|1|alice|20
+-- 1|2|bob|25
+-- 2|3|carol|30
+
+-- Statement 6
+-- SELECT * FROM users WHERE id = 2
+-- 1|2|bob|25
+
+-- Statement 7
+-- SELECT name FROM users
+-- alice
+-- bob
+-- carol
+
+-- Statement 8
+-- UPDATE users SET age = 26 WHERE id = 2
+-- OK (no results)
+
+-- Statement 9
+-- SELECT * FROM users WHERE id = 2
+-- 1|2|bob|26
+
+-- Statement 10
+-- DELETE FROM users WHERE id = 1
+-- OK (no results)
+
+-- Statement 11
+-- SELECT * FROM users
+-- 1|2|bob|26
+-- 2|3|carol|30
