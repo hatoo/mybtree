@@ -387,9 +387,10 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
             }
             Statement::Delete(del) => {
                 let table_name = match del.from {
-                    sqlparser::ast::FromTable::WithFromKeyword(table) => {
-                        table[0].relation.to_string()
-                    }
+                    sqlparser::ast::FromTable::WithFromKeyword(table) => table
+                        .get(0)
+                        .map(|t| t.relation.to_string())
+                        .ok_or(SqlError::UnsupportedStatement)?,
                     _ => return Err(SqlError::UnsupportedStatement),
                 };
 
