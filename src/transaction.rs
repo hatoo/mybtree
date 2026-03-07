@@ -163,6 +163,51 @@ impl<const N: usize> TransactionStore<N> {
     }
 }
 
+impl<'a, const N: usize> LockedTransaction<'a, N> {
+    pub fn read_range<F>(
+        &mut self,
+        root: NodePtr,
+        range: impl RangeBounds<Key>,
+        mut f: F,
+    ) -> Result<(), TreeError>
+    where
+        for<'local> F: FnMut(&'local mut LockedTransaction<'local, N>, Key, &[u8]) -> bool,
+    {
+        let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
+        let &mut LockedTransaction {
+            ref mut btree,
+            ref mut active_transactions,
+        } = self;
+        active_transactions
+            .range_reads
+            .push((root, range_bound.0.clone(), range_bound.1.clone()));
+
+        btree.read_range_map(root, range_bound.clone(), |btree, k, v| {
+            active_transactions.reads.insert((root, k));
+
+            // check active writes
+            if let Some(v) = active_transactions.writes.get(&(root, k)) {
+                if let Some(v) = v {
+                    let v = v.clone();
+                    let mut me = LockedTransaction {
+                        btree,
+                        active_transactions,
+                    };
+                    return f(&mut me, k, &v);
+                } else {
+                    return true; // deleted key, skip
+                }
+            }
+            let mut me = LockedTransaction {
+                btree,
+                active_transactions,
+            };
+
+            f(&mut me, k, v)
+        })
+    }
+}
+
 impl<'a, const N: usize> Transaction<'a, N> {
     pub fn with_lock(&mut self, mut f: impl FnMut(LockedTransaction<'_, N>)) {
         let mut inner = self.store.lock().unwrap();
