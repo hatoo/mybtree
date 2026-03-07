@@ -171,7 +171,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         mut f: F,
     ) -> Result<(), TreeError>
     where
-        for<'local> F: FnMut(&'local mut LockedTransaction<'local, N>, Key, &[u8]) -> bool,
+        for<'local> F: FnMut(LockedTransaction<'local, N>, Key, &[u8]) -> bool,
     {
         let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
         let &mut LockedTransaction {
@@ -189,21 +189,21 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             if let Some(v) = active_transactions.writes.get(&(root, k)) {
                 if let Some(v) = v {
                     let v = v.clone();
-                    let mut me = LockedTransaction {
+                    let me = LockedTransaction {
                         btree,
                         active_transactions,
                     };
-                    return f(&mut me, k, &v);
+                    return f(me, k, &v);
                 } else {
                     return true; // deleted key, skip
                 }
             } else {
-                let mut me = LockedTransaction {
+                let me = LockedTransaction {
                     btree,
                     active_transactions,
                 };
 
-                f(&mut me, k, v)
+                f(me, k, v)
             }
         })
     }
