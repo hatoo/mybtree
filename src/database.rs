@@ -39,7 +39,7 @@ pub struct Schema {
     pub columns: Vec<Column>,
     /// Index of the primary key column. `None` means no explicit PK was given
     /// (an implicit `_rowid` column will be prepended by `create_table`).
-    pub primary_key: Option<usize>,
+    pub primary_key: usize,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -213,13 +213,20 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
         Ok(meta.schema)
     }
 
-    pub fn create_table(&self, name: &str, mut schema: Schema) -> Result<(), DatabaseError> {
+    pub fn create_table(
+        &self,
+        name: &str,
+        mut schema: Schema,
+        pk_index: Option<usize>,
+    ) -> Result<(), DatabaseError> {
         if self.find_table_meta(name)?.is_some() {
             return Err(DatabaseError::TableAlreadyExists(name.to_string()));
         }
 
         // If no explicit primary key, prepend an implicit `_rowid` column.
-        if schema.primary_key.is_none() {
+        if let Some(pk_idx) = pk_index {
+            schema.primary_key = pk_idx;
+        } else {
             schema.columns.insert(
                 0,
                 Column {
@@ -228,11 +235,11 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
                     nullable: false,
                 },
             );
-            schema.primary_key = Some(0);
+            schema.primary_key = 0;
         }
 
         // Validate PK column is integer and not nullable.
-        let pk_idx = schema.primary_key.unwrap();
+        let pk_idx = schema.primary_key;
         let pk_col = &schema.columns[pk_idx];
         if pk_col.column_type != ColumnType::Integer {
             return Err(DatabaseError::SchemaMismatch(
@@ -373,7 +380,7 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
             .find_table_meta(table_name)?
             .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
 
-        let pk_idx = meta.schema.primary_key.unwrap();
+        let pk_idx = meta.schema.primary_key;
         let mut row = row.clone();
 
         // Handle auto-assign for implicit _rowid (Null in PK position).

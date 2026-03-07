@@ -233,9 +233,9 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                 }
                 let schema = Schema {
                     columns,
-                    primary_key,
+                    primary_key: primary_key.unwrap_or(0),
                 };
-                tx.create_table(&ct.name.to_string(), schema)?;
+                tx.create_table(&ct.name.to_string(), schema, primary_key)?;
             }
             Statement::Insert(ins) => {
                 let table_name = ins.table.to_string();
@@ -247,14 +247,7 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
 
                 let schema = tx.get_schema(&table_name)?;
 
-                // Detect whether the table has an implicit _rowid column
-                // that the user is not explicitly providing.
-                let has_implicit_rowid =
-                    schema.columns.first().map_or(false, |c| c.name == "_rowid");
-
-                let column_map = if ins.columns.is_empty() {
-                    None
-                } else {
+                let (map, total) = {
                     let mut map: Vec<usize> = Vec::with_capacity(ins.columns.len());
                     for col in &ins.columns {
                         let pos = schema
@@ -269,7 +262,7 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                             })?;
                         map.push(pos);
                     }
-                    Some((map, schema.columns.len()))
+                    (map, schema.columns.len())
                 };
 
                 for row_exprs in rows_exprs {
@@ -278,21 +271,12 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                         .map(expr_to_dbvalue)
                         .collect::<Result<_, _>>()?;
 
-                    let row = if let Some((ref map, total)) = column_map {
+                    let row = {
                         let mut full = vec![DbValue::Null; total];
                         for (i, pos) in map.iter().enumerate() {
                             full[*pos] = values[i].clone();
                         }
                         Row { values: full }
-                    } else if has_implicit_rowid {
-                        // User provided values without column list and table has
-                        // implicit _rowid — prepend Null so _rowid auto-assigns.
-                        let mut full = Vec::with_capacity(values.len() + 1);
-                        full.push(DbValue::Null);
-                        full.extend(values);
-                        Row { values: full }
-                    } else {
-                        Row { values }
                     };
 
                     tx.insert(&table_name, &row)?;
@@ -323,7 +307,7 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                         let col_idx = resolve_column(col_name, &schema)?;
                         let pk_idx = schema.primary_key;
 
-                        if pk_idx == Some(col_idx) {
+                        if pk_idx == col_idx {
                             // Primary key point lookup
                             if let DbValue::Integer(i) = value {
                                 if *i >= 0 {
