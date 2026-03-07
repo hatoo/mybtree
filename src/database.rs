@@ -37,9 +37,8 @@ pub struct Column {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct Schema {
     pub columns: Vec<Column>,
-    /// Index of the primary key column. `None` means no explicit PK was given
-    /// (an implicit `_rowid` column will be prepended by `create_table`).
     pub primary_key: usize,
+    // True if PK column was auto-added as implicit _rowid (not part of user-defined schema).
     pub implicit_pk: bool,
 }
 
