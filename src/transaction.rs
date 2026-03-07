@@ -197,13 +197,14 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                 } else {
                     return true; // deleted key, skip
                 }
-            }
-            let mut me = LockedTransaction {
-                btree,
-                active_transactions,
-            };
+            } else {
+                let mut me = LockedTransaction {
+                    btree,
+                    active_transactions,
+                };
 
-            f(&mut me, k, v)
+                f(&mut me, k, v)
+            }
         })
     }
 }
