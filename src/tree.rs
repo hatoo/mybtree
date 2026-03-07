@@ -720,14 +720,31 @@ impl<const N: usize> Btree<N> {
         range: R,
         mut f: impl FnMut(Key, &[u8]),
     ) -> Result<(), TreeError> {
-        self.read_range_at(root, &range, &mut f, 0)
+        self.read_range_at(
+            root,
+            &range,
+            |_, k, v| {
+                f(k, v);
+                false
+            },
+            0,
+        )
+    }
+
+    pub fn read_range_map<R: RangeBounds<Key>>(
+        &mut self,
+        root: NodePtr,
+        range: R,
+        f: impl FnMut(&mut Self, Key, &[u8]) -> bool,
+    ) -> Result<(), TreeError> {
+        self.read_range_at(root, &range, f, 0)
     }
 
     fn read_range_at<R: RangeBounds<Key>>(
         &mut self,
         node_ptr: NodePtr,
         range: &R,
-        f: &mut impl FnMut(Key, &[u8]),
+        mut f: impl FnMut(&mut Self, Key, &[u8]) -> bool,
         left_key: Key,
     ) -> Result<(), TreeError> {
         // Stack of (node_ptr, left_key)
@@ -744,9 +761,13 @@ impl<const N: usize> Btree<N> {
                                 let (start_page, total_len) =
                                     Pager::<N>::parse_overflow_meta(leaf.value(i));
                                 let data = self.pager.read_overflow(start_page, total_len)?;
-                                f(k, &data);
+                                if f(self, k, &data) {
+                                    return Ok(());
+                                }
                             } else {
-                                f(k, leaf.value(i));
+                                if f(self, k, leaf.value(i)) {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
