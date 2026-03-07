@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::{Bound, RangeBounds},
+    ops::{Bound, DerefMut, RangeBounds},
     sync::Mutex,
 };
 
@@ -29,6 +29,11 @@ pub struct TransactionStore<const N: usize> {
 pub struct Transaction<'a, const N: usize> {
     store: &'a Mutex<TransactionStoreInner<N>>,
     tx_id: usize,
+}
+
+pub struct LockedTransaction<'a, const N: usize> {
+    btree: &'a mut Btree<N>,
+    active_transactions: &'a mut Operation,
 }
 
 pub struct Operation {
@@ -159,6 +164,21 @@ impl<const N: usize> TransactionStore<N> {
 }
 
 impl<'a, const N: usize> Transaction<'a, N> {
+    pub fn with_lock(&mut self, mut f: impl FnMut(LockedTransaction<'_, N>)) {
+        let mut inner = self.store.lock().unwrap();
+        let &mut TransactionStoreInner {
+            ref mut btree,
+            ref mut active_transactions,
+            ..
+        } = inner.deref_mut();
+        let op = active_transactions.get_mut(&self.tx_id).unwrap();
+        let locked_tx = LockedTransaction {
+            btree: btree,
+            active_transactions: op,
+        };
+        f(locked_tx)
+    }
+
     pub fn read(&self, root: NodePtr, key: Key) -> Result<Option<Vec<u8>>, TreeError> {
         let mut inner = self.store.lock().unwrap();
         if let Some(op) = inner.active_transactions.get_mut(&self.tx_id) {
