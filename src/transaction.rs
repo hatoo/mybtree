@@ -195,7 +195,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                     };
                     return f(me, k, &v);
                 } else {
-                    return true; // deleted key, skip
+                    return false; // deleted key, skip
                 }
             } else {
                 let me = LockedTransaction {
