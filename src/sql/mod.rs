@@ -234,6 +234,7 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                 let schema = Schema {
                     columns,
                     primary_key: primary_key.unwrap_or(0),
+                    implicit_pk: primary_key.is_none(),
                 };
                 tx.create_table(&ct.name.to_string(), schema, primary_key)?;
             }
@@ -247,7 +248,14 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
 
                 let schema = tx.get_schema(&table_name)?;
 
-                let (map, total) = {
+                let total = schema.columns.len();
+                let map = if ins.columns.is_empty() {
+                    if schema.implicit_pk {
+                        (1..total).collect()
+                    } else {
+                        (0..total).collect()
+                    }
+                } else {
                     let mut map: Vec<usize> = Vec::with_capacity(ins.columns.len());
                     for col in &ins.columns {
                         let pos = schema
@@ -262,7 +270,7 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                             })?;
                         map.push(pos);
                     }
-                    (map, schema.columns.len())
+                    map
                 };
 
                 for row_exprs in rows_exprs {
@@ -1087,7 +1095,7 @@ mod tests {
         let schema = tx.get_schema("items").unwrap();
         assert_eq!(schema.columns.len(), 2);
         assert_eq!(schema.columns[0].name, "id");
-        assert_eq!(schema.primary_key, Some(0));
+        assert_eq!(schema.primary_key, 0);
     }
 
     #[test]

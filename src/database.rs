@@ -40,6 +40,7 @@ pub struct Schema {
     /// Index of the primary key column. `None` means no explicit PK was given
     /// (an implicit `_rowid` column will be prepended by `create_table`).
     pub primary_key: usize,
+    pub implicit_pk: bool,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -226,6 +227,7 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
         // If no explicit primary key, prepend an implicit `_rowid` column.
         if let Some(pk_idx) = pk_index {
             schema.primary_key = pk_idx;
+            schema.implicit_pk = false;
         } else {
             schema.columns.insert(
                 0,
@@ -236,6 +238,7 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
                 },
             );
             schema.primary_key = 0;
+            schema.implicit_pk = true;
         }
 
         // Validate PK column is integer and not nullable.
@@ -619,7 +622,8 @@ mod tests {
                     nullable: false,
                 },
             ],
-            primary_key: None,
+            primary_key: 0,
+            implicit_pk: true,
         }
     }
 
@@ -639,23 +643,23 @@ mod tests {
     fn test_create_table() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         let meta = tx.find_table_meta("users").unwrap().unwrap();
         // 3 columns: _rowid (implicit) + name + age
         assert_eq!(meta.schema.columns.len(), 3);
         assert_eq!(meta.schema.columns[0].name, "_rowid");
-        assert_eq!(meta.schema.primary_key, Some(0));
+        assert_eq!(meta.schema.primary_key, 0);
     }
 
     #[test]
     fn test_create_table_already_exists() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
-        let err = tx.create_table("users", users_schema()).unwrap_err();
+        let err = tx.create_table("users", users_schema(), None).unwrap_err();
         assert!(matches!(err, DatabaseError::TableAlreadyExists(_)));
     }
 
@@ -664,7 +668,7 @@ mod tests {
     fn test_insert_and_get() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -682,7 +686,7 @@ mod tests {
     fn test_schema_mismatch_wrong_type() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // _rowid + wrong type for name + age
@@ -699,7 +703,7 @@ mod tests {
     fn test_schema_mismatch_wrong_column_count() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let bad_row = Row {
@@ -716,7 +720,7 @@ mod tests {
     fn test_scan_range() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -737,7 +741,7 @@ mod tests {
     fn test_update_row() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -768,7 +772,7 @@ mod tests {
     fn test_delete_row() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -788,7 +792,7 @@ mod tests {
     fn test_multiple_tables() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_table(
             "products",
             Schema {
@@ -804,8 +808,10 @@ mod tests {
                         nullable: false,
                     },
                 ],
-                primary_key: None,
+                primary_key: 0,
+                implicit_pk: true,
             },
+            None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -838,7 +844,7 @@ mod tests {
     fn test_rollback_on_drop() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -853,7 +859,7 @@ mod tests {
     fn test_commit_persists() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -884,8 +890,10 @@ mod tests {
                         nullable: true,
                     },
                 ],
-                primary_key: None,
+                primary_key: 0,
+                implicit_pk: true,
             },
+            None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -914,7 +922,7 @@ mod tests {
     fn test_non_nullable_rejects_null() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -935,7 +943,7 @@ mod tests {
     fn test_drop_table() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -976,8 +984,10 @@ mod tests {
                     column_type: ColumnType::Bool,
                     nullable: false,
                 }],
-                primary_key: None,
+                primary_key: 0,
+                implicit_pk: true,
             },
+            None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -1024,7 +1034,7 @@ mod tests {
         let db = Database::create(pager).unwrap();
 
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // Insert many rows to allocate several pages
@@ -1043,7 +1053,7 @@ mod tests {
 
         // Re-create and re-insert — should reuse freed pages
         let tx = db.begin_transaction();
-        tx.create_table("users2", users_schema()).unwrap();
+        tx.create_table("users2", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1075,7 +1085,7 @@ mod tests {
         let db = Database::create(pager).unwrap();
 
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.create_index("users", "age").unwrap();
         tx.commit().unwrap();
@@ -1096,7 +1106,7 @@ mod tests {
 
         // Re-create with indexes and re-insert — should reuse freed pages
         let tx = db.begin_transaction();
-        tx.create_table("users2", users_schema()).unwrap();
+        tx.create_table("users2", users_schema(), None).unwrap();
         tx.create_index("users2", "name").unwrap();
         tx.create_index("users2", "age").unwrap();
         tx.commit().unwrap();
@@ -1124,7 +1134,7 @@ mod tests {
     fn test_create_index() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
 
         let meta = tx.find_table_meta("users").unwrap().unwrap();
@@ -1136,7 +1146,7 @@ mod tests {
     fn test_create_index_nonexistent_column() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         let err = tx.create_index("users", "email").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
@@ -1145,7 +1155,7 @@ mod tests {
     fn test_create_index_duplicate() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         let err = tx.create_index("users", "name").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
@@ -1155,7 +1165,7 @@ mod tests {
     fn test_drop_index() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.drop_index("users", "name").unwrap();
 
@@ -1167,7 +1177,7 @@ mod tests {
     fn test_drop_index_nonexistent() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         let err = tx.drop_index("users", "name").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
@@ -1176,7 +1186,7 @@ mod tests {
     fn test_scan_by_index() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1200,7 +1210,7 @@ mod tests {
     fn test_scan_by_index_no_index() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1214,7 +1224,7 @@ mod tests {
     fn test_index_maintained_on_insert() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1234,7 +1244,7 @@ mod tests {
     fn test_index_maintained_on_delete() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1257,7 +1267,7 @@ mod tests {
     fn test_index_maintained_on_update() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1300,7 +1310,7 @@ mod tests {
     fn test_create_index_backfills_existing_data() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // Insert rows before creating the index
@@ -1326,7 +1336,7 @@ mod tests {
     fn test_drop_table_with_index() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1348,7 +1358,7 @@ mod tests {
     fn test_conflict_write_write_same_key() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1395,7 +1405,7 @@ mod tests {
     fn test_conflict_read_write() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1430,7 +1440,7 @@ mod tests {
     fn test_conflict_delete_vs_read() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1452,7 +1462,7 @@ mod tests {
     fn test_conflict_range_scan_vs_insert() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1477,7 +1487,7 @@ mod tests {
     fn test_conflict_index_scan_vs_insert() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1498,7 +1508,7 @@ mod tests {
     fn test_conflict_index_point_read_vs_insert() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1519,7 +1529,7 @@ mod tests {
     fn test_no_conflict_disjoint_rows() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1568,7 +1578,7 @@ mod tests {
     fn test_no_conflict_serial_transactions() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1611,7 +1621,7 @@ mod tests {
     fn test_no_conflict_disjoint_index_ranges() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1632,7 +1642,7 @@ mod tests {
     fn test_conflict_concurrent_inserts_same_index_value() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1652,7 +1662,7 @@ mod tests {
     fn test_conflict_update_vs_index_scan() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1693,8 +1703,8 @@ mod tests {
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
 
-        tx1.create_table("users", users_schema()).unwrap();
-        tx2.create_table("users", users_schema()).unwrap();
+        tx1.create_table("users", users_schema(), None).unwrap();
+        tx2.create_table("users", users_schema(), None).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -1707,8 +1717,8 @@ mod tests {
         let tx1 = db.begin_transaction();
         let tx2 = db.begin_transaction();
 
-        tx1.create_table("users", users_schema()).unwrap();
-        tx2.create_table("products", users_schema()).unwrap();
+        tx1.create_table("users", users_schema(), None).unwrap();
+        tx2.create_table("products", users_schema(), None).unwrap();
 
         tx1.commit().unwrap();
         tx2.commit().unwrap();
@@ -1718,7 +1728,7 @@ mod tests {
     fn test_conflict_concurrent_drop_table_same_name() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx1 = db.begin_transaction();
@@ -1735,7 +1745,7 @@ mod tests {
     fn test_conflict_create_table_vs_drop_table_same_name() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // tx1 drops the table, tx2 reads it (via insert)
@@ -1753,7 +1763,7 @@ mod tests {
     fn test_conflict_create_index_vs_insert() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // tx1 creates an index (backfills via range read), tx2 inserts a row
@@ -1771,7 +1781,7 @@ mod tests {
     fn test_conflict_concurrent_create_index_same_column() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // Both try to create an index on the same column
@@ -1789,7 +1799,7 @@ mod tests {
     fn test_conflict_drop_index_vs_index_scan() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.commit().unwrap();
 
@@ -1813,7 +1823,7 @@ mod tests {
     fn test_conflict_drop_table_vs_read() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -1835,7 +1845,7 @@ mod tests {
     fn test_multiple_indexes_on_table() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.create_index("users", "name").unwrap();
         tx.create_index("users", "age").unwrap();
         tx.commit().unwrap();
@@ -1878,9 +1888,10 @@ mod tests {
                     nullable: false,
                 },
             ],
-            primary_key: None,
+            primary_key: 0,
+            implicit_pk: true,
         };
-        tx.create_table("t", schema).unwrap();
+        tx.create_table("t", schema, None).unwrap();
         tx.create_index("t", "x").unwrap();
         tx.insert(
             "t",
@@ -1967,8 +1978,10 @@ mod tests {
                         nullable: false,
                     },
                 ],
-                primary_key: Some(0),
+                primary_key: 0,
+                implicit_pk: false,
             },
+            Some(0),
         )
         .unwrap();
         tx.commit().unwrap();
@@ -2011,8 +2024,10 @@ mod tests {
                         nullable: false,
                     },
                 ],
-                primary_key: Some(0),
+                primary_key: 0,
+                implicit_pk: false,
             },
+            Some(0),
         )
         .unwrap();
 
@@ -2020,7 +2035,7 @@ mod tests {
         // No _rowid prepended when explicit PK is given
         assert_eq!(meta.schema.columns.len(), 2);
         assert_eq!(meta.schema.columns[0].name, "id");
-        assert_eq!(meta.schema.primary_key, Some(0));
+        assert_eq!(meta.schema.primary_key, 0);
     }
 
     #[test]
@@ -2042,8 +2057,10 @@ mod tests {
                         nullable: false,
                     },
                 ],
-                primary_key: Some(0),
+                primary_key: 0,
+                implicit_pk: false,
             },
+            Some(0),
         )
         .unwrap();
         tx.commit().unwrap();
@@ -2079,8 +2096,10 @@ mod tests {
                     column_type: ColumnType::Integer,
                     nullable: false,
                 }],
-                primary_key: Some(0),
+                primary_key: 0,
+                implicit_pk: false,
             },
+            Some(0),
         )
         .unwrap();
         tx.commit().unwrap();
@@ -2101,7 +2120,7 @@ mod tests {
     fn test_implicit_rowid_auto_assigns() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -2119,7 +2138,7 @@ mod tests {
     fn test_implicit_rowid_explicit_value() {
         let (db, _tmp) = open_db();
         let tx = db.begin_transaction();
-        tx.create_table("users", users_schema()).unwrap();
+        tx.create_table("users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // Provide explicit _rowid value
@@ -2156,8 +2175,10 @@ mod tests {
                         column_type: ColumnType::Text,
                         nullable: false,
                     }],
-                    primary_key: Some(0),
+                    primary_key: 0,
+                    implicit_pk: false,
                 },
+                Some(0),
             )
             .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
