@@ -202,14 +202,15 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         Ok(None)
     }
 
-    pub fn read_range<F>(
+    pub fn read_range<F, E>(
         &mut self,
         root: NodePtr,
         range: impl RangeBounds<Key>,
         mut f: F,
-    ) -> Result<(), TreeError>
+    ) -> Result<(), E>
     where
-        for<'local> F: FnMut(LockedTransaction<'local, N>, Key, &[u8]) -> bool,
+        for<'local> F: FnMut(LockedTransaction<'local, N>, Key, &[u8]) -> Result<bool, E>,
+        E: From<TreeError>,
     {
         let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
         let &mut LockedTransaction {
@@ -233,7 +234,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                     };
                     return f(me, k, &v);
                 } else {
-                    return false; // deleted key, skip
+                    return Ok(false); // deleted key, skip
                 }
             } else {
                 let me = LockedTransaction {

@@ -5,7 +5,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::Pager;
 use crate::transaction::{LockedTransaction, TransactionError, TransactionStore};
-use crate::tree::Btree;
+use crate::tree::{Btree, TreeError};
 use crate::types::{Key, NodePtr};
 
 // ── Column types ────────────────────────────────────────────────────
@@ -198,29 +198,48 @@ pub struct LockedDbTransaction<'a, const N: usize> {
 
 impl<'a, const N: usize> LockedDbTransaction<'a, N> {
     fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
-        if let Some(catalog_key) = self
-            .tx
-            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
-        {
-            if let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)? {
-                let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
-                return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
-            }
-        }
-        Ok(None)
+        todo!()
     }
 
-    pub fn scan(
+    pub fn scan<F, E: From<DatabaseError>>(
         &mut self,
         table_name: &str,
         range: impl RangeBounds<Key>,
-        f: FnMut(&mut Self, Key, Row) -> bool,
-    ) -> Result<(), DatabaseError> {
+        mut f: F,
+    ) -> Result<(), E>
+    where
+        F: for<'local> FnMut(
+            LockedDbTransaction<'local, N>,
+            Key,
+            &'local rkyv::Archived<Row>,
+        ) -> Result<bool, E>,
+    {
         let meta = self
             .find_table_meta(table_name)?
             .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
 
-        self.tx.read_range(meta.r, range, f)
+        #[derive(thiserror::Error)]
+        enum E1<E> {
+            #[error("{0}")]
+            Error(#[from] E),
+        }
+
+        impl<E: From<DatabaseError>> From<TreeError> for E1<E> {
+            fn from(err: TreeError) -> Self {
+                E1::Error(E::from(DatabaseError::TreeError(err)))
+            }
+        }
+
+        self.tx
+            .read_range(meta.root_page, range, |tx, key, value| {
+                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(value)
+                    .map_err(|e| E::from(DatabaseError::Internal(e)))?;
+                Ok(f(LockedDbTransaction { tx }, key, archived).map_err(|e| E1::Error(e))?)
+            })
+            .map_err(|e| match e {
+                E1::Error(e) => e,
+            })?;
+        Ok(())
     }
 }
 

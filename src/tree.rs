@@ -725,32 +725,32 @@ impl<const N: usize> Btree<N> {
             &range,
             |_, k, v| {
                 f(k, v);
-                false
+                Ok(false)
             },
             0,
         )
     }
 
-    pub fn read_range_map<R: RangeBounds<Key>>(
+    pub fn read_range_map<R: RangeBounds<Key>, E: From<TreeError>>(
         &mut self,
         root: NodePtr,
         range: R,
-        f: impl FnMut(&mut Self, Key, &[u8]) -> bool,
-    ) -> Result<(), TreeError> {
+        f: impl FnMut(&mut Self, Key, &[u8]) -> Result<bool, E>,
+    ) -> Result<(), E> {
         self.read_range_at(root, &range, f, 0)
     }
 
-    fn read_range_at<R: RangeBounds<Key>>(
+    fn read_range_at<R: RangeBounds<Key>, E: From<TreeError>>(
         &mut self,
         node_ptr: NodePtr,
         range: &R,
-        mut f: impl FnMut(&mut Self, Key, &[u8]) -> bool,
+        mut f: impl FnMut(&mut Self, Key, &[u8]) -> Result<bool, E>,
         left_key: Key,
-    ) -> Result<(), TreeError> {
+    ) -> Result<(), E> {
         // Stack of (node_ptr, left_key)
         let mut stack = vec![(node_ptr, left_key)];
         while let Some((cur, lk)) = stack.pop() {
-            let page = self.pager.owned_node(cur)?;
+            let page = self.pager.owned_node(cur).map_err(|e| TreeError::Io(e))?;
             match page.page_type() {
                 PageType::Leaf => {
                     let leaf: LeafPage<N> = page.try_into().unwrap();
@@ -760,12 +760,15 @@ impl<const N: usize> Btree<N> {
                             if leaf.is_overflow(i) {
                                 let (start_page, total_len) =
                                     Pager::<N>::parse_overflow_meta(leaf.value(i));
-                                let data = self.pager.read_overflow(start_page, total_len)?;
-                                if f(self, k, &data) {
+                                let data = self
+                                    .pager
+                                    .read_overflow(start_page, total_len)
+                                    .map_err(|e| TreeError::Io(e))?;
+                                if f(self, k, &data)? {
                                     return Ok(());
                                 }
                             } else {
-                                if f(self, k, leaf.value(i)) {
+                                if f(self, k, leaf.value(i))? {
                                     return Ok(());
                                 }
                             }
@@ -790,9 +793,9 @@ impl<const N: usize> Btree<N> {
                     }
                 }
                 _ => {
-                    return Err(TreeError::UnexpectedPageType {
+                    Err(TreeError::UnexpectedPageType {
                         expected: "Leaf or Internal",
-                    });
+                    })?;
                 }
             }
         }
