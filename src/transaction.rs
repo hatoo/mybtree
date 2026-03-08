@@ -413,7 +413,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         mut f: F,
     ) -> Result<Vec<Key>, E>
     where
-        for<'local> F: FnMut(LockedTransaction<'local, N>, Key, &[u8]) -> Result<bool, E>,
+        for<'local> F: FnMut(LockedTransaction<'local, N>, &[u8], Key) -> Result<bool, E>,
         E: From<TreeError>,
     {
         todo!()

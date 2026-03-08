@@ -1665,33 +1665,52 @@ impl<const N: usize> Btree<N> {
         range: R,
         mut f: impl FnMut(&[u8], Key),
     ) -> Result<(), TreeError> {
+        self.index_read_range_at(root, &range, &mut |_s, value, key| {
+            f(value, key);
+            Ok(false)
+        })
+    }
+
+    pub fn index_read_range_map<'a, R: RangeBounds<&'a [u8]>, E: From<TreeError>>(
+        &mut self,
+        root: NodePtr,
+        range: R,
+        mut f: impl FnMut(&mut Self, &[u8], Key) -> Result<bool, E>,
+    ) -> Result<(), E> {
         self.index_read_range_at(root, &range, &mut f)
     }
 
-    fn index_read_range_at<'a, R: RangeBounds<&'a [u8]>>(
+    fn index_read_range_at<'a, R: RangeBounds<&'a [u8]>, E: From<TreeError>>(
         &mut self,
         node_ptr: NodePtr,
         range: &R,
-        f: &mut impl FnMut(&[u8], Key),
-    ) -> Result<(), TreeError> {
-        let page_type = self.pager.read_node(node_ptr)?.page_type();
+        f: &mut impl FnMut(&mut Self, &[u8], Key) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let page_type = self
+            .pager
+            .read_node(node_ptr)
+            .map_err(|e| TreeError::from(e))?
+            .page_type();
         match page_type {
             PageType::IndexLeaf => self.index_read_range_leaf(node_ptr, range, f),
             PageType::IndexInternal => self.index_read_range_internal(node_ptr, range, f),
-            _ => Err(TreeError::UnexpectedPageType {
+            _ => Err(E::from(TreeError::UnexpectedPageType {
                 expected: "IndexLeaf or IndexInternal",
-            }),
+            })),
         }
     }
 
-    fn index_read_range_leaf<'a, R: RangeBounds<&'a [u8]>>(
+    fn index_read_range_leaf<'a, R: RangeBounds<&'a [u8]>, E: From<TreeError>>(
         &mut self,
         node_ptr: NodePtr,
         range: &R,
-        f: &mut impl FnMut(&[u8], Key),
-    ) -> Result<(), TreeError> {
-        let page = self.pager.read_node(node_ptr)?;
-        let leaf: &IndexLeafPage<N> = page.try_into().unwrap();
+        f: &mut impl FnMut(&mut Self, &[u8], Key) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let page = self
+            .pager
+            .owned_node(node_ptr)
+            .map_err(|e| TreeError::from(e))?;
+        let leaf: IndexLeafPage<N> = page.try_into().unwrap();
         let len = leaf.len();
 
         // Binary search for start position
@@ -1737,29 +1756,38 @@ impl<const N: usize> Btree<N> {
                 }
             }
 
-            f(key_bytes, leaf.value(i));
+            if f(self, key_bytes, leaf.value(i))? {
+                return Ok(());
+            }
         }
 
         Ok(())
     }
 
-    fn index_read_range_leaf_slow<'a, R: RangeBounds<&'a [u8]>>(
+    fn index_read_range_leaf_slow<'a, R: RangeBounds<&'a [u8]>, E: From<TreeError>>(
         &mut self,
         node_ptr: NodePtr,
         from_idx: usize,
         range: &R,
-        f: &mut impl FnMut(&[u8], Key),
-    ) -> Result<(), TreeError> {
-        let page = self.pager.owned_node(node_ptr)?;
+        f: &mut impl FnMut(&mut Self, &[u8], Key) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let page = self
+            .pager
+            .owned_node(node_ptr)
+            .map_err(|e| E::from(TreeError::from(e)))?;
         let leaf: IndexLeafPage<N> = page.try_into().unwrap();
         for i in from_idx..leaf.len() {
-            let key_bytes = leaf.resolved_key(i, &mut self.pager)?.into_owned();
-            if range.contains(&key_bytes.as_slice()) {
-                f(&key_bytes, leaf.value(i));
+            let key_bytes = leaf
+                .resolved_key(i, &mut self.pager)
+                .map_err(|e| E::from(TreeError::from(e)))?;
+            if range.contains(&key_bytes.as_ref()) {
+                if f(self, key_bytes.as_ref(), leaf.value(i))? {
+                    return Ok(());
+                }
             }
             let past_end = match range.end_bound() {
-                Bound::Included(e) => key_bytes.as_slice() > *e,
-                Bound::Excluded(e) => key_bytes.as_slice() >= *e,
+                Bound::Included(e) => key_bytes.as_ref() > *e,
+                Bound::Excluded(e) => key_bytes.as_ref() >= *e,
                 Bound::Unbounded => false,
             };
             if past_end {
@@ -1769,13 +1797,16 @@ impl<const N: usize> Btree<N> {
         Ok(())
     }
 
-    fn index_read_range_internal<'a, R: RangeBounds<&'a [u8]>>(
+    fn index_read_range_internal<'a, R: RangeBounds<&'a [u8]>, E: From<TreeError>>(
         &mut self,
         node_ptr: NodePtr,
         range: &R,
-        f: &mut impl FnMut(&[u8], Key),
-    ) -> Result<(), TreeError> {
-        let page = self.pager.read_node(node_ptr)?;
+        f: &mut impl FnMut(&mut Self, &[u8], Key) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let page = self
+            .pager
+            .read_node(node_ptr)
+            .map_err(|e| E::from(TreeError::from(e)))?;
         let internal: &IndexInternalPage<N> = page.try_into().unwrap();
         let len = internal.len();
         if len == 0 {
@@ -1816,16 +1847,22 @@ impl<const N: usize> Btree<N> {
         }
     }
 
-    fn index_read_range_internal_slow<'a, R: RangeBounds<&'a [u8]>>(
+    fn index_read_range_internal_slow<'a, R: RangeBounds<&'a [u8]>, E: From<TreeError>>(
         &mut self,
         node_ptr: NodePtr,
         range: &R,
-        f: &mut impl FnMut(&[u8], Key),
-    ) -> Result<(), TreeError> {
-        let page = self.pager.owned_node(node_ptr)?;
+        f: &mut impl FnMut(&mut Self, &[u8], Key) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let page = self
+            .pager
+            .owned_node(node_ptr)
+            .map_err(|e| E::from(TreeError::from(e)))?;
         let internal: IndexInternalPage<N> = page.try_into().unwrap();
         for i in 0..internal.len() {
-            let max_bytes = internal.resolved_key(i, &mut self.pager)?.into_owned();
+            let max_bytes = internal
+                .resolved_key(i, &mut self.pager)
+                .map_err(|e| E::from(TreeError::from(e)))?
+                .into_owned();
             let ptr = internal.ptr(i);
 
             let below_start = match range.start_bound() {
@@ -1838,7 +1875,10 @@ impl<const N: usize> Btree<N> {
             }
 
             if i > 0 {
-                let prev_max = internal.resolved_key(i - 1, &mut self.pager)?.into_owned();
+                let prev_max = internal
+                    .resolved_key(i - 1, &mut self.pager)
+                    .map_err(|e| E::from(TreeError::from(e)))?
+                    .into_owned();
                 let beyond_end = match range.end_bound() {
                     Bound::Included(e) => prev_max.as_slice() > *e,
                     Bound::Excluded(e) => prev_max.as_slice() >= *e,
