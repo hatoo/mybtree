@@ -197,8 +197,17 @@ pub struct LockedDbTransaction<'a, const N: usize> {
 }
 
 impl<'a, const N: usize> LockedDbTransaction<'a, N> {
-    fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
-        todo!()
+    fn find_table_meta(&mut self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
+        if let Some(catalog_key) = self
+            .tx
+            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
+        {
+            if let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)? {
+                let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
+                return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
+            }
+        }
+        Ok(None)
     }
 
     pub fn scan<F, E: From<DatabaseError>>(

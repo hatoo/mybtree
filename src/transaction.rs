@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     ops::{Bound, DerefMut, RangeBounds},
     sync::Mutex,
@@ -200,6 +201,15 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         }
 
         Ok(None)
+    }
+
+    pub fn read(&mut self, root: NodePtr, key: Key) -> Result<Option<Cow<'_, [u8]>>, TreeError> {
+        self.active_transactions.reads.insert((root, key));
+        if let Some(value) = self.active_transactions.writes.get(&(root, key)) {
+            return Ok(value.as_deref().map(|v| Cow::Borrowed(v)));
+        }
+        let value = self.btree.read(root, key)?;
+        Ok(value)
     }
 
     pub fn read_range<F, E>(
