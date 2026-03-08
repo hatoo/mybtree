@@ -291,6 +291,16 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         }
         Ok(())
     }
+
+    pub fn write(&mut self, root: NodePtr, key: Key, value: Vec<u8>) {
+        self.active_transactions
+            .writes
+            .insert((root, key), Some(value));
+    }
+
+    pub fn remove(&mut self, root: NodePtr, key: Key) {
+        self.active_transactions.writes.insert((root, key), None);
+    }
 }
 
 impl<'a, const N: usize> Transaction<'a, N> {
