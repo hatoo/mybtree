@@ -385,6 +385,20 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
 
         Ok(())
     }
+
+    // ── Structural operations ──────────────────────────────────────
+
+    pub fn init_tree(&mut self) -> Result<NodePtr, TreeError> {
+        let page = self.btree.init_tree()?;
+        self.active_transactions.deferred_init_trees.push(page);
+        Ok(page)
+    }
+
+    pub fn init_index(&mut self) -> Result<NodePtr, TreeError> {
+        let page = self.btree.init_index()?;
+        self.active_transactions.deferred_init_indexes.push(page);
+        Ok(page)
+    }
 }
 
 impl<'a, const N: usize> Transaction<'a, N> {
