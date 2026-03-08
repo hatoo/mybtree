@@ -407,16 +407,93 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
     }
 
     pub fn index_read_range<'b, R: RangeBounds<&'b [u8]>, F, E>(
-        &self,
+        &mut self,
         idx_root: NodePtr,
         range: R,
         mut f: F,
-    ) -> Result<Vec<Key>, E>
+    ) -> Result<(), E>
     where
         for<'local> F: FnMut(LockedTransaction<'local, N>, &[u8], Key) -> Result<bool, E>,
         E: From<TreeError>,
     {
-        todo!()
+        let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
+        let &mut LockedTransaction {
+            ref mut btree,
+            ref mut active_transactions,
+        } = self;
+
+        // Record range read for conflict detection
+        active_transactions.index_range_reads.push((
+            idx_root,
+            range_bound.0.clone().map(|v| v.to_vec()),
+            range_bound.1.clone().map(|v| v.to_vec()),
+        ));
+
+        // Collect local index operations for this root
+        let local_ops = active_transactions
+            .index_ops
+            .iter()
+            .filter(|((r, _, _), _)| *r == idx_root)
+            .map(|((_, v, k), is_insert)| (v.clone(), *k, *is_insert))
+            .collect::<Vec<_>>();
+
+        let mut processed_entries = BTreeSet::new();
+        let mut early_stop = false;
+
+        // Iterate through btree entries
+        btree.index_read_range_map(
+            idx_root,
+            range_bound.clone(),
+            |btree, value, key| -> Result<bool, E> {
+                // Check if this entry is locally deleted
+                if let Some((_, _, false)) =
+                    local_ops.iter().find(|(v, k, _)| v == value && *k == key)
+                {
+                    // Entry is deleted locally, skip it
+                    return Ok(false);
+                }
+
+                processed_entries.insert((value.to_vec(), key));
+
+                // Record index read for conflict detection
+                active_transactions
+                    .index_reads
+                    .insert((idx_root, value.to_vec()));
+
+                // Call the user callback
+                let me = LockedTransaction {
+                    btree,
+                    active_transactions,
+                };
+                let should_stop = f(me, value, key)?;
+
+                if should_stop {
+                    early_stop = true;
+                }
+
+                Ok(should_stop)
+            },
+        )?;
+
+        // Process locally inserted entries in range (if not stopped early)
+        if !early_stop {
+            for (value, key, is_insert) in local_ops {
+                if is_insert && range_bound.contains(&value.as_slice()) {
+                    // Check if we already processed this entry from btree
+                    if !processed_entries.contains(&(value.clone(), key)) {
+                        let me = LockedTransaction {
+                            btree,
+                            active_transactions,
+                        };
+                        if f(me, &value, key)? {
+                            break; // Stop early
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     // ── Structural operations ──────────────────────────────────────
