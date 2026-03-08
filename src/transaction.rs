@@ -345,6 +345,46 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
 
         Ok(key)
     }
+
+    pub fn remove_range(
+        &mut self,
+        root: NodePtr,
+        range: impl RangeBounds<Key>,
+    ) -> Result<(), TreeError> {
+        let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
+
+        // Find all keys in range from btree
+        let mut keys_to_remove: Vec<Key> = Vec::new();
+        self.btree
+            .read_range_map(root, range_bound.clone(), |_btree, key, _: &[u8]| {
+                keys_to_remove.push(key);
+                Ok::<_, TreeError>(false)
+            })?;
+
+        // Also find keys in range from local writes
+        for ((w_root, key), value) in &self.active_transactions.writes {
+            if *w_root == root
+                && range_bound.contains(key)
+                && value.is_some()
+                && !keys_to_remove.contains(key)
+            {
+                keys_to_remove.push(*key);
+            }
+        }
+
+        // Record range read for conflict detection
+        self.active_transactions
+            .range_reads
+            .push((root, range_bound.0, range_bound.1));
+
+        // Mark all keys for removal
+        for key in keys_to_remove {
+            self.active_transactions.reads.insert((root, key));
+            self.active_transactions.writes.insert((root, key), None);
+        }
+
+        Ok(())
+    }
 }
 
 impl<'a, const N: usize> Transaction<'a, N> {
