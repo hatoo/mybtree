@@ -75,8 +75,8 @@ fn execute_and_print(db: &Database<PAGE_SIZE>, input: &str) -> anyhow::Result<()
         return Ok(());
     }
 
-    let tx = db.begin_transaction();
-    let rows = mybtree::sql::execute(&tx, input)?;
+    let mut tx = db.begin_transaction();
+    let rows = mybtree::sql::execute(&mut tx, input)?;
     tx.commit()?;
 
     for row in &rows {

@@ -55,8 +55,8 @@ fn split_statements(sql: &str) -> Vec<String> {
 /// Execute a SQL file and return formatted output for snapshotting
 fn execute_sql_file(sql_path: &str) -> String {
     // Read the SQL file
-    let sql_content = fs::read_to_string(sql_path)
-        .unwrap_or_else(|_| panic!("Failed to read {}", sql_path));
+    let sql_content =
+        fs::read_to_string(sql_path).unwrap_or_else(|_| panic!("Failed to read {}", sql_path));
 
     // Create a temporary database
     let temp = NamedTempFile::new().unwrap();
@@ -73,12 +73,12 @@ fn execute_sql_file(sql_path: &str) -> String {
     let mut output = String::new();
 
     for (idx, stmt) in statements.iter().enumerate() {
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
 
         output.push_str(&format!("-- Statement {}\n", idx + 1));
         output.push_str(&format!("-- {}\n", stmt.replace('\n', " ")));
 
-        match mybtree::sql::execute(&tx, stmt) {
+        match mybtree::sql::execute(&mut tx, stmt) {
             Ok(rows) => {
                 if rows.is_empty() {
                     output.push_str("-- OK (no results)\n");

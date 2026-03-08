@@ -253,8 +253,8 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
 }
 
 impl<'a, const N: usize> DbTransaction<'a, N> {
-    pub fn with_lock(&mut self, mut f: impl FnMut(LockedDbTransaction<'_, N>)) {
-        self.tx.with_lock(|tx| f(LockedDbTransaction { tx }));
+    pub fn with_lock<T>(&mut self, mut f: impl FnMut(LockedDbTransaction<'_, N>) -> T) -> T {
+        self.tx.with_lock(|tx| f(LockedDbTransaction { tx }))
     }
 
     fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {

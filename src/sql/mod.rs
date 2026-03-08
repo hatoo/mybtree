@@ -192,7 +192,10 @@ fn eval_where(expr: &Expr, row: &Row, schema: &Schema) -> Result<bool, SqlError>
     }
 }
 
-pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<Vec<Row>, SqlError> {
+pub fn execute<const N: usize>(
+    tx: &mut DbTransaction<'_, N>,
+    sql: &str,
+) -> Result<Vec<Row>, SqlError> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)?;
 
@@ -310,44 +313,67 @@ pub fn execute<const N: usize>(tx: &DbTransaction<'_, N>, sql: &str) -> Result<V
                 // Try to use an index or PK for simple `col = value` WHERE clauses.
                 let eq_cond = select.selection.as_ref().and_then(try_extract_eq_condition);
 
-                let rows: Vec<(crate::types::Key, Row)> =
-                    if let Some((ref col_name, ref value)) = eq_cond {
-                        let col_idx = resolve_column(col_name, &schema)?;
-                        let pk_idx = schema.primary_key;
+                let rows: Vec<(crate::types::Key, Row)> = if let Some((ref col_name, ref value)) =
+                    eq_cond
+                {
+                    let col_idx = resolve_column(col_name, &schema)?;
+                    let pk_idx = schema.primary_key;
 
-                        if pk_idx == col_idx {
-                            // Primary key point lookup
-                            if let DbValue::Integer(i) = value {
-                                if *i >= 0 {
-                                    match tx.get(&table_name, *i as u64)? {
-                                        Some(row) => vec![(*i as u64, row)],
-                                        None => vec![],
-                                    }
-                                } else {
-                                    vec![]
+                    if pk_idx == col_idx {
+                        // Primary key point lookup
+                        if let DbValue::Integer(i) = value {
+                            if *i >= 0 {
+                                match tx.get(&table_name, *i as u64)? {
+                                    Some(row) => vec![(*i as u64, row)],
+                                    None => vec![],
                                 }
                             } else {
-                                // PK is always integer; non-integer value can't match
                                 vec![]
                             }
                         } else {
-                            let indexed_cols = tx.get_indexed_columns(&table_name)?;
-                            if indexed_cols.contains(&col_name.to_string()) {
-                                // Index scan
-                                let bytes = db_value_to_bytes(value);
-                                tx.scan_by_index(
-                                    &table_name,
-                                    col_name,
-                                    bytes.as_slice()..=bytes.as_slice(),
-                                )?
-                            } else {
-                                // No index — fall back to full scan
-                                tx.scan(&table_name, ..)?
-                            }
+                            // PK is always integer; non-integer value can't match
+                            vec![]
                         }
                     } else {
-                        tx.scan(&table_name, ..)?
-                    };
+                        let indexed_cols = tx.get_indexed_columns(&table_name)?;
+                        if indexed_cols.contains(&col_name.to_string()) {
+                            // Index scan
+                            let bytes = db_value_to_bytes(value);
+                            tx.scan_by_index(
+                                &table_name,
+                                col_name,
+                                bytes.as_slice()..=bytes.as_slice(),
+                            )?
+                        } else {
+                            // No index — fall back to full scan
+                            // testing new impl
+                            // tx.scan(&table_name, ..)?
+                            tx.with_lock(|mut lock| {
+                                lock.scan(&table_name, .., |_, _key, row| {
+                                    let row =
+                                        rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
+                                    let matches = match &select.selection {
+                                        Some(where_expr) => eval_where(where_expr, &row, &schema)?,
+                                        None => true,
+                                    };
+                                    if matches {
+                                        let projected = Row {
+                                            values: col_indices
+                                                .iter()
+                                                .map(|&i| row.values[i].clone())
+                                                .collect(),
+                                        };
+                                        result.push(projected);
+                                    }
+                                    Ok::<_, SqlError>(false)
+                                })
+                            })?;
+                            return Ok(result);
+                        }
+                    }
+                } else {
+                    tx.scan(&table_name, ..)?
+                };
 
                 for (_, row) in &rows {
                     let matches = match &select.selection {
@@ -492,9 +518,9 @@ mod tests {
         use crate::{DbValue, Row};
 
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE items (
                 id INTEGER NOT NULL,
                 name VARCHAR(255) NOT NULL,
@@ -563,9 +589,9 @@ mod tests {
         use crate::{DbValue, Row};
 
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE t (a INT NOT NULL, b INT, c TEXT NOT NULL, d TEXT)",
         )
         .unwrap();
@@ -623,13 +649,13 @@ mod tests {
     #[test]
     fn test_insert_basic() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30)").unwrap();
+        execute(&mut tx, "INSERT INTO users VALUES ('Alice', 30)").unwrap();
 
         let rows = tx.scan("users", ..).unwrap();
         assert_eq!(rows.len(), 1);
@@ -641,13 +667,17 @@ mod tests {
     #[test]
     fn test_insert_multiple_rows() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)",
+        )
+        .unwrap();
 
         let rows = tx.scan("users", ..).unwrap();
         assert_eq!(rows.len(), 2);
@@ -656,14 +686,14 @@ mod tests {
     #[test]
     fn test_insert_with_column_list() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE users (name TEXT NOT NULL, age INTEGER, active BOOLEAN)",
         )
         .unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO users (active, name) VALUES (true, 'Alice')",
         )
         .unwrap();
@@ -679,13 +709,13 @@ mod tests {
     #[test]
     fn test_insert_all_types() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE t (i INTEGER, f FLOAT, t TEXT, b BOOLEAN)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO t VALUES (42, 3.14, 'hello', true)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (42, 3.14, 'hello', true)").unwrap();
 
         let rows = tx.scan("t", ..).unwrap();
         assert_eq!(rows[0].1.values[1], DbValue::Integer(42));
@@ -697,9 +727,9 @@ mod tests {
     #[test]
     fn test_insert_null() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (NULL, NULL)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (NULL, NULL)").unwrap();
 
         let rows = tx.scan("t", ..).unwrap();
         assert_eq!(rows[0].1.values[1], DbValue::Null);
@@ -709,9 +739,9 @@ mod tests {
     #[test]
     fn test_insert_negative_numbers() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (i INTEGER, f FLOAT)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (-42, -3.14)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (i INTEGER, f FLOAT)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (-42, -3.14)").unwrap();
 
         let rows = tx.scan("t", ..).unwrap();
         assert_eq!(rows[0].1.values[1], DbValue::Integer(-42));
@@ -721,34 +751,34 @@ mod tests {
     #[test]
     fn test_insert_schema_mismatch() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (a INTEGER NOT NULL)").unwrap();
-        let err = execute(&tx, "INSERT INTO t VALUES (NULL)").unwrap_err();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (a INTEGER NOT NULL)").unwrap();
+        let err = execute(&mut tx, "INSERT INTO t VALUES (NULL)").unwrap_err();
         assert!(matches!(err, SqlError::Database(_)));
     }
 
     #[test]
     fn test_unsupported_type() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        let err = execute(&tx, "CREATE TABLE t (a BLOB)").unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = execute(&mut tx, "CREATE TABLE t (a BLOB)").unwrap_err();
         assert!(matches!(err, SqlError::UnsupportedType(_)));
     }
 
     #[test]
     fn test_invalid_sql() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        let err = execute(&tx, "NOT VALID SQL AT ALL ???").unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = execute(&mut tx, "NOT VALID SQL AT ALL ???").unwrap_err();
         assert!(matches!(err, SqlError::Parse(_)));
     }
 
     #[test]
     fn test_unsupported_statement() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         // Try to delete from non-existent table - should fail with table not found
-        let err = execute(&tx, "DELETE FROM nonexistent WHERE id = 1").unwrap_err();
+        let err = execute(&mut tx, "DELETE FROM nonexistent WHERE id = 1").unwrap_err();
         assert!(matches!(
             err,
             SqlError::Database(DatabaseError::TableNotFound(_))
@@ -758,10 +788,14 @@ mod tests {
     #[test]
     fn test_create_index() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
-        execute(&tx, "CREATE INDEX idx_name ON users (name)").unwrap();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(&mut tx, "CREATE INDEX idx_name ON users (name)").unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)",
+        )
+        .unwrap();
 
         // Index should be usable via scan_by_index
         let rows = tx
@@ -774,10 +808,10 @@ mod tests {
     #[test]
     fn test_create_index_backfills() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (10), (20), (30)").unwrap();
-        execute(&tx, "CREATE INDEX idx_x ON t (x)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (10), (20), (30)").unwrap();
+        execute(&mut tx, "CREATE INDEX idx_x ON t (x)").unwrap();
 
         let key_20 = 20i64.to_be_bytes().to_vec();
         let rows = tx
@@ -791,14 +825,14 @@ mod tests {
     fn test_create_index_persists_after_commit() {
         let (db, _tmp) = open_db();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (name TEXT, age INTEGER)").unwrap();
-        execute(&tx, "CREATE INDEX idx_name ON t (name)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES ('Alice', 30)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (name TEXT, age INTEGER)").unwrap();
+        execute(&mut tx, "CREATE INDEX idx_name ON t (name)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES ('Alice', 30)").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "INSERT INTO t VALUES ('Bob', 25)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "INSERT INTO t VALUES ('Bob', 25)").unwrap();
         tx.commit().unwrap();
 
         let tx = db.begin_transaction();
@@ -812,25 +846,29 @@ mod tests {
     #[test]
     fn test_create_index_duplicate_error() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
-        execute(&tx, "CREATE INDEX idx1 ON t (x)").unwrap();
-        let err = execute(&tx, "CREATE INDEX idx2 ON t (x)").unwrap_err();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&mut tx, "CREATE INDEX idx1 ON t (x)").unwrap();
+        let err = execute(&mut tx, "CREATE INDEX idx2 ON t (x)").unwrap_err();
         assert!(matches!(err, SqlError::Database(_)));
     }
 
     #[test]
     fn test_select_star() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)",
+        )
+        .unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM users").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 2);
         // 3 columns: _rowid + name + age
         assert_eq!(rows[0].values.len(), 3);
@@ -839,15 +877,15 @@ mod tests {
     #[test]
     fn test_select_columns() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE users (name TEXT, age INTEGER, active BOOLEAN)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30, true)").unwrap();
+        execute(&mut tx, "INSERT INTO users VALUES ('Alice', 30, true)").unwrap();
 
-        let rows = execute(&tx, "SELECT age, name FROM users").unwrap();
+        let rows = execute(&mut tx, "SELECT age, name FROM users").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.len(), 2);
         assert_eq!(rows[0].values[0], DbValue::Integer(30));
@@ -857,43 +895,53 @@ mod tests {
     #[test]
     fn test_select_where_eq() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 30)",
         )
         .unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM users WHERE age = 30").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM users WHERE age = 30").unwrap();
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn test_select_where_comparison() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (10), (20), (30), (40)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (10), (20), (30), (40)").unwrap();
 
         assert_eq!(
-            execute(&tx, "SELECT * FROM t WHERE x > 20").unwrap().len(),
+            execute(&mut tx, "SELECT * FROM t WHERE x > 20")
+                .unwrap()
+                .len(),
             2
         );
         assert_eq!(
-            execute(&tx, "SELECT * FROM t WHERE x >= 20").unwrap().len(),
+            execute(&mut tx, "SELECT * FROM t WHERE x >= 20")
+                .unwrap()
+                .len(),
             3
         );
         assert_eq!(
-            execute(&tx, "SELECT * FROM t WHERE x < 20").unwrap().len(),
+            execute(&mut tx, "SELECT * FROM t WHERE x < 20")
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            execute(&tx, "SELECT * FROM t WHERE x <= 20").unwrap().len(),
+            execute(&mut tx, "SELECT * FROM t WHERE x <= 20")
+                .unwrap()
+                .len(),
             2
         );
         assert_eq!(
-            execute(&tx, "SELECT * FROM t WHERE x <> 20").unwrap().len(),
+            execute(&mut tx, "SELECT * FROM t WHERE x <> 20")
+                .unwrap()
+                .len(),
             3
         );
     }
@@ -901,57 +949,61 @@ mod tests {
     #[test]
     fn test_select_where_and_or() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t WHERE a >= 2 AND b <= 20").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t WHERE a >= 2 AND b <= 20").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[1], DbValue::Integer(2));
 
-        let rows = execute(&tx, "SELECT * FROM t WHERE a = 1 OR a = 3").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t WHERE a = 1 OR a = 3").unwrap();
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn test_select_where_is_null() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO t VALUES (1, 'hello'), (2, NULL), (NULL, 'world')",
         )
         .unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t WHERE b IS NULL").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t WHERE b IS NULL").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[1], DbValue::Integer(2));
 
-        let rows = execute(&tx, "SELECT * FROM t WHERE a IS NOT NULL").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t WHERE a IS NOT NULL").unwrap();
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn test_select_where_null_comparison() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (a INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1), (NULL)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (a INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1), (NULL)").unwrap();
 
         // NULL = NULL should be false (SQL semantics)
-        let rows = execute(&tx, "SELECT * FROM t WHERE a = NULL").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t WHERE a = NULL").unwrap();
         assert_eq!(rows.len(), 0);
     }
 
     #[test]
     fn test_select_where_string() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (name TEXT)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES ('Alice'), ('Bob'), ('Charlie')").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (name TEXT)").unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO t VALUES ('Alice'), ('Bob'), ('Charlie')",
+        )
+        .unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t WHERE name = 'Bob'").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t WHERE name = 'Bob'").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[1], DbValue::Text("Bob".into()));
     }
@@ -959,10 +1011,10 @@ mod tests {
     #[test]
     fn test_select_empty_result() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (a INTEGER)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (a INTEGER)").unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert!(rows.is_empty());
     }
 
@@ -970,13 +1022,17 @@ mod tests {
     fn test_insert_visible_after_commit() {
         let (db, _tmp) = open_db();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)",
+        )
+        .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let rows = execute(&tx, "SELECT * FROM users").unwrap();
+        let mut tx = db.begin_transaction();
+        let rows = execute(&mut tx, "SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values[1], DbValue::Text("Alice".into()));
         assert_eq!(rows[0].values[2], DbValue::Integer(30));
@@ -988,16 +1044,16 @@ mod tests {
     fn test_insert_not_visible_after_rollback() {
         let (db, _tmp) = open_db();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "INSERT INTO users VALUES ('Alice', 30)").unwrap();
         drop(tx); // rollback
 
-        let tx = db.begin_transaction();
-        let rows = execute(&tx, "SELECT * FROM users").unwrap();
+        let mut tx = db.begin_transaction();
+        let rows = execute(&mut tx, "SELECT * FROM users").unwrap();
         assert!(rows.is_empty());
     }
 
@@ -1005,13 +1061,13 @@ mod tests {
     fn test_create_table_visible_after_commit() {
         let (db, _tmp) = open_db();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "INSERT INTO t VALUES (42)").unwrap();
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "INSERT INTO t VALUES (42)").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[1], DbValue::Integer(42));
     }
@@ -1020,21 +1076,21 @@ mod tests {
     fn test_select_across_commits() {
         let (db, _tmp) = open_db();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1)").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "INSERT INTO t VALUES (2)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "INSERT INTO t VALUES (2)").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "INSERT INTO t VALUES (3)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "INSERT INTO t VALUES (3)").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let rows = execute(&tx, "SELECT * FROM t WHERE x >= 2").unwrap();
+        let mut tx = db.begin_transaction();
+        let rows = execute(&mut tx, "SELECT * FROM t WHERE x >= 2").unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -1043,9 +1099,9 @@ mod tests {
         use crate::{DbValue, Row};
 
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE t (
                 a BIGINT,
                 b CHAR(10),
@@ -1085,9 +1141,9 @@ mod tests {
     #[test]
     fn test_sql_create_table_with_primary_key() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
         )
         .unwrap();
@@ -1101,14 +1157,14 @@ mod tests {
     #[test]
     fn test_sql_insert_with_explicit_pk() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO items VALUES (10, 'widget')").unwrap();
-        execute(&tx, "INSERT INTO items VALUES (20, 'gadget')").unwrap();
+        execute(&mut tx, "INSERT INTO items VALUES (10, 'widget')").unwrap();
+        execute(&mut tx, "INSERT INTO items VALUES (20, 'gadget')").unwrap();
 
         // B-tree key should match PK value
         let row = tx.get("items", 10).unwrap().unwrap();
@@ -1122,14 +1178,14 @@ mod tests {
     #[test]
     fn test_sql_duplicate_pk_error() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO items VALUES (1, 'a')").unwrap();
-        let err = execute(&tx, "INSERT INTO items VALUES (1, 'b')").unwrap_err();
+        execute(&mut tx, "INSERT INTO items VALUES (1, 'a')").unwrap();
+        let err = execute(&mut tx, "INSERT INTO items VALUES (1, 'b')").unwrap_err();
         assert!(matches!(
             err,
             SqlError::Database(DatabaseError::DuplicateKey(1))
@@ -1139,15 +1195,15 @@ mod tests {
     #[test]
     fn test_sql_select_with_pk_table() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO items VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+        execute(&mut tx, "INSERT INTO items VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
 
-        let rows = execute(&tx, "SELECT name FROM items WHERE id = 2").unwrap();
+        let rows = execute(&mut tx, "SELECT name FROM items WHERE id = 2").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], DbValue::Text("Bob".into()));
     }
@@ -1155,12 +1211,12 @@ mod tests {
     #[test]
     fn test_sql_implicit_rowid_not_in_insert() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
         // INSERT without column list should not require _rowid
-        execute(&tx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
 
-        let rows = execute(&tx, "SELECT x, y FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT x, y FROM t").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values[0], DbValue::Integer(1));
         assert_eq!(rows[0].values[1], DbValue::Text("a".into()));
@@ -1169,12 +1225,12 @@ mod tests {
     #[test]
     fn test_sql_select_rowid() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (100)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (100)").unwrap();
 
         // _rowid is queryable via SELECT
-        let rows = execute(&tx, "SELECT _rowid, x FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT _rowid, x FROM t").unwrap();
         assert_eq!(rows.len(), 1);
         // _rowid should be auto-assigned (0)
         assert_eq!(rows[0].values[0], DbValue::Integer(0));
@@ -1186,16 +1242,16 @@ mod tests {
     #[test]
     fn test_select_uses_index_for_eq() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
-        execute(&tx, "CREATE INDEX idx_name ON users (name)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(&mut tx, "CREATE INDEX idx_name ON users (name)").unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 30)",
         )
         .unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM users WHERE name = 'Bob'").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM users WHERE name = 'Bob'").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[1], DbValue::Text("Bob".into()));
         assert_eq!(rows[0].values[2], DbValue::Integer(25));
@@ -1204,16 +1260,16 @@ mod tests {
     #[test]
     fn test_select_uses_index_multiple_matches() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
-        execute(&tx, "CREATE INDEX idx_x ON t (x)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        execute(&mut tx, "CREATE INDEX idx_x ON t (x)").unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (1, 'c'), (3, 'd'), (1, 'e')",
         )
         .unwrap();
 
-        let rows = execute(&tx, "SELECT y FROM t WHERE x = 1").unwrap();
+        let rows = execute(&mut tx, "SELECT y FROM t WHERE x = 1").unwrap();
         assert_eq!(rows.len(), 3);
         let mut vals: Vec<String> = rows
             .iter()
@@ -1229,37 +1285,37 @@ mod tests {
     #[test]
     fn test_select_pk_point_lookup() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
         )
         .unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO items VALUES (10, 'widget'), (20, 'gadget'), (30, 'doohickey')",
         )
         .unwrap();
 
-        let rows = execute(&tx, "SELECT name FROM items WHERE id = 20").unwrap();
+        let rows = execute(&mut tx, "SELECT name FROM items WHERE id = 20").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], DbValue::Text("gadget".into()));
 
         // Non-existent PK
-        let rows = execute(&tx, "SELECT name FROM items WHERE id = 99").unwrap();
+        let rows = execute(&mut tx, "SELECT name FROM items WHERE id = 99").unwrap();
         assert!(rows.is_empty());
     }
 
     #[test]
     fn test_select_eq_no_index_falls_back() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
         // No index created
-        execute(&tx, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (1, 'c')").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (1, 'c')").unwrap();
 
         // Should still work via full scan fallback
-        let rows = execute(&tx, "SELECT y FROM t WHERE x = 1").unwrap();
+        let rows = execute(&mut tx, "SELECT y FROM t WHERE x = 1").unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -1268,14 +1324,18 @@ mod tests {
     #[test]
     fn test_update_basic() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25)",
+        )
+        .unwrap();
 
         // Update a single column
-        execute(&tx, "UPDATE users SET age = 31 WHERE name = 'Alice'").unwrap();
+        execute(&mut tx, "UPDATE users SET age = 31 WHERE name = 'Alice'").unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM users WHERE name = 'Alice'").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM users WHERE name = 'Alice'").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[1], DbValue::Text("Alice".into()));
         assert_eq!(rows[0].values[2], DbValue::Integer(31));
@@ -1284,26 +1344,26 @@ mod tests {
     #[test]
     fn test_update_multiple_columns() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE users (name TEXT, age INTEGER, city TEXT)",
         )
         .unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO users VALUES ('Alice', 30, 'NYC'), ('Bob', 25, 'LA')",
         )
         .unwrap();
 
         // Update multiple columns
         execute(
-            &tx,
+            &mut tx,
             "UPDATE users SET age = 31, city = 'Boston' WHERE name = 'Alice'",
         )
         .unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM users WHERE name = 'Alice'").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM users WHERE name = 'Alice'").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[2], DbValue::Integer(31));
         assert_eq!(rows[0].values[3], DbValue::Text("Boston".into()));
@@ -1312,14 +1372,14 @@ mod tests {
     #[test]
     fn test_update_all_rows() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1), (2), (3)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1), (2), (3)").unwrap();
 
         // Update without WHERE clause updates all rows
-        execute(&tx, "UPDATE t SET x = 10").unwrap();
+        execute(&mut tx, "UPDATE t SET x = 10").unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows.len(), 3);
         for row in rows {
             assert_eq!(row.values[1], DbValue::Integer(10));
@@ -1329,14 +1389,18 @@ mod tests {
     #[test]
     fn test_update_multiple_rows() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER, active BOOLEAN)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1, true), (2, true), (3, false)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER, active BOOLEAN)").unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO t VALUES (1, true), (2, true), (3, false)",
+        )
+        .unwrap();
 
         // Update multiple matching rows
-        execute(&tx, "UPDATE t SET active = false WHERE x <= 2").unwrap();
+        execute(&mut tx, "UPDATE t SET active = false WHERE x <= 2").unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows.len(), 3);
 
         // First two should be false now
@@ -1350,14 +1414,14 @@ mod tests {
     #[test]
     fn test_update_with_expression() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1, 'hello'), (2, 'world')").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1, 'hello'), (2, 'world')").unwrap();
 
         // Update with literal value (not computed expressions yet, but test existing value)
-        execute(&tx, "UPDATE t SET y = 'updated' WHERE x = 1").unwrap();
+        execute(&mut tx, "UPDATE t SET y = 'updated' WHERE x = 1").unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t WHERE x = 1").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t WHERE x = 1").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[2], DbValue::Text("updated".into()));
     }
@@ -1365,14 +1429,14 @@ mod tests {
     #[test]
     fn test_update_to_null() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1, 'hello')").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1, 'hello')").unwrap();
 
         // Update to NULL
-        execute(&tx, "UPDATE t SET y = NULL WHERE x = 1").unwrap();
+        execute(&mut tx, "UPDATE t SET y = NULL WHERE x = 1").unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[2], DbValue::Null);
     }
@@ -1380,14 +1444,14 @@ mod tests {
     #[test]
     fn test_update_no_matching_rows() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1), (2)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1), (2)").unwrap();
 
         // This should succeed but update no rows
-        execute(&tx, "UPDATE t SET x = 99 WHERE x = 100").unwrap();
+        execute(&mut tx, "UPDATE t SET x = 99 WHERE x = 100").unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values[1], DbValue::Integer(1));
         assert_eq!(rows[1].values[1], DbValue::Integer(2));
@@ -1396,18 +1460,22 @@ mod tests {
     #[test]
     fn test_update_with_complex_where() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT)").unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 15, 'z')",
         )
         .unwrap();
 
         // Update with AND condition
-        execute(&tx, "UPDATE t SET c = 'updated' WHERE a >= 2 AND b <= 20").unwrap();
+        execute(
+            &mut tx,
+            "UPDATE t SET c = 'updated' WHERE a >= 2 AND b <= 20",
+        )
+        .unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows.len(), 3);
         // Should update rows 2 and 3 (a >= 2 AND b <= 20)
         assert_eq!(rows[0].values[3], DbValue::Text("x".into())); // a=1, not updated
@@ -1418,20 +1486,20 @@ mod tests {
     #[test]
     fn test_update_with_pk_table() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)",
         )
         .unwrap();
         execute(
-            &tx,
+            &mut tx,
             "INSERT INTO items VALUES (1, 'widget', 9.99), (2, 'gadget', 19.99)",
         )
         .unwrap();
 
         // Update by PK
-        execute(&tx, "UPDATE items SET price = 15.50 WHERE id = 2").unwrap();
+        execute(&mut tx, "UPDATE items SET price = 15.50 WHERE id = 2").unwrap();
 
         let row = tx.get("items", 2).unwrap().unwrap();
         assert_eq!(row.values[0], DbValue::Integer(2)); // id column
@@ -1442,22 +1510,22 @@ mod tests {
     #[test]
     fn test_update_different_types() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         execute(
-            &tx,
+            &mut tx,
             "CREATE TABLE t (i INTEGER, f FLOAT, t TEXT, b BOOLEAN)",
         )
         .unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1, 1.0, 'a', true)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1, 1.0, 'a', true)").unwrap();
 
         // Update different column types
         execute(
-            &tx,
+            &mut tx,
             "UPDATE t SET i = 42, f = 3.14, t = 'updated', b = false WHERE i = 1",
         )
         .unwrap();
 
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows[0].values[1], DbValue::Integer(42));
         assert_eq!(rows[0].values[2], DbValue::Float(3.14));
         assert_eq!(rows[0].values[3], DbValue::Text("updated".into()));
@@ -1468,17 +1536,17 @@ mod tests {
     fn test_update_visible_after_commit() {
         let (db, _tmp) = open_db();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "CREATE TABLE t (x INTEGER)").unwrap();
-        execute(&tx, "INSERT INTO t VALUES (1)").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE t (x INTEGER)").unwrap();
+        execute(&mut tx, "INSERT INTO t VALUES (1)").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        execute(&tx, "UPDATE t SET x = 99").unwrap();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "UPDATE t SET x = 99").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let rows = execute(&tx, "SELECT * FROM t").unwrap();
+        let mut tx = db.begin_transaction();
+        let rows = execute(&mut tx, "SELECT * FROM t").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[1], DbValue::Integer(99));
     }

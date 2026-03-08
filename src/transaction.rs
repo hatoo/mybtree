@@ -231,8 +231,30 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             .range_reads
             .push((root, range_bound.0.clone(), range_bound.1.clone()));
 
+        let writes = active_transactions
+            .writes
+            .iter()
+            .filter(|((r, _k), v)| *r == root && v.is_some())
+            .map(|((_, k), v)| (*k, v.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut last_key = 0;
         btree.read_range_map(root, range_bound.clone(), |btree, k, v| {
             active_transactions.reads.insert((root, k));
+
+            // check active writes between last_key and k for this root
+            for (&write_key, value) in writes.range(last_key..k) {
+                if let Some(v) = value {
+                    let me = LockedTransaction {
+                        btree,
+                        active_transactions,
+                    };
+                    if f(me, write_key, v)? {
+                        return Ok(true);
+                    }
+                }
+            }
+
+            last_key = k.checked_add(1).unwrap_or(u64::MAX);
 
             // check active writes
             if let Some(v) = active_transactions.writes.get(&(root, k)) {
@@ -254,7 +276,21 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
 
                 f(me, k, v)
             }
-        })
+        })?;
+        // check active writes between last_key and k for this root
+        for (&write_key, value) in writes.range((Bound::Included(last_key), range_bound.1.clone()))
+        {
+            if let Some(v) = value {
+                let me = LockedTransaction {
+                    btree,
+                    active_transactions,
+                };
+                if f(me, write_key, v)? {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
