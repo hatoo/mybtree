@@ -301,6 +301,50 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
     pub fn remove(&mut self, root: NodePtr, key: Key) {
         self.active_transactions.writes.insert((root, key), None);
     }
+
+    pub fn available_key(&mut self, root: NodePtr) -> Result<Key, TreeError> {
+        let mut key = self.btree.available_key(root)?;
+
+        // Also consider keys from all active transactions' writes for the same root
+        if let Some(&(_, max_write_key)) = self
+            .active_transactions
+            .writes
+            .keys()
+            .rev()
+            .find(|&&(r, _k)| r == root && self.active_transactions.writes[&(r, _k)].is_some())
+        {
+            let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
+            if candidate > key {
+                key = candidate;
+            }
+        }
+
+        Ok(key)
+    }
+
+    pub fn insert(&mut self, root: NodePtr, value: Vec<u8>) -> Result<Key, TreeError> {
+        let mut key = self.btree.available_key(root)?;
+
+        // Also consider keys from all active transactions' writes for the same root
+        if let Some(&(_, max_write_key)) = self
+            .active_transactions
+            .writes
+            .keys()
+            .rev()
+            .find(|&&(r, k)| r == root && self.active_transactions.writes[&(r, k)].is_some())
+        {
+            let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
+            if candidate > key {
+                key = candidate;
+            }
+        }
+
+        self.active_transactions
+            .writes
+            .insert((root, key), Some(value));
+
+        Ok(key)
+    }
 }
 
 impl<'a, const N: usize> Transaction<'a, N> {
