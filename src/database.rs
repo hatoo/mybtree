@@ -4,7 +4,7 @@ use rkyv::rancor::Error;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::Pager;
-use crate::transaction::{TransactionError, TransactionStore};
+use crate::transaction::{LockedTransaction, TransactionError, TransactionStore};
 use crate::tree::Btree;
 use crate::types::{Key, NodePtr};
 
@@ -192,7 +192,43 @@ pub struct DbTransaction<'a, const N: usize> {
     tx: crate::Transaction<'a, N>,
 }
 
+pub struct LockedDbTransaction<'a, const N: usize> {
+    tx: LockedTransaction<'a, N>,
+}
+
+impl<'a, const N: usize> LockedDbTransaction<'a, N> {
+    fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
+        if let Some(catalog_key) = self
+            .tx
+            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
+        {
+            if let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)? {
+                let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
+                return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn scan(
+        &mut self,
+        table_name: &str,
+        range: impl RangeBounds<Key>,
+        f: FnMut(&mut Self, Key, Row) -> bool,
+    ) -> Result<(), DatabaseError> {
+        let meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        self.tx.read_range(meta.r, range, f)
+    }
+}
+
 impl<'a, const N: usize> DbTransaction<'a, N> {
+    pub fn with_lock(&mut self, mut f: impl FnMut(LockedDbTransaction<'_, N>)) {
+        self.tx.with_lock(|tx| f(LockedDbTransaction { tx }));
+    }
+
     fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
         if let Some(catalog_key) = self
             .tx

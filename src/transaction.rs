@@ -164,6 +164,44 @@ impl<const N: usize> TransactionStore<N> {
 }
 
 impl<'a, const N: usize> LockedTransaction<'a, N> {
+    pub fn index_read(
+        &mut self,
+        idx_root: NodePtr,
+        value: &[u8],
+    ) -> Result<Option<Key>, TreeError> {
+        let value_bytes = value.to_vec();
+
+        self.active_transactions
+            .index_reads
+            .insert((idx_root, value_bytes.clone()));
+
+        // Check local overlay: find a locally inserted entry
+        let start = (idx_root, value_bytes.clone(), 0u64);
+        let end = (idx_root, value_bytes.clone(), u64::MAX);
+        for ((_, _, k), is_insert) in self.active_transactions.index_ops.range(start..=end) {
+            if *is_insert {
+                return Ok(Some(*k));
+            }
+        }
+
+        // Read from btree
+        let btree_key = self.btree.index_read(idx_root, value)?;
+
+        if let Some(key) = btree_key {
+            if self
+                .active_transactions
+                .index_ops
+                .get(&(idx_root, value_bytes, key))
+                == Some(&false)
+            {
+                return Ok(None);
+            }
+            return Ok(Some(key));
+        }
+
+        Ok(None)
+    }
+
     pub fn read_range<F>(
         &mut self,
         root: NodePtr,
@@ -210,7 +248,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
 }
 
 impl<'a, const N: usize> Transaction<'a, N> {
-    pub fn with_lock(&mut self, mut f: impl FnMut(LockedTransaction<'_, N>)) {
+    pub fn with_lock<T>(&mut self, mut f: impl FnMut(LockedTransaction<'_, N>) -> T) -> T {
         let mut inner = self.store.lock().unwrap();
         let &mut TransactionStoreInner {
             ref mut btree,
