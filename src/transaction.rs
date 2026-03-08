@@ -165,42 +165,24 @@ impl<const N: usize> TransactionStore<N> {
 }
 
 impl<'a, const N: usize> LockedTransaction<'a, N> {
-    pub fn index_read(
-        &mut self,
-        idx_root: NodePtr,
-        value: &[u8],
-    ) -> Result<Option<Key>, TreeError> {
-        let value_bytes = value.to_vec();
+    pub fn available_key(&mut self, root: NodePtr) -> Result<Key, TreeError> {
+        let mut key = self.btree.available_key(root)?;
 
-        self.active_transactions
-            .index_reads
-            .insert((idx_root, value_bytes.clone()));
-
-        // Check local overlay: find a locally inserted entry
-        let start = (idx_root, value_bytes.clone(), 0u64);
-        let end = (idx_root, value_bytes.clone(), u64::MAX);
-        for ((_, _, k), is_insert) in self.active_transactions.index_ops.range(start..=end) {
-            if *is_insert {
-                return Ok(Some(*k));
+        // Also consider keys from all active transactions' writes for the same root
+        if let Some(&(_, max_write_key)) = self
+            .active_transactions
+            .writes
+            .keys()
+            .rev()
+            .find(|&&(r, _k)| r == root && self.active_transactions.writes[&(r, _k)].is_some())
+        {
+            let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
+            if candidate > key {
+                key = candidate;
             }
         }
 
-        // Read from btree
-        let btree_key = self.btree.index_read(idx_root, value)?;
-
-        if let Some(key) = btree_key {
-            if self
-                .active_transactions
-                .index_ops
-                .get(&(idx_root, value_bytes, key))
-                == Some(&false)
-            {
-                return Ok(None);
-            }
-            return Ok(Some(key));
-        }
-
-        Ok(None)
+        Ok(key)
     }
 
     pub fn read(&mut self, root: NodePtr, key: Key) -> Result<Option<Cow<'_, [u8]>>, TreeError> {
@@ -302,26 +284,6 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         self.active_transactions.writes.insert((root, key), None);
     }
 
-    pub fn available_key(&mut self, root: NodePtr) -> Result<Key, TreeError> {
-        let mut key = self.btree.available_key(root)?;
-
-        // Also consider keys from all active transactions' writes for the same root
-        if let Some(&(_, max_write_key)) = self
-            .active_transactions
-            .writes
-            .keys()
-            .rev()
-            .find(|&&(r, _k)| r == root && self.active_transactions.writes[&(r, _k)].is_some())
-        {
-            let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
-            if candidate > key {
-                key = candidate;
-            }
-        }
-
-        Ok(key)
-    }
-
     pub fn insert(&mut self, root: NodePtr, value: Vec<u8>) -> Result<Key, TreeError> {
         let mut key = self.btree.available_key(root)?;
 
@@ -386,6 +348,55 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         Ok(())
     }
 
+    // ── Index tree operations (deferred, with local overlay) ────────
+
+    pub fn index_read(
+        &mut self,
+        idx_root: NodePtr,
+        value: &[u8],
+    ) -> Result<Option<Key>, TreeError> {
+        let value_bytes = value.to_vec();
+
+        self.active_transactions
+            .index_reads
+            .insert((idx_root, value_bytes.clone()));
+
+        // Check local overlay: find a locally inserted entry
+        let start = (idx_root, value_bytes.clone(), 0u64);
+        let end = (idx_root, value_bytes.clone(), u64::MAX);
+        for ((_, _, k), is_insert) in self.active_transactions.index_ops.range(start..=end) {
+            if *is_insert {
+                return Ok(Some(*k));
+            }
+        }
+
+        // Read from btree
+        let btree_key = self.btree.index_read(idx_root, value)?;
+
+        if let Some(key) = btree_key {
+            if self
+                .active_transactions
+                .index_ops
+                .get(&(idx_root, value_bytes, key))
+                == Some(&false)
+            {
+                return Ok(None);
+            }
+            return Ok(Some(key));
+        }
+
+        Ok(None)
+    }
+
+    pub fn index_remove(&mut self, idx_root: NodePtr, value: &[u8], key: Key) {
+        self.active_transactions
+            .index_writes
+            .insert((idx_root, value.to_vec()));
+        self.active_transactions
+            .index_ops
+            .insert((idx_root, value.to_vec(), key), false);
+    }
+
     // ── Structural operations ──────────────────────────────────────
 
     pub fn init_tree(&mut self) -> Result<NodePtr, TreeError> {
@@ -398,6 +409,18 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         let page = self.btree.init_index()?;
         self.active_transactions.deferred_init_indexes.push(page);
         Ok(page)
+    }
+
+    pub fn free_tree(&mut self, root: NodePtr) -> Result<(), TreeError> {
+        self.active_transactions.deferred_free_trees.push(root);
+        Ok(())
+    }
+
+    pub fn free_index_tree(&mut self, root: NodePtr) -> Result<(), TreeError> {
+        self.active_transactions
+            .deferred_free_index_trees
+            .push(root);
+        Ok(())
     }
 }
 
