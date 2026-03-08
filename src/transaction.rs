@@ -388,6 +388,15 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         Ok(None)
     }
 
+    pub fn index_insert(&mut self, idx_root: NodePtr, key: Key, value: Vec<u8>) {
+        self.active_transactions
+            .index_writes
+            .insert((idx_root, value.clone()));
+        self.active_transactions
+            .index_ops
+            .insert((idx_root, value, key), true);
+    }
+
     pub fn index_remove(&mut self, idx_root: NodePtr, value: &[u8], key: Key) {
         self.active_transactions
             .index_writes
@@ -395,6 +404,19 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         self.active_transactions
             .index_ops
             .insert((idx_root, value.to_vec(), key), false);
+    }
+
+    pub fn index_read_range<'b, R: RangeBounds<&'b [u8]>, F, E>(
+        &self,
+        idx_root: NodePtr,
+        range: R,
+        mut f: F,
+    ) -> Result<Vec<Key>, E>
+    where
+        for<'local> F: FnMut(LockedTransaction<'local, N>, Key, &[u8]) -> Result<bool, E>,
+        E: From<TreeError>,
+    {
+        todo!()
     }
 
     // ── Structural operations ──────────────────────────────────────
