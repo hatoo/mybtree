@@ -530,6 +530,7 @@ pub fn execute<const N: usize>(
 mod tests {
     use super::*;
     use crate::{Database, Pager};
+    use std::ops::RangeBounds;
     use std::fs;
     use tempfile::NamedTempFile;
 
@@ -543,6 +544,67 @@ mod tests {
         let pager = Pager::<4096>::new(file);
         let db = Database::create(pager).unwrap();
         (db, temp)
+    }
+
+    fn with_locked<const N: usize, T>(
+        tx: &mut DbTransaction<'_, N>,
+        f: impl FnOnce(&mut LockedDbTransaction<'_, N>) -> T,
+    ) -> T {
+        tx.with_lock(|mut locked| f(&mut locked))
+    }
+
+    fn insert<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        row: &Row,
+    ) -> Result<crate::types::Key, DatabaseError> {
+        with_locked(tx, |tx| tx.insert(table_name, row))
+    }
+
+    fn get<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        key: crate::types::Key,
+    ) -> Result<Option<Row>, DatabaseError> {
+        with_locked(tx, |tx| tx.get(table_name, key))
+    }
+
+    fn scan<const N: usize, R: RangeBounds<crate::types::Key>>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        range: R,
+    ) -> Result<Vec<(crate::types::Key, Row)>, DatabaseError> {
+        let mut rows = Vec::new();
+        with_locked(tx, |tx| {
+            tx.scan(table_name, range, |_, key, row| {
+                rows.push((key, rkyv::deserialize::<Row, rkyv::rancor::Error>(row)?));
+                Ok::<_, DatabaseError>(false)
+            })
+        })?;
+        Ok(rows)
+    }
+
+    fn scan_by_index<'b, const N: usize, R: RangeBounds<&'b [u8]>>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        column_name: &str,
+        range: R,
+    ) -> Result<Vec<(crate::types::Key, Row)>, DatabaseError> {
+        let mut rows = Vec::new();
+        with_locked(tx, |tx| {
+            tx.scan_by_index(table_name, column_name, range, |_, row, key| {
+                rows.push((key, rkyv::deserialize::<Row, rkyv::rancor::Error>(row)?));
+                Ok::<_, DatabaseError>(false)
+            })
+        })?;
+        Ok(rows)
+    }
+
+    fn get_schema<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+    ) -> Result<Schema, DatabaseError> {
+        with_locked(tx, |tx| tx.get_schema(table_name))
     }
 
     #[test]
@@ -563,28 +625,28 @@ mod tests {
         .unwrap();
 
         // Verify by inserting a valid row with all types (prepend _rowid Null)
-        let key = tx
-            .insert(
-                "items",
-                &Row {
-                    values: vec![
-                        DbValue::Null, // _rowid
-                        DbValue::Integer(1),
-                        DbValue::Text("widget".into()),
-                        DbValue::Float(9.99),
-                        DbValue::Bool(true),
-                    ],
-                },
-            )
-            .unwrap();
-        let row = tx.get("items", key).unwrap().unwrap();
+        let key = insert(
+            &mut tx,
+            "items",
+            &Row {
+                values: vec![
+                    DbValue::Null, // _rowid
+                    DbValue::Integer(1),
+                    DbValue::Text("widget".into()),
+                    DbValue::Float(9.99),
+                    DbValue::Bool(true),
+                ],
+            },
+        )
+        .unwrap();
+        let row = get(&mut tx, "items", key).unwrap().unwrap();
         assert_eq!(row.values[1], DbValue::Integer(1));
         assert_eq!(row.values[2], DbValue::Text("widget".into()));
         assert_eq!(row.values[3], DbValue::Float(9.99));
         assert_eq!(row.values[4], DbValue::Bool(true));
 
         // Nullable columns accept null
-        tx.insert(
+        insert(&mut tx, 
             "items",
             &Row {
                 values: vec![
@@ -599,20 +661,20 @@ mod tests {
         .unwrap();
 
         // NOT NULL columns reject null (id column)
-        let err = tx
-            .insert(
-                "items",
-                &Row {
-                    values: vec![
-                        DbValue::Null, // _rowid
-                        DbValue::Null,
-                        DbValue::Text("bad".into()),
-                        DbValue::Null,
-                        DbValue::Null,
-                    ],
-                },
-            )
-            .unwrap_err();
+        let err = insert(
+            &mut tx,
+            "items",
+            &Row {
+                values: vec![
+                    DbValue::Null, // _rowid
+                    DbValue::Null,
+                    DbValue::Text("bad".into()),
+                    DbValue::Null,
+                    DbValue::Null,
+                ],
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
@@ -629,7 +691,7 @@ mod tests {
         .unwrap();
 
         // b and d are nullable, a and c are NOT NULL
-        tx.insert(
+        insert(&mut tx, 
             "t",
             &Row {
                 values: vec![
@@ -644,37 +706,37 @@ mod tests {
         .unwrap();
 
         // a is NOT NULL — should reject
-        let err = tx
-            .insert(
-                "t",
-                &Row {
-                    values: vec![
-                        DbValue::Null, // _rowid
-                        DbValue::Null,
-                        DbValue::Integer(1),
-                        DbValue::Text("x".into()),
-                        DbValue::Null,
-                    ],
-                },
-            )
-            .unwrap_err();
+        let err = insert(
+            &mut tx,
+            "t",
+            &Row {
+                values: vec![
+                    DbValue::Null, // _rowid
+                    DbValue::Null,
+                    DbValue::Integer(1),
+                    DbValue::Text("x".into()),
+                    DbValue::Null,
+                ],
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
 
         // c is NOT NULL — should reject
-        let err = tx
-            .insert(
-                "t",
-                &Row {
-                    values: vec![
-                        DbValue::Null, // _rowid
-                        DbValue::Integer(1),
-                        DbValue::Null,
-                        DbValue::Null,
-                        DbValue::Null,
-                    ],
-                },
-            )
-            .unwrap_err();
+        let err = insert(
+            &mut tx,
+            "t",
+            &Row {
+                values: vec![
+                    DbValue::Null, // _rowid
+                    DbValue::Integer(1),
+                    DbValue::Null,
+                    DbValue::Null,
+                    DbValue::Null,
+                ],
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
@@ -689,7 +751,7 @@ mod tests {
         .unwrap();
         execute(&mut tx, "INSERT INTO users VALUES ('Alice', 30)").unwrap();
 
-        let rows = tx.scan("users", ..).unwrap();
+        let rows = scan(&mut tx, "users", ..).unwrap();
         assert_eq!(rows.len(), 1);
         // values[0] = _rowid, values[1] = name, values[2] = age
         assert_eq!(rows[0].1.values[1], DbValue::Text("Alice".into()));
@@ -711,7 +773,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = tx.scan("users", ..).unwrap();
+        let rows = scan(&mut tx, "users", ..).unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -730,7 +792,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = tx.scan("users", ..).unwrap();
+        let rows = scan(&mut tx, "users", ..).unwrap();
         assert_eq!(rows.len(), 1);
         // values[0] = _rowid, values[1] = name, values[2] = age, values[3] = active
         assert_eq!(rows[0].1.values[1], DbValue::Text("Alice".into()));
@@ -749,7 +811,7 @@ mod tests {
         .unwrap();
         execute(&mut tx, "INSERT INTO t VALUES (42, 3.14, 'hello', true)").unwrap();
 
-        let rows = tx.scan("t", ..).unwrap();
+        let rows = scan(&mut tx, "t", ..).unwrap();
         assert_eq!(rows[0].1.values[1], DbValue::Integer(42));
         assert_eq!(rows[0].1.values[2], DbValue::Float(3.14));
         assert_eq!(rows[0].1.values[3], DbValue::Text("hello".into()));
@@ -763,7 +825,7 @@ mod tests {
         execute(&mut tx, "CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
         execute(&mut tx, "INSERT INTO t VALUES (NULL, NULL)").unwrap();
 
-        let rows = tx.scan("t", ..).unwrap();
+        let rows = scan(&mut tx, "t", ..).unwrap();
         assert_eq!(rows[0].1.values[1], DbValue::Null);
         assert_eq!(rows[0].1.values[2], DbValue::Null);
     }
@@ -775,7 +837,7 @@ mod tests {
         execute(&mut tx, "CREATE TABLE t (i INTEGER, f FLOAT)").unwrap();
         execute(&mut tx, "INSERT INTO t VALUES (-42, -3.14)").unwrap();
 
-        let rows = tx.scan("t", ..).unwrap();
+        let rows = scan(&mut tx, "t", ..).unwrap();
         assert_eq!(rows[0].1.values[1], DbValue::Integer(-42));
         assert_eq!(rows[0].1.values[2], DbValue::Float(-3.14));
     }
@@ -830,9 +892,9 @@ mod tests {
         .unwrap();
 
         // Index should be usable via scan_by_index
-        let rows = tx
-            .scan_by_index("users", "name", b"Alice".as_ref()..=b"Alice".as_ref())
-            .unwrap();
+        let rows =
+            scan_by_index(&mut tx, "users", "name", b"Alice".as_ref()..=b"Alice".as_ref())
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[1], DbValue::Text("Alice".into()));
     }
@@ -846,8 +908,7 @@ mod tests {
         execute(&mut tx, "CREATE INDEX idx_x ON t (x)").unwrap();
 
         let key_20 = 20i64.to_be_bytes().to_vec();
-        let rows = tx
-            .scan_by_index("t", "x", key_20.as_slice()..=key_20.as_slice())
+        let rows = scan_by_index(&mut tx, "t", "x", key_20.as_slice()..=key_20.as_slice())
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[1], DbValue::Integer(20));
@@ -867,9 +928,8 @@ mod tests {
         execute(&mut tx, "INSERT INTO t VALUES ('Bob', 25)").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let rows = tx
-            .scan_by_index("t", "name", b"Bob".as_ref()..=b"Bob".as_ref())
+        let mut tx = db.begin_transaction();
+        let rows = scan_by_index(&mut tx, "t", "name", b"Bob".as_ref()..=b"Bob".as_ref())
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[2], DbValue::Integer(25));
@@ -1145,22 +1205,22 @@ mod tests {
         .unwrap();
 
         // Verify types by inserting matching values (prepend _rowid Null)
-        let key = tx
-            .insert(
-                "t",
-                &Row {
-                    values: vec![
-                        DbValue::Null,              // _rowid
-                        DbValue::Integer(42),       // BIGINT → Integer
-                        DbValue::Text("hi".into()), // CHAR → Text
-                        DbValue::Float(1.0),        // DOUBLE → Float
-                        DbValue::Float(2.0),        // REAL → Float
-                        DbValue::Bool(false),       // BOOL → Bool
-                    ],
-                },
-            )
-            .unwrap();
-        let row = tx.get("t", key).unwrap().unwrap();
+        let key = insert(
+            &mut tx,
+            "t",
+            &Row {
+                values: vec![
+                    DbValue::Null,              // _rowid
+                    DbValue::Integer(42),       // BIGINT -> Integer
+                    DbValue::Text("hi".into()), // CHAR -> Text
+                    DbValue::Float(1.0),        // DOUBLE -> Float
+                    DbValue::Float(2.0),        // REAL -> Float
+                    DbValue::Bool(false),       // BOOL -> Bool
+                ],
+            },
+        )
+        .unwrap();
+        let row = get(&mut tx, "t", key).unwrap().unwrap();
         assert_eq!(row.values[1], DbValue::Integer(42));
         assert_eq!(row.values[2], DbValue::Text("hi".into()));
         assert_eq!(row.values[3], DbValue::Float(1.0));
@@ -1180,7 +1240,7 @@ mod tests {
         )
         .unwrap();
 
-        let schema = tx.get_schema("items").unwrap();
+        let schema = get_schema(&mut tx, "items").unwrap();
         assert_eq!(schema.columns.len(), 2);
         assert_eq!(schema.columns[0].name, "id");
         assert_eq!(schema.primary_key, 0);
@@ -1199,11 +1259,11 @@ mod tests {
         execute(&mut tx, "INSERT INTO items VALUES (20, 'gadget')").unwrap();
 
         // B-tree key should match PK value
-        let row = tx.get("items", 10).unwrap().unwrap();
+        let row = get(&mut tx, "items", 10).unwrap().unwrap();
         assert_eq!(row.values[0], DbValue::Integer(10));
         assert_eq!(row.values[1], DbValue::Text("widget".into()));
 
-        let row = tx.get("items", 20).unwrap().unwrap();
+        let row = get(&mut tx, "items", 20).unwrap().unwrap();
         assert_eq!(row.values[1], DbValue::Text("gadget".into()));
     }
 
@@ -1533,7 +1593,7 @@ mod tests {
         // Update by PK
         execute(&mut tx, "UPDATE items SET price = 15.50 WHERE id = 2").unwrap();
 
-        let row = tx.get("items", 2).unwrap().unwrap();
+        let row = get(&mut tx, "items", 2).unwrap().unwrap();
         assert_eq!(row.values[0], DbValue::Integer(2)); // id column
         assert_eq!(row.values[1], DbValue::Text("gadget".into())); // name column
         assert_eq!(row.values[2], DbValue::Float(15.50)); // price column
