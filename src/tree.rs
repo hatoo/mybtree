@@ -359,22 +359,32 @@ impl<const N: usize> Btree<N> {
         root: NodePtr,
         range: impl RangeBounds<Key>,
     ) -> Result<(), TreeError> {
-        self.remove_range_at(root, &range, 0)
+        self.remove_range_at(root, &range, 0, |_, _, _| Ok((true, false)))
     }
 
-    fn remove_range_at(
+    pub fn remove_range_where<E: From<TreeError>>(
+        &mut self,
+        root: NodePtr,
+        range: impl RangeBounds<Key>,
+        f: impl FnMut(&mut Self, Key, &[u8]) -> Result<(bool, bool), E>,
+    ) -> Result<(), E> {
+        self.remove_range_at(root, &range, 0, f)
+    }
+
+    fn remove_range_at<E: From<TreeError>>(
         &mut self,
         node_ptr: NodePtr,
         range: &impl RangeBounds<Key>,
         left_key: Key,
-    ) -> Result<(), TreeError> {
+        mut f: impl FnMut(&mut Self, Key, &[u8]) -> Result<(bool, bool), E>,
+    ) -> Result<(), E> {
         // Collect leaf nodes to process first, then modify them.
         // Use a stack to avoid recursion.
         let mut visit_stack: Vec<(NodePtr, Key)> = vec![(node_ptr, left_key)];
         let mut leaves_to_process: Vec<NodePtr> = Vec::new();
 
         while let Some((cur, lk)) = visit_stack.pop() {
-            let page = self.pager.owned_node(cur)?;
+            let page = self.pager.owned_node(cur).map_err(|e| TreeError::from(e))?;
             match page.page_type() {
                 PageType::Leaf => {
                     leaves_to_process.push(cur);
@@ -392,32 +402,60 @@ impl<const N: usize> Btree<N> {
                     }
                 }
                 _ => {
-                    return Err(TreeError::UnexpectedPageType {
+                    return Err(E::from(TreeError::UnexpectedPageType {
                         expected: "Leaf or Internal",
-                    });
+                    }));
                 }
             }
         }
 
         for leaf_ptr in leaves_to_process {
+            let mut end = false;
             let (overflow_metas, indices_to_remove) = {
-                let page = self.pager.read_node(leaf_ptr)?;
-                let leaf: &LeafPage<N> = page.try_into().unwrap();
+                let page = self
+                    .pager
+                    .owned_node(leaf_ptr)
+                    .map_err(|e| TreeError::from(e))?;
+                let leaf: LeafPage<N> = page.try_into().unwrap();
                 let mut overflow_metas = vec![];
                 let mut indices_to_remove = vec![];
                 for i in 0..leaf.len() {
-                    if range.contains(&leaf.key(i)) {
-                        if leaf.is_overflow(i) {
-                            overflow_metas.push(Pager::<N>::parse_overflow_meta(leaf.value(i)));
+                    let k = leaf.key(i);
+                    if range.contains(&k) {
+                        let (del, end_) = if leaf.is_overflow(i) {
+                            let (start_page, total_len) =
+                                Pager::<N>::parse_overflow_meta(leaf.value(i));
+
+                            let data = self
+                                .pager
+                                .read_overflow(start_page, total_len)
+                                .map_err(|e| TreeError::from(e))?;
+                            f(self, k, &data)?
+                        } else {
+                            f(self, k, leaf.value(i))?
+                        };
+
+                        if del {
+                            if leaf.is_overflow(i) {
+                                overflow_metas.push(Pager::<N>::parse_overflow_meta(leaf.value(i)));
+                            }
+                            indices_to_remove.push(i);
                         }
-                        indices_to_remove.push(i);
+
+                        if end_ {
+                            end = true;
+                            break;
+                        }
                     }
                 }
                 (overflow_metas, indices_to_remove)
             };
             if !indices_to_remove.is_empty() {
                 {
-                    let p = self.pager.mut_node(leaf_ptr)?;
+                    let p = self
+                        .pager
+                        .mut_node(leaf_ptr)
+                        .map_err(|e| TreeError::from(e))?;
                     let leaf_mut: &mut LeafPage<N> = p.try_into().unwrap();
                     for &i in indices_to_remove.iter().rev() {
                         leaf_mut.remove(i);
@@ -426,7 +464,13 @@ impl<const N: usize> Btree<N> {
                 self.merge_leaf(&[leaf_ptr])?;
             }
             for (start_page, total_len) in overflow_metas {
-                self.pager.free_overflow_pages(start_page, total_len)?;
+                self.pager
+                    .free_overflow_pages(start_page, total_len)
+                    .map_err(|e| TreeError::from(e))?;
+            }
+
+            if end {
+                break;
             }
         }
 
