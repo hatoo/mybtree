@@ -1054,6 +1054,7 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::RangeBounds;
     use std::fs;
     use tempfile::NamedTempFile;
 
@@ -1099,13 +1100,123 @@ mod tests {
         }
     }
 
+    fn with_locked<const N: usize, T>(
+        tx: &mut DbTransaction<'_, N>,
+        f: impl FnOnce(&mut LockedDbTransaction<'_, N>) -> T,
+    ) -> T {
+        tx.with_lock(|mut locked| f(&mut locked))
+    }
+
+    fn find_table_meta<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        name: &str,
+    ) -> Result<Option<TableMeta>, DatabaseError> {
+        with_locked(tx, |tx| tx.find_table_meta(name))
+    }
+
+    fn create_table<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        name: &str,
+        schema: Schema,
+        pk_index: Option<usize>,
+    ) -> Result<(), DatabaseError> {
+        with_locked(tx, |tx| tx.create_table(name, schema, pk_index))
+    }
+
+    fn create_index<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<(), DatabaseError> {
+        with_locked(tx, |tx| tx.create_index(table_name, column_name))
+    }
+
+    fn drop_table<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        name: &str,
+    ) -> Result<(), DatabaseError> {
+        with_locked(tx, |tx| tx.drop_table(name))
+    }
+
+    fn drop_index<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<(), DatabaseError> {
+        with_locked(tx, |tx| tx.drop_index(table_name, column_name))
+    }
+
+    fn insert<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        row: &Row,
+    ) -> Result<crate::types::Key, DatabaseError> {
+        with_locked(tx, |tx| tx.insert(table_name, row))
+    }
+
+    fn get<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        key: crate::types::Key,
+    ) -> Result<Option<Row>, DatabaseError> {
+        with_locked(tx, |tx| tx.get(table_name, key))
+    }
+
+    fn scan<const N: usize, R: RangeBounds<crate::types::Key>>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        range: R,
+    ) -> Result<Vec<(crate::types::Key, Row)>, DatabaseError> {
+        let mut rows = Vec::new();
+        with_locked(tx, |tx| {
+            tx.scan(table_name, range, |_, key, row| {
+                rows.push((key, rkyv::deserialize::<Row, Error>(row)?));
+                Ok::<_, DatabaseError>(false)
+            })
+        })?;
+        Ok(rows)
+    }
+
+    fn scan_by_index<'b, const N: usize, R: RangeBounds<&'b [u8]>>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        column_name: &str,
+        range: R,
+    ) -> Result<Vec<(crate::types::Key, Row)>, DatabaseError> {
+        let mut rows = Vec::new();
+        with_locked(tx, |tx| {
+            tx.scan_by_index(table_name, column_name, range, |_, row, key| {
+                rows.push((key, rkyv::deserialize::<Row, Error>(row)?));
+                Ok::<_, DatabaseError>(false)
+            })
+        })?;
+        Ok(rows)
+    }
+
+    fn delete<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        key: crate::types::Key,
+    ) -> Result<(), DatabaseError> {
+        with_locked(tx, |tx| tx.delete(table_name, key))
+    }
+
+    fn update<const N: usize>(
+        tx: &mut DbTransaction<'_, N>,
+        table_name: &str,
+        key: crate::types::Key,
+        row: &Row,
+    ) -> Result<(), DatabaseError> {
+        with_locked(tx, |tx| tx.update(table_name, key, row))
+    }
+
     // 1. Create table + verify schema
     #[test]
     fn test_create_table() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        let meta = tx.find_table_meta("users").unwrap().unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        let meta = find_table_meta(&mut tx, "users").unwrap().unwrap();
         // 3 columns: _rowid (implicit) + name + age
         assert_eq!(meta.schema.columns.len(), 3);
         assert_eq!(meta.schema.columns[0].name, "_rowid");
@@ -1115,12 +1226,12 @@ mod tests {
     #[test]
     fn test_create_table_already_exists() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let err = tx.create_table("users", users_schema(), None).unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = create_table(&mut tx, "users", users_schema(), None).unwrap_err();
         assert!(matches!(err, DatabaseError::TableAlreadyExists(_)));
     }
 
@@ -1128,16 +1239,16 @@ mod tests {
     #[test]
     fn test_insert_and_get() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let fetched = tx.get("users", key).unwrap().unwrap();
+        let mut tx = db.begin_transaction();
+        let fetched = get(&mut tx, "users", key).unwrap().unwrap();
         assert_eq!(fetched.values[1], DbValue::Text("Alice".into()));
         assert_eq!(fetched.values[2], DbValue::Integer(30));
     }
@@ -1146,8 +1257,8 @@ mod tests {
     #[test]
     fn test_schema_mismatch_wrong_type() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // _rowid + wrong type for name + age
@@ -1155,24 +1266,24 @@ mod tests {
             values: vec![DbValue::Null, DbValue::Integer(123), DbValue::Integer(30)],
         };
 
-        let tx = db.begin_transaction();
-        let err = tx.insert("users", &bad_row).unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = insert(&mut tx, "users", &bad_row).unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_schema_mismatch_wrong_column_count() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         let bad_row = Row {
             values: vec![DbValue::Text("Alice".into())],
         };
 
-        let tx = db.begin_transaction();
-        let err = tx.insert("users", &bad_row).unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = insert(&mut tx, "users", &bad_row).unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
@@ -1180,18 +1291,18 @@ mod tests {
     #[test]
     fn test_scan_range() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let k1 = tx.insert("users", &user_row("Alice", 30)).unwrap();
-        let k2 = tx.insert("users", &user_row("Bob", 25)).unwrap();
-        let _k3 = tx.insert("users", &user_row("Charlie", 35)).unwrap();
+        let mut tx = db.begin_transaction();
+        let k1 = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
+        let k2 = insert(&mut tx, "users", &user_row("Bob", 25)).unwrap();
+        let _k3 = insert(&mut tx, "users", &user_row("Charlie", 35)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let results = tx.scan("users", k1..=k2).unwrap();
+        let mut tx = db.begin_transaction();
+        let results = scan(&mut tx, "users", k1..=k2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].1.values[1], DbValue::Text("Alice".into()));
         assert_eq!(results[1].1.values[1], DbValue::Text("Bob".into()));
@@ -1201,16 +1312,16 @@ mod tests {
     #[test]
     fn test_update_row() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.update(
+        let mut tx = db.begin_transaction();
+        update(&mut tx, 
             "users",
             key,
             &Row {
@@ -1224,37 +1335,37 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let fetched = tx.get("users", key).unwrap().unwrap();
+        let mut tx = db.begin_transaction();
+        let fetched = get(&mut tx, "users", key).unwrap().unwrap();
         assert_eq!(fetched.values[2], DbValue::Integer(31));
     }
 
     #[test]
     fn test_delete_row() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.delete("users", key).unwrap();
+        let mut tx = db.begin_transaction();
+        delete(&mut tx, "users", key).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        assert!(tx.get("users", key).unwrap().is_none());
+        let mut tx = db.begin_transaction();
+        assert!(get(&mut tx, "users", key).unwrap().is_none());
     }
 
     // 6. Multiple tables in same database
     #[test]
     fn test_multiple_tables() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_table(
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_table(&mut tx, 
             "products",
             Schema {
                 columns: vec![
@@ -1277,25 +1388,25 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let uk = tx.insert("users", &user_row("Alice", 30)).unwrap();
-        let pk = tx
-            .insert(
-                "products",
-                &Row {
-                    values: vec![
-                        DbValue::Null, // _rowid
-                        DbValue::Text("Widget".into()),
-                        DbValue::Float(9.99),
-                    ],
-                },
-            )
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let uk = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
+        let pk = insert(
+            &mut tx,
+            "products",
+            &Row {
+                values: vec![
+                    DbValue::Null, // _rowid
+                    DbValue::Text("Widget".into()),
+                    DbValue::Float(9.99),
+                ],
+            },
+        )
+        .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let user = tx.get("users", uk).unwrap().unwrap();
-        let product = tx.get("products", pk).unwrap().unwrap();
+        let mut tx = db.begin_transaction();
+        let user = get(&mut tx, "users", uk).unwrap().unwrap();
+        let product = get(&mut tx, "products", pk).unwrap().unwrap();
         assert_eq!(user.values[1], DbValue::Text("Alice".into()));
         assert_eq!(product.values[1], DbValue::Text("Widget".into()));
     }
@@ -1304,39 +1415,39 @@ mod tests {
     #[test]
     fn test_rollback_on_drop() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Ghost", 0)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Ghost", 0)).unwrap();
         drop(tx); // rollback
 
-        let tx = db.begin_transaction();
-        assert!(tx.get("users", key).unwrap().is_none());
+        let mut tx = db.begin_transaction();
+        assert!(get(&mut tx, "users", key).unwrap().is_none());
     }
 
     #[test]
     fn test_commit_persists() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Persist", 1)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Persist", 1)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        assert!(tx.get("users", key).unwrap().is_some());
+        let mut tx = db.begin_transaction();
+        assert!(get(&mut tx, "users", key).unwrap().is_some());
     }
 
     // 8. Nullable column handling
     #[test]
     fn test_nullable_column() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table(
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, 
             "events",
             Schema {
                 columns: vec![
@@ -1359,43 +1470,43 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "events",
-                &Row {
-                    values: vec![
-                        DbValue::Null, // _rowid
-                        DbValue::Text("Launch".into()),
-                        DbValue::Null,
-                    ],
-                },
-            )
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(
+            &mut tx,
+            "events",
+            &Row {
+                values: vec![
+                    DbValue::Null, // _rowid
+                    DbValue::Text("Launch".into()),
+                    DbValue::Null,
+                ],
+            },
+        )
+        .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let row = tx.get("events", key).unwrap().unwrap();
+        let mut tx = db.begin_transaction();
+        let row = get(&mut tx, "events", key).unwrap().unwrap();
         assert_eq!(row.values[2], DbValue::Null);
     }
 
     #[test]
     fn test_non_nullable_rejects_null() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         // name (index 1) is NOT NULL — should reject
-        let err = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![DbValue::Null, DbValue::Null, DbValue::Integer(30)],
-                },
-            )
-            .unwrap_err();
+        let err = insert(
+            &mut tx,
+            "users",
+            &Row {
+                values: vec![DbValue::Null, DbValue::Null, DbValue::Integer(30)],
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
@@ -1403,23 +1514,23 @@ mod tests {
     #[test]
     fn test_drop_table() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.drop_table("users").unwrap();
+        let mut tx = db.begin_transaction();
+        drop_table(&mut tx, "users").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        assert!(tx.find_table_meta("users").unwrap().is_none());
+        let mut tx = db.begin_transaction();
+        assert!(find_table_meta(&mut tx, "users").unwrap().is_none());
     }
 
     #[test]
     fn test_drop_nonexistent_table() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        let err = tx.drop_table("nope").unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = drop_table(&mut tx, "nope").unwrap_err();
         assert!(matches!(err, DatabaseError::TableNotFound(_)));
     }
 
@@ -1427,8 +1538,8 @@ mod tests {
     #[test]
     fn test_table_not_found() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        let err = tx.get("missing", 0).unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = get(&mut tx, "missing", 0).unwrap_err();
         assert!(matches!(err, DatabaseError::TableNotFound(_)));
     }
 
@@ -1436,8 +1547,8 @@ mod tests {
     #[test]
     fn test_bool_column() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table(
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, 
             "flags",
             Schema {
                 columns: vec![Column {
@@ -1453,32 +1564,32 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let k1 = tx
-            .insert(
-                "flags",
-                &Row {
-                    values: vec![DbValue::Null, DbValue::Bool(true)],
-                },
-            )
-            .unwrap();
-        let k2 = tx
-            .insert(
-                "flags",
-                &Row {
-                    values: vec![DbValue::Null, DbValue::Bool(false)],
-                },
-            )
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let k1 = insert(
+            &mut tx,
+            "flags",
+            &Row {
+                values: vec![DbValue::Null, DbValue::Bool(true)],
+            },
+        )
+        .unwrap();
+        let k2 = insert(
+            &mut tx,
+            "flags",
+            &Row {
+                values: vec![DbValue::Null, DbValue::Bool(false)],
+            },
+        )
+        .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         assert_eq!(
-            tx.get("flags", k1).unwrap().unwrap().values[1],
+            get(&mut tx, "flags", k1).unwrap().unwrap().values[1],
             DbValue::Bool(true)
         );
         assert_eq!(
-            tx.get("flags", k2).unwrap().unwrap().values[1],
+            get(&mut tx, "flags", k2).unwrap().unwrap().values[1],
             DbValue::Bool(false)
         );
     }
@@ -1494,32 +1605,32 @@ mod tests {
         let pager = Pager::<4096>::new(file);
         let db = Database::create(pager).unwrap();
 
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // Insert many rows to allocate several pages
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         for i in 0..100 {
-            tx.insert("users", &user_row(&format!("user_{}", i), i as i64))
+            insert(&mut tx, "users", &user_row(&format!("user_{}", i), i as i64))
                 .unwrap();
         }
         tx.commit().unwrap();
 
         let pages_before_drop = db.store.get_total_page_count();
 
-        let tx = db.begin_transaction();
-        tx.drop_table("users").unwrap();
+        let mut tx = db.begin_transaction();
+        drop_table(&mut tx, "users").unwrap();
         tx.commit().unwrap();
 
         // Re-create and re-insert — should reuse freed pages
-        let tx = db.begin_transaction();
-        tx.create_table("users2", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users2", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         for i in 0..100 {
-            tx.insert("users2", &user_row(&format!("user_{}", i), i as i64))
+            insert(&mut tx, "users2", &user_row(&format!("user_{}", i), i as i64))
                 .unwrap();
         }
         tx.commit().unwrap();
@@ -1545,36 +1656,36 @@ mod tests {
         let pager = Pager::<4096>::new(file);
         let db = Database::create(pager).unwrap();
 
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
-        tx.create_index("users", "age").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
+        create_index(&mut tx, "users", "age").unwrap();
         tx.commit().unwrap();
 
         // Insert many rows to allocate pages for data + both indexes
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         for i in 0..100 {
-            tx.insert("users", &user_row(&format!("user_{}", i), i as i64))
+            insert(&mut tx, "users", &user_row(&format!("user_{}", i), i as i64))
                 .unwrap();
         }
         tx.commit().unwrap();
 
         let pages_before_drop = db.store.get_total_page_count();
 
-        let tx = db.begin_transaction();
-        tx.drop_table("users").unwrap();
+        let mut tx = db.begin_transaction();
+        drop_table(&mut tx, "users").unwrap();
         tx.commit().unwrap();
 
         // Re-create with indexes and re-insert — should reuse freed pages
-        let tx = db.begin_transaction();
-        tx.create_table("users2", users_schema(), None).unwrap();
-        tx.create_index("users2", "name").unwrap();
-        tx.create_index("users2", "age").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users2", users_schema(), None).unwrap();
+        create_index(&mut tx, "users2", "name").unwrap();
+        create_index(&mut tx, "users2", "age").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         for i in 0..100 {
-            tx.insert("users2", &user_row(&format!("user_{}", i), i as i64))
+            insert(&mut tx, "users2", &user_row(&format!("user_{}", i), i as i64))
                 .unwrap();
         }
         tx.commit().unwrap();
@@ -1594,11 +1705,11 @@ mod tests {
     #[test]
     fn test_create_index() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
 
-        let meta = tx.find_table_meta("users").unwrap().unwrap();
+        let meta = find_table_meta(&mut tx, "users").unwrap().unwrap();
         assert_eq!(meta.index_trees.len(), 1);
         assert_eq!(meta.index_trees[0].0, "name");
     }
@@ -1606,61 +1717,60 @@ mod tests {
     #[test]
     fn test_create_index_nonexistent_column() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        let err = tx.create_index("users", "email").unwrap_err();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        let err = create_index(&mut tx, "users", "email").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_create_index_duplicate() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
-        let err = tx.create_index("users", "name").unwrap_err();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
+        let err = create_index(&mut tx, "users", "name").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_drop_index() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
-        tx.drop_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
+        drop_index(&mut tx, "users", "name").unwrap();
 
-        let meta = tx.find_table_meta("users").unwrap().unwrap();
+        let meta = find_table_meta(&mut tx, "users").unwrap().unwrap();
         assert!(meta.index_trees.is_empty());
     }
 
     #[test]
     fn test_drop_index_nonexistent() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        let err = tx.drop_index("users", "name").unwrap_err();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        let err = drop_index(&mut tx, "users", "name").unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_scan_by_index() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.insert("users", &user_row("Alice", 30)).unwrap();
-        tx.insert("users", &user_row("Bob", 25)).unwrap();
-        tx.insert("users", &user_row("Charlie", 35)).unwrap();
+        let mut tx = db.begin_transaction();
+        insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
+        insert(&mut tx, "users", &user_row("Bob", 25)).unwrap();
+        insert(&mut tx, "users", &user_row("Charlie", 35)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let results = tx
-            .scan_by_index("users", "name", &b"Bob"[..]..=&b"Charlie"[..])
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let results =
+            scan_by_index(&mut tx, "users", "name", &b"Bob"[..]..=&b"Charlie"[..]).unwrap();
         assert_eq!(results.len(), 2);
         let names: Vec<_> = results.iter().map(|(_, r)| &r.values[1]).collect();
         assert!(names.contains(&&DbValue::Text("Bob".into())));
@@ -1670,33 +1780,30 @@ mod tests {
     #[test]
     fn test_scan_by_index_no_index() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let err = tx
-            .scan_by_index("users", "name", &b"A"[..]..&b"Z"[..])
-            .unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = scan_by_index(&mut tx, "users", "name", &b"A"[..]..&b"Z"[..]).unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_index_maintained_on_insert() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.insert("users", &user_row("Diana", 28)).unwrap();
+        let mut tx = db.begin_transaction();
+        insert(&mut tx, "users", &user_row("Diana", 28)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let results = tx
-            .scan_by_index("users", "name", &b"Diana"[..]..=&b"Diana"[..])
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let results =
+            scan_by_index(&mut tx, "users", "name", &b"Diana"[..]..=&b"Diana"[..]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1.values[1], DbValue::Text("Diana".into()));
     }
@@ -1704,41 +1811,39 @@ mod tests {
     #[test]
     fn test_index_maintained_on_delete() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Eve", 22)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Eve", 22)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.delete("users", key).unwrap();
+        let mut tx = db.begin_transaction();
+        delete(&mut tx, "users", key).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let results = tx
-            .scan_by_index("users", "name", &b"Eve"[..]..=&b"Eve"[..])
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let results = scan_by_index(&mut tx, "users", "name", &b"Eve"[..]..=&b"Eve"[..]).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_index_maintained_on_update() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Frank", 40)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Frank", 40)).unwrap();
         tx.commit().unwrap();
 
         // Update name from Frank to George
-        let tx = db.begin_transaction();
-        tx.update(
+        let mut tx = db.begin_transaction();
+        update(&mut tx, 
             "users",
             key,
             &Row {
@@ -1753,16 +1858,14 @@ mod tests {
         tx.commit().unwrap();
 
         // Frank should be gone from index
-        let tx = db.begin_transaction();
-        let results = tx
-            .scan_by_index("users", "name", &b"Frank"[..]..=&b"Frank"[..])
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let results =
+            scan_by_index(&mut tx, "users", "name", &b"Frank"[..]..=&b"Frank"[..]).unwrap();
         assert!(results.is_empty());
 
         // George should be found
-        let results = tx
-            .scan_by_index("users", "name", &b"George"[..]..=&b"George"[..])
-            .unwrap();
+        let results =
+            scan_by_index(&mut tx, "users", "name", &b"George"[..]..=&b"George"[..]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1.values[1], DbValue::Text("George".into()));
     }
@@ -1770,47 +1873,46 @@ mod tests {
     #[test]
     fn test_create_index_backfills_existing_data() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // Insert rows before creating the index
-        let tx = db.begin_transaction();
-        tx.insert("users", &user_row("Alice", 30)).unwrap();
-        tx.insert("users", &user_row("Bob", 25)).unwrap();
+        let mut tx = db.begin_transaction();
+        insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
+        insert(&mut tx, "users", &user_row("Bob", 25)).unwrap();
         tx.commit().unwrap();
 
         // Create index after data exists
-        let tx = db.begin_transaction();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
         // The back-filled data should be queryable
-        let tx = db.begin_transaction();
-        let results = tx
-            .scan_by_index("users", "name", &b"Alice"[..]..=&b"Bob"[..])
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let results =
+            scan_by_index(&mut tx, "users", "name", &b"Alice"[..]..=&b"Bob"[..]).unwrap();
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn test_drop_table_with_index() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.drop_table("users").unwrap();
+        let mut tx = db.begin_transaction();
+        drop_table(&mut tx, "users").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        assert!(tx.find_table_meta("users").unwrap().is_none());
+        let mut tx = db.begin_transaction();
+        assert!(find_table_meta(&mut tx, "users").unwrap().is_none());
     }
 
     // ── Transaction conflict tests ─────────────────────────────────
@@ -1818,19 +1920,19 @@ mod tests {
     #[test]
     fn test_conflict_write_write_same_key() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // Two concurrent transactions update the same row
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.update(
+        update(&mut tx1, 
             "users",
             key,
             &Row {
@@ -1843,7 +1945,7 @@ mod tests {
         )
         .unwrap();
 
-        tx2.update(
+        update(&mut tx2, 
             "users",
             key,
             &Row {
@@ -1865,21 +1967,21 @@ mod tests {
     #[test]
     fn test_conflict_read_write() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 reads a row, tx2 writes (updates) the same row
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.get("users", key).unwrap();
+        get(&mut tx1, "users", key).unwrap();
 
-        tx2.update(
+        update(&mut tx2, 
             "users",
             key,
             &Row {
@@ -1900,20 +2002,20 @@ mod tests {
     #[test]
     fn test_conflict_delete_vs_read() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 reads the row, tx2 deletes it
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.get("users", key).unwrap();
-        tx2.delete("users", key).unwrap();
+        get(&mut tx1, "users", key).unwrap();
+        delete(&mut tx2, "users", key).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -1922,21 +2024,21 @@ mod tests {
     #[test]
     fn test_conflict_range_scan_vs_insert() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let k1 = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let k1 = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 does a range scan, tx2 inserts a row whose key falls in that range
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.scan("users", k1..).unwrap();
+        scan(&mut tx1, "users", k1..).unwrap();
 
-        let k2 = tx2.insert("users", &user_row("Bob", 25)).unwrap();
+        let k2 = insert(&mut tx2, "users", &user_row("Bob", 25)).unwrap();
         // The new key should be >= k1 so it falls in the scanned range
         assert!(k2 >= k1);
 
@@ -1947,19 +2049,19 @@ mod tests {
     #[test]
     fn test_conflict_index_scan_vs_insert() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
         // tx1 scans the index, tx2 inserts a row whose indexed value falls in range
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", &b"A"[..]..&b"Z"[..])
+        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"Z"[..])
             .unwrap();
 
-        tx2.insert("users", &user_row("Bob", 25)).unwrap();
+        insert(&mut tx2, "users", &user_row("Bob", 25)).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -1968,19 +2070,19 @@ mod tests {
     #[test]
     fn test_conflict_index_point_read_vs_insert() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
         // tx1 does a point lookup on index value "Alice", tx2 inserts "Alice"
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", &b"Alice"[..]..=&b"Alice"[..])
+        scan_by_index(&mut tx1, "users", "name", &b"Alice"[..]..=&b"Alice"[..])
             .unwrap();
 
-        tx2.insert("users", &user_row("Alice", 30)).unwrap();
+        insert(&mut tx2, "users", &user_row("Alice", 30)).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -1989,23 +2091,23 @@ mod tests {
     #[test]
     fn test_no_conflict_disjoint_rows() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let k1 = tx.insert("users", &user_row("Alice", 30)).unwrap();
-        let k2 = tx.insert("users", &user_row("Bob", 25)).unwrap();
+        let mut tx = db.begin_transaction();
+        let k1 = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
+        let k2 = insert(&mut tx, "users", &user_row("Bob", 25)).unwrap();
         tx.commit().unwrap();
 
         // tx1 reads row k1, tx2 reads row k2 — no overlap
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.get("users", k1).unwrap();
-        tx2.get("users", k2).unwrap();
+        get(&mut tx1, "users", k1).unwrap();
+        get(&mut tx2, "users", k2).unwrap();
 
-        tx1.update(
+        update(&mut tx1, 
             "users",
             k1,
             &Row {
@@ -2018,7 +2120,7 @@ mod tests {
         )
         .unwrap();
 
-        tx2.update(
+        update(&mut tx2, 
             "users",
             k2,
             &Row {
@@ -2038,17 +2140,17 @@ mod tests {
     #[test]
     fn test_no_conflict_serial_transactions() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 commits before tx2 starts — no conflict possible
-        let tx1 = db.begin_transaction();
-        tx1.update(
+        let mut tx1 = db.begin_transaction();
+        update(&mut tx1, 
             "users",
             key,
             &Row {
@@ -2062,8 +2164,8 @@ mod tests {
         .unwrap();
         tx1.commit().unwrap();
 
-        let tx2 = db.begin_transaction();
-        tx2.update(
+        let mut tx2 = db.begin_transaction();
+        update(&mut tx2, 
             "users",
             key,
             &Row {
@@ -2081,19 +2183,19 @@ mod tests {
     #[test]
     fn test_no_conflict_disjoint_index_ranges() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
         // tx1 scans names A-B, tx2 inserts name starting with Z
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", &b"A"[..]..&b"C"[..])
+        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"C"[..])
             .unwrap();
 
-        tx2.insert("users", &user_row("Zara", 20)).unwrap();
+        insert(&mut tx2, "users", &user_row("Zara", 20)).unwrap();
 
         tx2.commit().unwrap();
         tx1.commit().unwrap(); // should succeed — "Zara" is outside A..C
@@ -2102,17 +2204,17 @@ mod tests {
     #[test]
     fn test_conflict_concurrent_inserts_same_index_value() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
         // Both transactions insert with the same indexed column value
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.insert("users", &user_row("Alice", 30)).unwrap();
-        tx2.insert("users", &user_row("Alice", 25)).unwrap();
+        insert(&mut tx1, "users", &user_row("Alice", 30)).unwrap();
+        insert(&mut tx2, "users", &user_row("Alice", 25)).unwrap();
 
         // First to commit fails — both wrote to same index value
         tx1.commit().unwrap_err();
@@ -2122,23 +2224,23 @@ mod tests {
     #[test]
     fn test_conflict_update_vs_index_scan() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 scans index range including "Bob", tx2 updates Alice → Bob
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", &b"B"[..]..&b"C"[..])
+        scan_by_index(&mut tx1, "users", "name", &b"B"[..]..&b"C"[..])
             .unwrap();
 
-        tx2.update(
+        update(&mut tx2, 
             "users",
             key,
             &Row {
@@ -2161,11 +2263,11 @@ mod tests {
     fn test_conflict_concurrent_create_table_same_name() {
         let (db, _tmp) = open_db();
 
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.create_table("users", users_schema(), None).unwrap();
-        tx2.create_table("users", users_schema(), None).unwrap();
+        create_table(&mut tx1, "users", users_schema(), None).unwrap();
+        create_table(&mut tx2, "users", users_schema(), None).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -2175,11 +2277,11 @@ mod tests {
     fn test_no_conflict_concurrent_create_table_different_names() {
         let (db, _tmp) = open_db();
 
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.create_table("users", users_schema(), None).unwrap();
-        tx2.create_table("products", users_schema(), None).unwrap();
+        create_table(&mut tx1, "users", users_schema(), None).unwrap();
+        create_table(&mut tx2, "products", users_schema(), None).unwrap();
 
         tx1.commit().unwrap();
         tx2.commit().unwrap();
@@ -2188,15 +2290,15 @@ mod tests {
     #[test]
     fn test_conflict_concurrent_drop_table_same_name() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.drop_table("users").unwrap();
-        tx2.drop_table("users").unwrap();
+        drop_table(&mut tx1, "users").unwrap();
+        drop_table(&mut tx2, "users").unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -2205,16 +2307,16 @@ mod tests {
     #[test]
     fn test_conflict_create_table_vs_drop_table_same_name() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // tx1 drops the table, tx2 reads it (via insert)
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.drop_table("users").unwrap();
-        tx2.insert("users", &user_row("Alice", 30)).unwrap();
+        drop_table(&mut tx1, "users").unwrap();
+        insert(&mut tx2, "users", &user_row("Alice", 30)).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -2223,16 +2325,16 @@ mod tests {
     #[test]
     fn test_conflict_create_index_vs_insert() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // tx1 creates an index (backfills via range read), tx2 inserts a row
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.create_index("users", "name").unwrap();
-        tx2.insert("users", &user_row("Alice", 30)).unwrap();
+        create_index(&mut tx1, "users", "name").unwrap();
+        insert(&mut tx2, "users", &user_row("Alice", 30)).unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -2241,16 +2343,16 @@ mod tests {
     #[test]
     fn test_conflict_concurrent_create_index_same_column() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // Both try to create an index on the same column
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.create_index("users", "name").unwrap();
-        tx2.create_index("users", "name").unwrap();
+        create_index(&mut tx1, "users", "name").unwrap();
+        create_index(&mut tx2, "users", "name").unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -2259,22 +2361,22 @@ mod tests {
     #[test]
     fn test_conflict_drop_index_vs_index_scan() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 scans the index, tx2 drops it (modifying catalog metadata)
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.scan_by_index("users", "name", &b"A"[..]..&b"Z"[..])
+        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"Z"[..])
             .unwrap();
-        tx2.drop_index("users", "name").unwrap();
+        drop_index(&mut tx2, "users", "name").unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -2283,20 +2385,20 @@ mod tests {
     #[test]
     fn test_conflict_drop_table_vs_read() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx.insert("users", &user_row("Alice", 30)).unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
         tx.commit().unwrap();
 
         // tx1 reads a row, tx2 drops the whole table
-        let tx1 = db.begin_transaction();
-        let tx2 = db.begin_transaction();
+        let mut tx1 = db.begin_transaction();
+        let mut tx2 = db.begin_transaction();
 
-        tx1.get("users", key).unwrap();
-        tx2.drop_table("users").unwrap();
+        get(&mut tx1, "users", key).unwrap();
+        drop_table(&mut tx2, "users").unwrap();
 
         tx1.commit().unwrap_err();
         tx2.commit().unwrap();
@@ -2305,37 +2407,36 @@ mod tests {
     #[test]
     fn test_multiple_indexes_on_table() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
-        tx.create_index("users", "name").unwrap();
-        tx.create_index("users", "age").unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
+        create_index(&mut tx, "users", "name").unwrap();
+        create_index(&mut tx, "users", "age").unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.insert("users", &user_row("Alice", 30)).unwrap();
-        tx.insert("users", &user_row("Bob", 25)).unwrap();
+        let mut tx = db.begin_transaction();
+        insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
+        insert(&mut tx, "users", &user_row("Bob", 25)).unwrap();
         tx.commit().unwrap();
 
         // Query by name
-        let tx = db.begin_transaction();
-        let by_name = tx
-            .scan_by_index("users", "name", &b"Alice"[..]..=&b"Alice"[..])
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let by_name =
+            scan_by_index(&mut tx, "users", "name", &b"Alice"[..]..=&b"Alice"[..]).unwrap();
         assert_eq!(by_name.len(), 1);
 
         // Query by age (i64 big-endian bytes for 25)
         let age_25 = 25i64.to_be_bytes().to_vec();
         let age_30 = 30i64.to_be_bytes().to_vec();
-        let by_age = tx
-            .scan_by_index("users", "age", age_25.as_slice()..=age_30.as_slice())
-            .unwrap();
+        let by_age =
+            scan_by_index(&mut tx, "users", "age", age_25.as_slice()..=age_30.as_slice())
+                .unwrap();
         assert_eq!(by_age.len(), 2);
     }
 
     #[test]
     fn test_index_access_multiple_same_key() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         let schema = Schema {
             columns: vec![
                 Column {
@@ -2352,9 +2453,9 @@ mod tests {
             primary_key: 0,
             implicit_pk: true,
         };
-        tx.create_table("t", schema, None).unwrap();
-        tx.create_index("t", "x").unwrap();
-        tx.insert(
+        create_table(&mut tx, "t", schema, None).unwrap();
+        create_index(&mut tx, "t", "x").unwrap();
+        insert(&mut tx, 
             "t",
             &Row {
                 values: vec![
@@ -2365,7 +2466,7 @@ mod tests {
             },
         )
         .unwrap();
-        tx.insert(
+        insert(&mut tx, 
             "t",
             &Row {
                 values: vec![
@@ -2376,7 +2477,7 @@ mod tests {
             },
         )
         .unwrap();
-        tx.insert(
+        insert(&mut tx, 
             "t",
             &Row {
                 values: vec![
@@ -2387,7 +2488,7 @@ mod tests {
             },
         )
         .unwrap();
-        tx.insert(
+        insert(&mut tx, 
             "t",
             &Row {
                 values: vec![
@@ -2400,13 +2501,11 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
+        let mut tx = db.begin_transaction();
         let key_1 = 1i64.to_be_bytes().to_vec();
-        let meta = tx.find_table_meta("t").unwrap().unwrap();
+        let meta = find_table_meta(&mut tx, "t").unwrap().unwrap();
         let _idx_root = meta.index_trees.iter().find(|(c, _)| c == "x").unwrap().1;
-        let rows = tx
-            .scan_by_index("t", "x", key_1.as_slice()..=key_1.as_slice())
-            .unwrap();
+        let rows = scan_by_index(&mut tx, "t", "x", key_1.as_slice()..=key_1.as_slice()).unwrap();
         let mut values: Vec<String> = rows
             .iter()
             .map(|(_, row)| match &row.values[2] {
@@ -2423,8 +2522,8 @@ mod tests {
     #[test]
     fn test_explicit_primary_key() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table(
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, 
             "items",
             Schema {
                 columns: vec![
@@ -2447,21 +2546,21 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "items",
-                &Row {
-                    values: vec![DbValue::Integer(42), DbValue::Text("widget".into())],
-                },
-            )
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(
+            &mut tx,
+            "items",
+            &Row {
+                values: vec![DbValue::Integer(42), DbValue::Text("widget".into())],
+            },
+        )
+        .unwrap();
         // The B-tree key should equal the PK value
         assert_eq!(key, 42);
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let row = tx.get("items", 42).unwrap().unwrap();
+        let mut tx = db.begin_transaction();
+        let row = get(&mut tx, "items", 42).unwrap().unwrap();
         assert_eq!(row.values[0], DbValue::Integer(42));
         assert_eq!(row.values[1], DbValue::Text("widget".into()));
     }
@@ -2469,8 +2568,8 @@ mod tests {
     #[test]
     fn test_explicit_pk_no_rowid_prepended() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table(
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, 
             "t",
             Schema {
                 columns: vec![
@@ -2492,7 +2591,7 @@ mod tests {
         )
         .unwrap();
 
-        let meta = tx.find_table_meta("t").unwrap().unwrap();
+        let meta = find_table_meta(&mut tx, "t").unwrap().unwrap();
         // No _rowid prepended when explicit PK is given
         assert_eq!(meta.schema.columns.len(), 2);
         assert_eq!(meta.schema.columns[0].name, "id");
@@ -2502,8 +2601,8 @@ mod tests {
     #[test]
     fn test_duplicate_primary_key_rejected() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table(
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, 
             "items",
             Schema {
                 columns: vec![
@@ -2526,30 +2625,30 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        tx.insert(
+        let mut tx = db.begin_transaction();
+        insert(&mut tx, 
             "items",
             &Row {
                 values: vec![DbValue::Integer(1), DbValue::Text("a".into())],
             },
         )
         .unwrap();
-        let err = tx
-            .insert(
-                "items",
-                &Row {
-                    values: vec![DbValue::Integer(1), DbValue::Text("b".into())],
-                },
-            )
-            .unwrap_err();
+        let err = insert(
+            &mut tx,
+            "items",
+            &Row {
+                values: vec![DbValue::Integer(1), DbValue::Text("b".into())],
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, DatabaseError::DuplicateKey(1)));
     }
 
     #[test]
     fn test_negative_pk_rejected() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table(
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, 
             "items",
             Schema {
                 columns: vec![Column {
@@ -2565,60 +2664,60 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let err = tx
-            .insert(
-                "items",
-                &Row {
-                    values: vec![DbValue::Integer(-1)],
-                },
-            )
-            .unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = insert(
+            &mut tx,
+            "items",
+            &Row {
+                values: vec![DbValue::Integer(-1)],
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 
     #[test]
     fn test_implicit_rowid_auto_assigns() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
-        let tx = db.begin_transaction();
-        let k1 = tx.insert("users", &user_row("Alice", 30)).unwrap();
-        let k2 = tx.insert("users", &user_row("Bob", 25)).unwrap();
+        let mut tx = db.begin_transaction();
+        let k1 = insert(&mut tx, "users", &user_row("Alice", 30)).unwrap();
+        let k2 = insert(&mut tx, "users", &user_row("Bob", 25)).unwrap();
         // Auto-increment: k2 > k1
         assert!(k2 > k1);
 
         // _rowid is stored in the row
-        let row = tx.get("users", k1).unwrap().unwrap();
+        let row = get(&mut tx, "users", k1).unwrap().unwrap();
         assert_eq!(row.values[0], DbValue::Integer(k1 as i64));
     }
 
     #[test]
     fn test_implicit_rowid_explicit_value() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        tx.create_table("users", users_schema(), None).unwrap();
+        let mut tx = db.begin_transaction();
+        create_table(&mut tx, "users", users_schema(), None).unwrap();
         tx.commit().unwrap();
 
         // Provide explicit _rowid value
-        let tx = db.begin_transaction();
-        let key = tx
-            .insert(
-                "users",
-                &Row {
-                    values: vec![
-                        DbValue::Integer(100),
-                        DbValue::Text("Alice".into()),
-                        DbValue::Integer(30),
-                    ],
-                },
-            )
-            .unwrap();
+        let mut tx = db.begin_transaction();
+        let key = insert(
+            &mut tx,
+            "users",
+            &Row {
+                values: vec![
+                    DbValue::Integer(100),
+                    DbValue::Text("Alice".into()),
+                    DbValue::Integer(30),
+                ],
+            },
+        )
+        .unwrap();
         assert_eq!(key, 100);
 
-        let row = tx.get("users", 100).unwrap().unwrap();
+        let row = get(&mut tx, "users", 100).unwrap().unwrap();
         assert_eq!(row.values[0], DbValue::Integer(100));
         assert_eq!(row.values[1], DbValue::Text("Alice".into()));
     }
@@ -2626,22 +2725,22 @@ mod tests {
     #[test]
     fn test_pk_non_integer_rejected() {
         let (db, _tmp) = open_db();
-        let tx = db.begin_transaction();
-        let err = tx
-            .create_table(
-                "bad",
-                Schema {
-                    columns: vec![Column {
-                        name: "id".into(),
-                        column_type: ColumnType::Text,
-                        nullable: false,
-                    }],
-                    primary_key: 0,
-                    implicit_pk: false,
-                },
-                Some(0),
-            )
-            .unwrap_err();
+        let mut tx = db.begin_transaction();
+        let err = create_table(
+            &mut tx,
+            "bad",
+            Schema {
+                columns: vec![Column {
+                    name: "id".into(),
+                    column_type: ColumnType::Text,
+                    nullable: false,
+                }],
+                primary_key: 0,
+                implicit_pk: false,
+            },
+            Some(0),
+        )
+        .unwrap_err();
         assert!(matches!(err, DatabaseError::SchemaMismatch(_)));
     }
 }

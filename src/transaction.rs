@@ -35,6 +35,7 @@ pub struct Transaction<'a, const N: usize> {
 pub struct LockedTransaction<'a, const N: usize> {
     btree: &'a mut Btree<N>,
     active_transactions: &'a mut Operation,
+    other_max_write_keys: BTreeMap<NodePtr, Key>,
 }
 
 pub struct Operation {
@@ -168,7 +169,14 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
     pub fn available_key(&mut self, root: NodePtr) -> Result<Key, TreeError> {
         let mut key = self.btree.available_key(root)?;
 
-        // Also consider keys from all active transactions' writes for the same root
+        if let Some(&other_max) = self.other_max_write_keys.get(&root) {
+            let candidate = other_max.checked_add(1).unwrap_or(u64::MAX);
+            if candidate > key {
+                key = candidate;
+            }
+        }
+
+        // Also consider keys from this transaction's writes for the same root.
         if let Some(&(_, max_write_key)) = self
             .active_transactions
             .writes
@@ -208,7 +216,9 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         let &mut LockedTransaction {
             ref mut btree,
             ref mut active_transactions,
+            ref other_max_write_keys,
         } = self;
+        let other_max_write_keys = other_max_write_keys.clone();
         active_transactions
             .range_reads
             .push((root, range_bound.0.clone(), range_bound.1.clone()));
@@ -229,6 +239,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                     let me = LockedTransaction {
                         btree,
                         active_transactions,
+                        other_max_write_keys: other_max_write_keys.clone(),
                     };
                     if f(me, write_key, v)? {
                         return Ok(true);
@@ -245,6 +256,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                     let me = LockedTransaction {
                         btree,
                         active_transactions,
+                        other_max_write_keys: other_max_write_keys.clone(),
                     };
                     return f(me, k, &v);
                 } else {
@@ -254,6 +266,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                 let me = LockedTransaction {
                     btree,
                     active_transactions,
+                    other_max_write_keys: other_max_write_keys.clone(),
                 };
 
                 f(me, k, v)
@@ -265,6 +278,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                 let me = LockedTransaction {
                     btree,
                     active_transactions,
+                    other_max_write_keys: other_max_write_keys.clone(),
                 };
                 if f(me, write_key, v)? {
                     return Ok(());
@@ -287,7 +301,14 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
     pub fn insert(&mut self, root: NodePtr, value: Vec<u8>) -> Result<Key, TreeError> {
         let mut key = self.btree.available_key(root)?;
 
-        // Also consider keys from all active transactions' writes for the same root
+        if let Some(&other_max) = self.other_max_write_keys.get(&root) {
+            let candidate = other_max.checked_add(1).unwrap_or(u64::MAX);
+            if candidate > key {
+                key = candidate;
+            }
+        }
+
+        // Also consider keys from this transaction's writes for the same root.
         if let Some(&(_, max_write_key)) = self
             .active_transactions
             .writes
@@ -420,7 +441,9 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         let &mut LockedTransaction {
             ref mut btree,
             ref mut active_transactions,
+            ref other_max_write_keys,
         } = self;
+        let other_max_write_keys = other_max_write_keys.clone();
 
         // Record range read for conflict detection
         active_transactions.index_range_reads.push((
@@ -464,6 +487,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                 let me = LockedTransaction {
                     btree,
                     active_transactions,
+                    other_max_write_keys: other_max_write_keys.clone(),
                 };
                 let should_stop = f(me, value, key)?;
 
@@ -484,6 +508,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                         let me = LockedTransaction {
                             btree,
                             active_transactions,
+                            other_max_write_keys: other_max_write_keys.clone(),
                         };
                         if f(me, &value, key)? {
                             break; // Stop early
@@ -529,10 +554,30 @@ impl<'a, const N: usize> Transaction<'a, N> {
             ref mut active_transactions,
             ..
         } = inner.deref_mut();
+        let other_max_write_keys = active_transactions
+            .iter()
+            .filter(|(tx_id, _)| **tx_id != self.tx_id)
+            .flat_map(|(_, op)| {
+                op.writes
+                    .iter()
+                    .filter(|(_, value)| value.is_some())
+                    .map(|((root, key), _)| (*root, *key))
+            })
+            .fold(BTreeMap::new(), |mut acc, (root, key)| {
+                acc.entry(root)
+                    .and_modify(|max_key| {
+                        if key > *max_key {
+                            *max_key = key;
+                        }
+                    })
+                    .or_insert(key);
+                acc
+            });
         let op = active_transactions.get_mut(&self.tx_id).unwrap();
         let locked_tx = LockedTransaction {
             btree: btree,
             active_transactions: op,
+            other_max_write_keys,
         };
         f(locked_tx)
     }
