@@ -133,16 +133,16 @@ fn try_extract_eq_condition(expr: &Expr) -> Option<(String, DbValue)> {
             return None;
         }
         // col = literal
-        if let Expr::Identifier(ident) = left.as_ref() {
-            if let Ok(val) = expr_to_dbvalue(right) {
-                return Some((ident.value.clone(), val));
-            }
+        if let Expr::Identifier(ident) = left.as_ref()
+            && let Ok(val) = expr_to_dbvalue(right)
+        {
+            return Some((ident.value.clone(), val));
         }
         // literal = col
-        if let Expr::Identifier(ident) = right.as_ref() {
-            if let Ok(val) = expr_to_dbvalue(left) {
-                return Some((ident.value.clone(), val));
-            }
+        if let Expr::Identifier(ident) = right.as_ref()
+            && let Ok(val) = expr_to_dbvalue(left)
+        {
+            return Some((ident.value.clone(), val));
         }
     }
     None
@@ -371,59 +371,58 @@ fn execute_locked<const N: usize>(
                 // Try to use an index or PK for simple `col = value` WHERE clauses.
                 let eq_cond = select.selection.as_ref().and_then(try_extract_eq_condition);
 
-                let rows: Vec<(crate::types::Key, Row)> = if let Some((ref col_name, ref value)) =
-                    eq_cond
-                {
-                    let col_idx = resolve_column(col_name, &schema)?;
-                    let pk_idx = schema.primary_key;
+                let rows: Vec<(crate::types::Key, Row)> =
+                    if let Some((ref col_name, ref value)) = eq_cond {
+                        let col_idx = resolve_column(col_name, &schema)?;
+                        let pk_idx = schema.primary_key;
 
-                    if pk_idx == col_idx {
-                        // Primary key point lookup
-                        if let DbValue::Integer(i) = value {
-                            if *i >= 0 {
-                                match tx.get(&table_name, *i as u64)? {
-                                    Some(row) => vec![(*i as u64, row)],
-                                    None => vec![],
+                        if pk_idx == col_idx {
+                            // Primary key point lookup
+                            if let DbValue::Integer(i) = value {
+                                if *i >= 0 {
+                                    match tx.get(&table_name, *i as u64)? {
+                                        Some(row) => vec![(*i as u64, row)],
+                                        None => vec![],
+                                    }
+                                } else {
+                                    vec![]
                                 }
                             } else {
+                                // PK is always integer; non-integer value can't match
                                 vec![]
                             }
                         } else {
-                            // PK is always integer; non-integer value can't match
-                            vec![]
+                            let indexed_cols = tx.get_indexed_columns(&table_name)?;
+                            if indexed_cols.contains(&col_name.to_string()) {
+                                // Index scan
+                                let bytes = db_value_to_bytes(value);
+                                collect_scan_by_index(tx, &table_name, col_name, bytes.as_slice())?
+                            } else {
+                                // No index — fall back to full scan
+                                tx.scan(&table_name, .., |_, _key, row| {
+                                    let row =
+                                        rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
+                                    let matches = match &select.selection {
+                                        Some(where_expr) => eval_where(where_expr, &row, &schema)?,
+                                        None => true,
+                                    };
+                                    if matches {
+                                        let projected = Row {
+                                            values: col_indices
+                                                .iter()
+                                                .map(|&i| row.values[i].clone())
+                                                .collect(),
+                                        };
+                                        result.push(projected);
+                                    }
+                                    Ok::<_, SqlError>(false)
+                                })?;
+                                return Ok(result);
+                            }
                         }
                     } else {
-                        let indexed_cols = tx.get_indexed_columns(&table_name)?;
-                        if indexed_cols.contains(&col_name.to_string()) {
-                            // Index scan
-                            let bytes = db_value_to_bytes(value);
-                            collect_scan_by_index(tx, &table_name, col_name, bytes.as_slice())?
-                        } else {
-                            // No index — fall back to full scan
-                            tx.scan(&table_name, .., |_, _key, row| {
-                                let row =
-                                    rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
-                                let matches = match &select.selection {
-                                    Some(where_expr) => eval_where(where_expr, &row, &schema)?,
-                                    None => true,
-                                };
-                                if matches {
-                                    let projected = Row {
-                                        values: col_indices
-                                            .iter()
-                                            .map(|&i| row.values[i].clone())
-                                            .collect(),
-                                    };
-                                    result.push(projected);
-                                }
-                                Ok::<_, SqlError>(false)
-                            })?;
-                            return Ok(result);
-                        }
-                    }
-                } else {
-                    collect_scan(tx, &table_name)?
-                };
+                        collect_scan(tx, &table_name)?
+                    };
 
                 for (_, row) in &rows {
                     let matches = match &select.selection {
@@ -456,7 +455,7 @@ fn execute_locked<const N: usize>(
             Statement::Delete(del) => {
                 let table_name = match del.from {
                     sqlparser::ast::FromTable::WithFromKeyword(table) => table
-                        .get(0)
+                        .first()
                         .map(|t| t.relation.to_string())
                         .ok_or(SqlError::UnsupportedStatement)?,
                     _ => return Err(SqlError::UnsupportedStatement),
@@ -493,7 +492,11 @@ fn execute_locked<const N: usize>(
                         let col_name = name.to_string();
                         // Handle qualified names (table.column) by taking just the column part
                         let col_name = if col_name.contains('.') {
-                            col_name.split('.').last().unwrap_or(&col_name).to_string()
+                            col_name
+                                .split('.')
+                                .next_back()
+                                .unwrap_or(&col_name)
+                                .to_string()
                         } else {
                             col_name
                         };
@@ -544,8 +547,8 @@ pub fn execute<const N: usize>(
 mod tests {
     use super::*;
     use crate::{Database, Pager};
-    use std::ops::RangeBounds;
     use std::fs;
+    use std::ops::RangeBounds;
     use tempfile::NamedTempFile;
 
     fn open_db() -> (Database<4096>, NamedTempFile) {
@@ -660,7 +663,8 @@ mod tests {
         assert_eq!(row.values[4], DbValue::Bool(true));
 
         // Nullable columns accept null
-        insert(&mut tx, 
+        insert(
+            &mut tx,
             "items",
             &Row {
                 values: vec![
@@ -705,7 +709,8 @@ mod tests {
         .unwrap();
 
         // b and d are nullable, a and c are NOT NULL
-        insert(&mut tx, 
+        insert(
+            &mut tx,
             "t",
             &Row {
                 values: vec![
@@ -906,9 +911,13 @@ mod tests {
         .unwrap();
 
         // Index should be usable via scan_by_index
-        let rows =
-            scan_by_index(&mut tx, "users", "name", b"Alice".as_ref()..=b"Alice".as_ref())
-                .unwrap();
+        let rows = scan_by_index(
+            &mut tx,
+            "users",
+            "name",
+            b"Alice".as_ref()..=b"Alice".as_ref(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[1], DbValue::Text("Alice".into()));
     }
@@ -922,8 +931,7 @@ mod tests {
         execute(&mut tx, "CREATE INDEX idx_x ON t (x)").unwrap();
 
         let key_20 = 20i64.to_be_bytes().to_vec();
-        let rows = scan_by_index(&mut tx, "t", "x", key_20.as_slice()..=key_20.as_slice())
-            .unwrap();
+        let rows = scan_by_index(&mut tx, "t", "x", key_20.as_slice()..=key_20.as_slice()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[1], DbValue::Integer(20));
     }
@@ -943,8 +951,7 @@ mod tests {
         tx.commit().unwrap();
 
         let mut tx = db.begin_transaction();
-        let rows = scan_by_index(&mut tx, "t", "name", b"Bob".as_ref()..=b"Bob".as_ref())
-            .unwrap();
+        let rows = scan_by_index(&mut tx, "t", "name", b"Bob".as_ref()..=b"Bob".as_ref()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[2], DbValue::Integer(25));
     }
@@ -977,14 +984,22 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.values[1], DbValue::Text("Bob".into()));
 
-        let alice =
-            scan_by_index(&mut tx, "users", "name", b"Alice".as_ref()..=b"Alice".as_ref())
-                .unwrap();
-        let bob = scan_by_index(&mut tx, "users", "name", b"Bob".as_ref()..=b"Bob".as_ref())
-            .unwrap();
-        let charlie =
-            scan_by_index(&mut tx, "users", "name", b"Charlie".as_ref()..=b"Charlie".as_ref())
-                .unwrap();
+        let alice = scan_by_index(
+            &mut tx,
+            "users",
+            "name",
+            b"Alice".as_ref()..=b"Alice".as_ref(),
+        )
+        .unwrap();
+        let bob =
+            scan_by_index(&mut tx, "users", "name", b"Bob".as_ref()..=b"Bob".as_ref()).unwrap();
+        let charlie = scan_by_index(
+            &mut tx,
+            "users",
+            "name",
+            b"Charlie".as_ref()..=b"Charlie".as_ref(),
+        )
+        .unwrap();
 
         assert!(alice.is_empty());
         assert_eq!(bob.len(), 1);

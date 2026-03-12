@@ -175,10 +175,10 @@ impl<const N: usize> Pager<N> {
 
     /// Insert a page into the cache, flushing any evicted dirty page to disk.
     fn cache_put(&mut self, page_num: u64, data: Box<AnyPage<N>>) -> io::Result<()> {
-        if let Some((evicted_page, evicted_data)) = self.cache.push(page_num, data) {
-            if self.dirty.remove(&evicted_page) {
-                self.flush_page(evicted_page, &evicted_data)?;
-            }
+        if let Some((evicted_page, evicted_data)) = self.cache.push(page_num, data)
+            && self.dirty.remove(&evicted_page)
+        {
+            self.flush_page(evicted_page, &evicted_data)?;
         }
         Ok(())
     }
@@ -288,7 +288,7 @@ impl<const N: usize> Pager<N> {
     /// Write overflow data across multiple pages, returns start page number.
     pub fn write_overflow(&mut self, data: &[u8]) -> io::Result<u64> {
         let data_per_page = N - 8;
-        let num_pages = (data.len() + data_per_page - 1) / data_per_page;
+        let num_pages = data.len().div_ceil(data_per_page);
         assert!(num_pages > 0);
 
         let pages: Vec<u64> = (0..num_pages)

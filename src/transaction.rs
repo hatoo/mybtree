@@ -170,7 +170,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         let mut key = self.btree.available_key(root)?;
 
         if let Some(&other_max) = self.other_max_write_keys.get(&root) {
-            let candidate = other_max.checked_add(1).unwrap_or(u64::MAX);
+            let candidate = other_max.saturating_add(1);
             if candidate > key {
                 key = candidate;
             }
@@ -184,7 +184,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             .rev()
             .find(|&&(r, _k)| r == root && self.active_transactions.writes[&(r, _k)].is_some())
         {
-            let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
+            let candidate = max_write_key.saturating_add(1);
             if candidate > key {
                 key = candidate;
             }
@@ -196,7 +196,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
     pub fn read(&mut self, root: NodePtr, key: Key) -> Result<Option<Cow<'_, [u8]>>, TreeError> {
         self.active_transactions.reads.insert((root, key));
         if let Some(value) = self.active_transactions.writes.get(&(root, key)) {
-            return Ok(value.as_deref().map(|v| Cow::Borrowed(v)));
+            return Ok(value.as_deref().map(Cow::Borrowed));
         }
         let value = self.btree.read(root, key)?;
         Ok(value)
@@ -221,7 +221,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         let other_max_write_keys = other_max_write_keys.clone();
         active_transactions
             .range_reads
-            .push((root, range_bound.0.clone(), range_bound.1.clone()));
+            .push((root, range_bound.0, range_bound.1));
 
         let writes = active_transactions
             .writes
@@ -230,7 +230,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             .map(|((_, k), v)| (*k, v.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut last_bound = Bound::Unbounded;
-        btree.read_range(root, range_bound.clone(), |btree, k, v| {
+        btree.read_range(root, range_bound, |btree, k, v| {
             active_transactions.reads.insert((root, k));
 
             // check active writes between last_key and k for this root
@@ -258,9 +258,9 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
                         active_transactions,
                         other_max_write_keys: other_max_write_keys.clone(),
                     };
-                    return f(me, k, &v);
+                    f(me, k, &v)
                 } else {
-                    return Ok(false); // deleted key, skip
+                    Ok(false) // deleted key, skip
                 }
             } else {
                 let me = LockedTransaction {
@@ -273,7 +273,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             }
         })?;
         // check active writes between last_key and k for this root
-        for (&write_key, value) in writes.range((last_bound, range_bound.1.clone())) {
+        for (&write_key, value) in writes.range((last_bound, range_bound.1)) {
             if let Some(v) = value {
                 let me = LockedTransaction {
                     btree,
@@ -302,7 +302,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         let mut key = self.btree.available_key(root)?;
 
         if let Some(&other_max) = self.other_max_write_keys.get(&root) {
-            let candidate = other_max.checked_add(1).unwrap_or(u64::MAX);
+            let candidate = other_max.saturating_add(1);
             if candidate > key {
                 key = candidate;
             }
@@ -316,7 +316,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             .rev()
             .find(|&&(r, k)| r == root && self.active_transactions.writes[&(r, k)].is_some())
         {
-            let candidate = max_write_key.checked_add(1).unwrap_or(u64::MAX);
+            let candidate = max_write_key.saturating_add(1);
             if candidate > key {
                 key = candidate;
             }
@@ -340,35 +340,31 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
     {
         let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
 
-        self.active_transactions.range_reads.push((
-            root,
-            range_bound.0.clone(),
-            range_bound.1.clone(),
-        ));
+        self.active_transactions
+            .range_reads
+            .push((root, range_bound.0, range_bound.1));
 
-        let mut next_key = Some(range_bound.0.clone());
+        let mut next_key = Some(range_bound.0);
 
-        while let Some(search_from) = next_key.clone() {
+        while let Some(search_from) = next_key {
             let next_write_key = self
                 .active_transactions
                 .writes
-                .range(match search_from.clone() {
+                .range(match search_from {
                     Bound::Included(key) => (Bound::Included((root, key)), Bound::Unbounded),
                     Bound::Excluded(key) => (Bound::Excluded((root, key)), Bound::Unbounded),
                     Bound::Unbounded => (Bound::Included((root, 0)), Bound::Unbounded),
                 })
                 .take_while(|((write_root, _), _)| *write_root == root)
                 .find_map(|(&(write_root, write_key), value)| {
-                    (write_root == root
-                        && range_bound.contains(&write_key)
-                        && value.is_some())
-                    .then_some(write_key)
+                    (write_root == root && range_bound.contains(&write_key) && value.is_some())
+                        .then_some(write_key)
                 });
 
             let mut next_tree_entry = None;
             self.btree.read_range(
                 root,
-                (search_from, range_bound.1.clone()),
+                (search_from, range_bound.1),
                 |_btree, key, value: &[u8]| {
                     next_tree_entry = Some((key, value.to_vec()));
                     Ok::<_, TreeError>(true)
@@ -433,7 +429,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         // Find all keys in range from btree
         let mut keys_to_remove: Vec<Key> = Vec::new();
         self.btree
-            .read_range(root, range_bound.clone(), |_btree, key, _: &[u8]| {
+            .read_range(root, range_bound, |_btree, key, _: &[u8]| {
                 keys_to_remove.push(key);
                 Ok::<_, TreeError>(false)
             })?;
@@ -542,8 +538,8 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         // Record range read for conflict detection
         active_transactions.index_range_reads.push((
             idx_root,
-            range_bound.0.clone().map(|v| v.to_vec()),
-            range_bound.1.clone().map(|v| v.to_vec()),
+            range_bound.0.map(|v| v.to_vec()),
+            range_bound.1.map(|v| v.to_vec()),
         ));
 
         // Collect local index operations for this root
@@ -560,7 +556,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         // Iterate through btree entries
         btree.index_read_range(
             idx_root,
-            range_bound.clone(),
+            range_bound,
             |btree, value, key| -> Result<bool, E> {
                 // Check if this entry is locally deleted
                 if let Some((_, _, false)) =
@@ -669,7 +665,7 @@ impl<'a, const N: usize> Transaction<'a, N> {
             });
         let op = active_transactions.get_mut(&self.tx_id).unwrap();
         let locked_tx = LockedTransaction {
-            btree: btree,
+            btree,
             active_transactions: op,
             other_max_write_keys,
         };

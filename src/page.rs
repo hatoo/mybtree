@@ -412,7 +412,7 @@ impl<const N: usize> LeafPage<N> {
         // Calculate the maximum number of slots that can fit in a page
         let max_slots = (N - Self::HEADER_SIZE) / Self::SLOT_SIZE;
         // After split, the worst case is inserting into a page with ceil(max_slots/2) slots
-        let half_slots = (max_slots + 1) / 2;
+        let half_slots = max_slots.div_ceil(2);
         // Space used by slots in half-full page
         let used_slot_space = half_slots * Self::SLOT_SIZE;
         // Remaining space for value

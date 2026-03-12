@@ -418,10 +418,7 @@ impl<const N: usize> Btree<N> {
             };
             if !indices_to_remove.is_empty() {
                 {
-                    let p = self
-                        .pager
-                        .mut_node(leaf_ptr)
-                        .map_err(|e| TreeError::from(e))?;
+                    let p = self.pager.mut_node(leaf_ptr).map_err(TreeError::from)?;
                     let leaf_mut: &mut LeafPage<N> = p.try_into().unwrap();
                     for &i in indices_to_remove.iter().rev() {
                         leaf_mut.remove(i);
@@ -737,7 +734,7 @@ impl<const N: usize> Btree<N> {
         // Stack of (node_ptr, left_key)
         let mut stack = vec![(node_ptr, left_key)];
         while let Some((cur, lk)) = stack.pop() {
-            let page = self.pager.owned_node(cur).map_err(|e| TreeError::Io(e))?;
+            let page = self.pager.owned_node(cur).map_err(TreeError::Io)?;
             match page.page_type() {
                 PageType::Leaf => {
                     let leaf: LeafPage<N> = page.try_into().unwrap();
@@ -750,7 +747,7 @@ impl<const N: usize> Btree<N> {
                                 let data = self
                                     .pager
                                     .read_overflow(start_page, total_len)
-                                    .map_err(|e| TreeError::Io(e))?;
+                                    .map_err(TreeError::Io)?;
                                 if f(self, k, &data)? {
                                     return Ok(());
                                 }
@@ -795,7 +792,7 @@ impl<const N: usize> Btree<N> {
             PageType::Leaf => {
                 let leaf: LeafPage<N> = page.try_into().unwrap();
                 if leaf.len() > 0 {
-                    Ok(leaf.key(leaf.len() - 1).checked_add(1).unwrap_or(u64::MAX))
+                    Ok(leaf.key(leaf.len() - 1).saturating_add(1))
                 } else {
                     Ok(0)
                 }
@@ -803,19 +800,14 @@ impl<const N: usize> Btree<N> {
             PageType::Internal => {
                 let internal: InternalPage<N> = page.try_into().unwrap();
                 if internal.len() > 0 {
-                    Ok(internal
-                        .key(internal.len() - 1)
-                        .checked_add(1)
-                        .unwrap_or(u64::MAX))
+                    Ok(internal.key(internal.len() - 1).saturating_add(1))
                 } else {
                     Ok(0)
                 }
             }
-            _ => {
-                return Err(TreeError::UnexpectedPageType {
-                    expected: "Leaf or Internal",
-                });
-            }
+            _ => Err(TreeError::UnexpectedPageType {
+                expected: "Leaf or Internal",
+            }),
         }
     }
 
@@ -893,10 +885,11 @@ impl<const N: usize> Btree<N> {
                     match leaf.search_entry_inline(value, key) {
                         Ok(result) => {
                             // Check for duplicate
-                            if let Some(idx) = result {
-                                if leaf.key(idx) == value && leaf.value(idx) == key {
-                                    return Ok(false);
-                                }
+                            if let Some(idx) = result
+                                && leaf.key(idx) == value
+                                && leaf.value(idx) == key
+                            {
+                                return Ok(false);
                             }
                             let insert_idx = result.unwrap_or(leaf.len());
                             let can_insert = leaf.can_insert(value.len());
@@ -1606,10 +1599,10 @@ impl<const N: usize> Btree<N> {
                     let leaf: &IndexLeafPage<N> = page.try_into().unwrap();
                     match leaf.search_inline(value) {
                         Ok(result) => {
-                            if let Some(idx) = result {
-                                if leaf.key(idx) == value {
-                                    return Ok(Some(leaf.value(idx)));
-                                }
+                            if let Some(idx) = result
+                                && leaf.key(idx) == value
+                            {
+                                return Ok(Some(leaf.value(idx)));
                             }
                             return Ok(None);
                         }
@@ -1664,7 +1657,7 @@ impl<const N: usize> Btree<N> {
         let page_type = self
             .pager
             .read_node(node_ptr)
-            .map_err(|e| TreeError::from(e))?
+            .map_err(TreeError::from)?
             .page_type();
         match page_type {
             PageType::IndexLeaf => self.index_read_range_leaf(node_ptr, range, f),
@@ -1681,10 +1674,7 @@ impl<const N: usize> Btree<N> {
         range: &R,
         f: &mut impl FnMut(&mut Self, &[u8], Key) -> Result<bool, E>,
     ) -> Result<(), E> {
-        let page = self
-            .pager
-            .owned_node(node_ptr)
-            .map_err(|e| TreeError::from(e))?;
+        let page = self.pager.owned_node(node_ptr).map_err(TreeError::from)?;
         let leaf: IndexLeafPage<N> = page.try_into().unwrap();
         let len = leaf.len();
 
@@ -1725,10 +1715,10 @@ impl<const N: usize> Btree<N> {
             }
 
             // Skip entries before Excluded start
-            if let Bound::Excluded(s) = range.start_bound() {
-                if key_bytes == *s {
-                    continue;
-                }
+            if let Bound::Excluded(s) = range.start_bound()
+                && key_bytes == *s
+            {
+                continue;
             }
 
             if f(self, key_bytes, leaf.value(i))? {
@@ -1755,10 +1745,8 @@ impl<const N: usize> Btree<N> {
             let key_bytes = leaf
                 .resolved_key(i, &mut self.pager)
                 .map_err(|e| E::from(TreeError::from(e)))?;
-            if range.contains(&key_bytes.as_ref()) {
-                if f(self, key_bytes.as_ref(), leaf.value(i))? {
-                    return Ok(());
-                }
+            if range.contains(&key_bytes.as_ref()) && f(self, key_bytes.as_ref(), leaf.value(i))? {
+                return Ok(());
             }
             let past_end = match range.end_bound() {
                 Bound::Included(e) => key_bytes.as_ref() > *e,
@@ -1805,7 +1793,7 @@ impl<const N: usize> Btree<N> {
         };
 
         match (start_idx, end_idx) {
-            (Ok(s), _) if s >= len => return Ok(()),
+            (Ok(s), _) if s >= len => Ok(()),
             (Ok(s), Ok(e)) => {
                 let e = e.min(len - 1);
                 let children: Vec<NodePtr> = (s..=e).map(|i| internal.ptr(i)).collect();
@@ -1877,7 +1865,7 @@ impl<const N: usize> Btree<N> {
                 Ok((0..leaf.len())
                     .map(|i| leaf.value(i))
                     .max()
-                    .map_or(0, |k| k.checked_add(1).unwrap_or(u64::MAX)))
+                    .map_or(0, |k| k.saturating_add(1)))
             }
             PageType::IndexInternal => {
                 let internal: IndexInternalPage<N> = page.try_into().unwrap();
@@ -1888,11 +1876,9 @@ impl<const N: usize> Btree<N> {
                 }
                 Ok(max_key)
             }
-            _ => {
-                return Err(TreeError::UnexpectedPageType {
-                    expected: "IndexLeaf or IndexInternal",
-                });
-            }
+            _ => Err(TreeError::UnexpectedPageType {
+                expected: "IndexLeaf or IndexInternal",
+            }),
         }
     }
 

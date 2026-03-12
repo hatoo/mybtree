@@ -201,11 +201,10 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         if let Some(catalog_key) = self
             .tx
             .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
+            && let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)?
         {
-            if let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)? {
-                let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
-                return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
-            }
+            let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
+            return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
         }
         Ok(None)
     }
@@ -423,7 +422,7 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
             .read_range(meta.root_page, range, |tx, key, value| {
                 let archived = rkyv::access::<rkyv::Archived<Row>, Error>(value)
                     .map_err(|e| E::from(DatabaseError::Internal(e)))?;
-                Ok(f(LockedDbTransaction { tx }, key, archived).map_err(|e| E1::Error(e))?)
+                f(LockedDbTransaction { tx }, key, archived).map_err(|e| E1::Error(e))
             })
             .map_err(|e| match e {
                 E1::Error(e) => e,
@@ -485,7 +484,7 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
                 let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)
                     .map_err(|e| E::from(DatabaseError::Internal(e)))?;
                 let locked = LockedDbTransaction { tx };
-                Ok(f(locked, archived, key).map_err(|e| E1::Error(e))?)
+                f(locked, archived, key).map_err(|e| E1::Error(e))
             })
             .map_err(|e| match e {
                 E1::Error(e) => e,
