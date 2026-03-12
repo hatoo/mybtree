@@ -370,6 +370,26 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         Ok(())
     }
 
+    pub fn drop_index(&mut self, table_name: &str, column_name: &str) -> Result<(), DatabaseError> {
+        let mut meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        let idx_pos = meta
+            .index_trees
+            .iter()
+            .position(|(c, _)| c == column_name)
+            .ok_or_else(|| {
+                DatabaseError::SchemaMismatch(format!("no index on column '{}'", column_name))
+            })?;
+
+        let (_, idx_root) = meta.index_trees.remove(idx_pos);
+        self.tx.free_index_tree(idx_root);
+        self.update_table_meta(table_name, &meta)?;
+
+        Ok(())
+    }
+
     pub fn scan<F, E: From<DatabaseError>>(
         &mut self,
         table_name: &str,
