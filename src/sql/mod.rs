@@ -6,7 +6,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::database::{
-    Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema, db_value_to_bytes,
+    Column, ColumnType, DatabaseError, DbTransaction, DbValue, LockedDbTransaction, Row, Schema,
+    db_value_to_bytes,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -192,8 +193,40 @@ fn eval_where(expr: &Expr, row: &Row, schema: &Schema) -> Result<bool, SqlError>
     }
 }
 
-pub fn execute<const N: usize>(
-    tx: &mut DbTransaction<'_, N>,
+fn collect_scan<const N: usize>(
+    tx: &mut LockedDbTransaction<'_, N>,
+    table_name: &str,
+) -> Result<Vec<(crate::types::Key, Row)>, SqlError> {
+    let mut rows = Vec::new();
+    tx.scan(table_name, .., |_, key, row| {
+        rows.push((
+            key,
+            rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap(),
+        ));
+        Ok::<_, SqlError>(false)
+    })?;
+    Ok(rows)
+}
+
+fn collect_scan_by_index<const N: usize>(
+    tx: &mut LockedDbTransaction<'_, N>,
+    table_name: &str,
+    column_name: &str,
+    value: &[u8],
+) -> Result<Vec<(crate::types::Key, Row)>, SqlError> {
+    let mut rows = Vec::new();
+    tx.scan_by_index(table_name, column_name, value..=value, |_, row, key| {
+        rows.push((
+            key,
+            rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap(),
+        ));
+        Ok::<_, SqlError>(false)
+    })?;
+    Ok(rows)
+}
+
+fn execute_locked<const N: usize>(
+    tx: &mut LockedDbTransaction<'_, N>,
     sql: &str,
 ) -> Result<Vec<Row>, SqlError> {
     let dialect = GenericDialect {};
@@ -239,10 +272,7 @@ pub fn execute<const N: usize>(
                     primary_key: primary_key.unwrap_or(0),
                     implicit_pk: primary_key.is_none(),
                 };
-                tx.with_lock(move |mut lock| {
-                    lock.create_table(&ct.name.to_string(), schema, primary_key)?;
-                    Ok::<_, SqlError>(())
-                })?;
+                tx.create_table(&ct.name.to_string(), schema, primary_key)?;
             }
             Statement::Insert(ins) => {
                 let table_name = ins.table.to_string();
@@ -342,40 +372,32 @@ pub fn execute<const N: usize>(
                         if indexed_cols.contains(&col_name.to_string()) {
                             // Index scan
                             let bytes = db_value_to_bytes(value);
-                            tx.scan_by_index(
-                                &table_name,
-                                col_name,
-                                bytes.as_slice()..=bytes.as_slice(),
-                            )?
+                            collect_scan_by_index(tx, &table_name, col_name, bytes.as_slice())?
                         } else {
                             // No index — fall back to full scan
-                            // testing new impl
-                            // tx.scan(&table_name, ..)?
-                            tx.with_lock(|mut lock| {
-                                lock.scan(&table_name, .., |_, _key, row| {
-                                    let row =
-                                        rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
-                                    let matches = match &select.selection {
-                                        Some(where_expr) => eval_where(where_expr, &row, &schema)?,
-                                        None => true,
+                            tx.scan(&table_name, .., |_, _key, row| {
+                                let row =
+                                    rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
+                                let matches = match &select.selection {
+                                    Some(where_expr) => eval_where(where_expr, &row, &schema)?,
+                                    None => true,
+                                };
+                                if matches {
+                                    let projected = Row {
+                                        values: col_indices
+                                            .iter()
+                                            .map(|&i| row.values[i].clone())
+                                            .collect(),
                                     };
-                                    if matches {
-                                        let projected = Row {
-                                            values: col_indices
-                                                .iter()
-                                                .map(|&i| row.values[i].clone())
-                                                .collect(),
-                                        };
-                                        result.push(projected);
-                                    }
-                                    Ok::<_, SqlError>(false)
-                                })
+                                    result.push(projected);
+                                }
+                                Ok::<_, SqlError>(false)
                             })?;
                             return Ok(result);
                         }
                     }
                 } else {
-                    tx.scan(&table_name, ..)?
+                    collect_scan(tx, &table_name)?
                 };
 
                 for (_, row) in &rows {
@@ -418,7 +440,7 @@ pub fn execute<const N: usize>(
                 let schema = tx.get_schema(&table_name)?;
 
                 // Scan all rows
-                let rows: Vec<(crate::types::Key, Row)> = tx.scan(&table_name, ..)?;
+                let rows = collect_scan(tx, &table_name)?;
 
                 // Collect keys to delete
                 let mut keys_to_delete = Vec::new();
@@ -471,7 +493,7 @@ pub fn execute<const N: usize>(
                 }
 
                 // Scan all rows
-                let rows: Vec<(crate::types::Key, Row)> = tx.scan(&table_name, ..)?;
+                let rows = collect_scan(tx, &table_name)?;
 
                 // Update matching rows
                 for (key, mut row) in rows {
@@ -495,6 +517,13 @@ pub fn execute<const N: usize>(
     }
 
     Ok(result)
+}
+
+pub fn execute<const N: usize>(
+    tx: &mut DbTransaction<'_, N>,
+    sql: &str,
+) -> Result<Vec<Row>, SqlError> {
+    tx.with_lock(|mut tx| execute_locked(&mut tx, sql))
 }
 
 #[cfg(test)]

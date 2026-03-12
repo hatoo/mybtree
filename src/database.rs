@@ -1,6 +1,6 @@
 use std::ops::RangeBounds;
 
-use rkyv::rancor::Error;
+use rkyv::rancor::{Error, Source};
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::Pager;
@@ -472,10 +472,19 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         }
 
         self.tx
-            .index_read_range(idx_root, range, |tx, value, key| {
-                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(value)
+            .index_read_range(idx_root, range, |mut tx, _value, key| {
+                let bytes = {
+                    tx.read(meta.root_page, key)?.ok_or_else(|| {
+                        E::from(DatabaseError::Internal(Error::new(
+                            std::io::Error::other("missing row for index entry"),
+                        )))
+                    })?
+                    .into_owned()
+                };
+                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)
                     .map_err(|e| E::from(DatabaseError::Internal(e)))?;
-                Ok(f(LockedDbTransaction { tx }, archived, key).map_err(|e| E1::Error(e))?)
+                let locked = LockedDbTransaction { tx };
+                Ok(f(locked, archived, key).map_err(|e| E1::Error(e))?)
             })
             .map_err(|e| match e {
                 E1::Error(e) => e,
