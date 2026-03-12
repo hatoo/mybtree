@@ -210,6 +210,13 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         Ok(None)
     }
 
+    pub fn get_schema(&mut self, name: &str) -> Result<Schema, DatabaseError> {
+        let meta = self
+            .find_table_meta(name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+        Ok(meta.schema)
+    }
+
     pub fn scan<F, E: From<DatabaseError>>(
         &mut self,
         table_name: &str,
@@ -249,6 +256,58 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
                 E1::Error(e) => e,
             })?;
         Ok(())
+    }
+
+    pub fn insert(&mut self, table_name: &str, row: &Row) -> Result<Key, DatabaseError> {
+        let meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        let pk_idx = meta.schema.primary_key;
+        let mut row = row.clone();
+
+        // Handle auto-assign for implicit _rowid (Null in PK position).
+        if row.values[pk_idx] == DbValue::Null {
+            let next = self.tx.available_key(meta.root_page)?;
+            row.values[pk_idx] = DbValue::Integer(next as i64);
+        }
+
+        validate_row(&row, &meta.schema)?;
+
+        // Extract PK value and convert to B-tree key.
+        let key = match &row.values[pk_idx] {
+            DbValue::Integer(i) => {
+                if *i < 0 {
+                    return Err(DatabaseError::SchemaMismatch(
+                        "primary key value must be non-negative".to_string(),
+                    ));
+                }
+                *i as Key
+            }
+            _ => unreachable!("PK column validated as integer"),
+        };
+
+        // Check for duplicate key.
+        if self.tx.read(meta.root_page, key)?.is_some() {
+            return Err(DatabaseError::DuplicateKey(key));
+        }
+
+        self.tx
+            .write(meta.root_page, key, rkyv::to_bytes::<Error>(&row)?.to_vec());
+
+        // Update index trees
+        for (col_name, idx_root) in &meta.index_trees {
+            let col_idx = meta
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == *col_name)
+                .unwrap();
+            let col_bytes = db_value_to_bytes(&row.values[col_idx]);
+            self.tx.index_insert(*idx_root, key, col_bytes);
+        }
+
+        Ok(key)
     }
 }
 
