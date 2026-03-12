@@ -522,7 +522,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
 }
 
 impl<'a, const N: usize> Transaction<'a, N> {
-    pub fn with_lock<T>(&mut self, mut f: impl FnMut(LockedTransaction<'_, N>) -> T) -> T {
+    pub fn with_lock<T>(&mut self, f: impl FnOnce(LockedTransaction<'_, N>) -> T) -> T {
         let mut inner = self.store.lock().unwrap();
         let &mut TransactionStoreInner {
             ref mut btree,

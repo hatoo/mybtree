@@ -642,7 +642,7 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
 }
 
 impl<'a, const N: usize> DbTransaction<'a, N> {
-    pub fn with_lock<T>(&mut self, mut f: impl FnMut(LockedDbTransaction<'_, N>) -> T) -> T {
+    pub fn with_lock<T>(&mut self, f: impl FnOnce(LockedDbTransaction<'_, N>) -> T) -> T {
         self.tx.with_lock(|tx| f(LockedDbTransaction { tx }))
     }
 

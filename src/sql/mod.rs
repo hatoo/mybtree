@@ -239,7 +239,10 @@ pub fn execute<const N: usize>(
                     primary_key: primary_key.unwrap_or(0),
                     implicit_pk: primary_key.is_none(),
                 };
-                tx.create_table(&ct.name.to_string(), schema, primary_key)?;
+                tx.with_lock(move |mut lock| {
+                    lock.create_table(&ct.name.to_string(), schema, primary_key)?;
+                    Ok::<_, SqlError>(())
+                })?;
             }
             Statement::Insert(ins) => {
                 let table_name = ins.table.to_string();
