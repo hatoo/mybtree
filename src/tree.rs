@@ -1642,19 +1642,7 @@ impl<const N: usize> Btree<N> {
         }
     }
 
-    pub fn index_read_range<'a, R: RangeBounds<&'a [u8]>>(
-        &mut self,
-        root: NodePtr,
-        range: R,
-        mut f: impl FnMut(&[u8], Key),
-    ) -> Result<(), TreeError> {
-        self.index_read_range_at(root, &range, &mut |_s, value, key| {
-            f(value, key);
-            Ok(false)
-        })
-    }
-
-    pub fn index_read_range_map<'a, R: RangeBounds<&'a [u8]>, E: From<TreeError>>(
+    pub fn index_read_range<'a, R: RangeBounds<&'a [u8]>, E: From<TreeError>>(
         &mut self,
         root: NodePtr,
         range: R,
@@ -2908,8 +2896,9 @@ mod tests {
 
         let mut results = Vec::new();
         btree
-            .index_read_range(root, b"bbb".as_ref()..=b"ddd".as_ref(), |v, k| {
-                results.push((v.to_vec(), k))
+            .index_read_range(root, b"bbb".as_ref()..=b"ddd".as_ref(), |_btree, v, k| {
+                results.push((v.to_vec(), k));
+                Ok::<_, TreeError>(false)
             })
             .unwrap();
 
@@ -2930,7 +2919,10 @@ mod tests {
 
         let mut results = Vec::new();
         btree
-            .index_read_range(root, .., |v, k| results.push((v.to_vec(), k)))
+            .index_read_range(root, .., |_btree, v, k| {
+                results.push((v.to_vec(), k));
+                Ok::<_, TreeError>(false)
+            })
             .unwrap();
         assert_eq!(results.len(), 10);
     }
@@ -2942,8 +2934,9 @@ mod tests {
 
         let mut results = Vec::new();
         btree
-            .index_read_range(root, b"zzz".as_ref()..=b"zzzz".as_ref(), |v, k| {
-                results.push((v.to_vec(), k))
+            .index_read_range(root, b"zzz".as_ref()..=b"zzzz".as_ref(), |_btree, v, k| {
+                results.push((v.to_vec(), k));
+                Ok::<_, TreeError>(false)
             })
             .unwrap();
         assert!(results.is_empty());
@@ -3087,7 +3080,10 @@ mod tests {
 
         let mut result = Vec::new();
         btree
-            .index_read_range(root, .., |v, _k| result.push(v.to_vec()))
+            .index_read_range(root, .., |_btree, v, _k| {
+                result.push(v.to_vec());
+                Ok::<_, TreeError>(false)
+            })
             .unwrap();
 
         let mut sorted = result.clone();
@@ -3110,8 +3106,9 @@ mod tests {
 
         let mut results = Vec::new();
         btree
-            .index_read_range(root, b"0050".as_ref()..b"0150".as_ref(), |v, _k| {
-                results.push(v.to_vec())
+            .index_read_range(root, b"0050".as_ref()..b"0150".as_ref(), |_btree, v, _k| {
+                results.push(v.to_vec());
+                Ok::<_, TreeError>(false)
             })
             .unwrap();
 

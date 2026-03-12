@@ -464,7 +464,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         let mut early_stop = false;
 
         // Iterate through btree entries
-        btree.index_read_range_map(
+        btree.index_read_range(
             idx_root,
             range_bound.clone(),
             |btree, value, key| -> Result<bool, E> {
