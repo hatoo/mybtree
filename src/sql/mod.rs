@@ -4,6 +4,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::ops::Bound;
 
 use crate::database::{
     Column, ColumnType, DatabaseError, DbTransaction, DbValue, LockedDbTransaction, Row, Schema,
@@ -145,6 +146,30 @@ fn try_extract_eq_condition(expr: &Expr) -> Option<(String, DbValue)> {
         }
     }
     None
+}
+
+fn select_pk_eq_range(selection: Option<&Expr>, schema: &Schema) -> (Bound<u64>, Bound<u64>) {
+    let Some((column_name, value)) = selection.and_then(try_extract_eq_condition) else {
+        return (Bound::Unbounded, Bound::Unbounded);
+    };
+
+    let Some(pk_column) = schema.columns.get(schema.primary_key) else {
+        return (Bound::Unbounded, Bound::Unbounded);
+    };
+
+    if column_name != pk_column.name {
+        return (Bound::Unbounded, Bound::Unbounded);
+    }
+
+    let DbValue::Integer(key) = value else {
+        return (Bound::Unbounded, Bound::Unbounded);
+    };
+    if key < 0 {
+        return (Bound::Included(1), Bound::Excluded(1));
+    }
+
+    let key = key as u64;
+    (Bound::Included(key), Bound::Included(key))
 }
 
 fn eval_where(expr: &Expr, row: &Row, schema: &Schema) -> Result<bool, SqlError> {
@@ -438,26 +463,15 @@ fn execute_locked<const N: usize>(
                 };
 
                 let schema = tx.get_schema(&table_name)?;
-
-                // Scan all rows
-                let rows = collect_scan(tx, &table_name)?;
-
-                // Collect keys to delete
-                let mut keys_to_delete = Vec::new();
-                for (key, row) in &rows {
+                let pk_range = select_pk_eq_range(del.selection.as_ref(), &schema);
+                tx.delete_range_where(&table_name, pk_range, |_, row| {
+                    let row = rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
                     let matches = match &del.selection {
-                        Some(where_expr) => eval_where(where_expr, row, &schema)?,
+                        Some(where_expr) => eval_where(where_expr, &row, &schema)?,
                         None => true,
                     };
-                    if matches {
-                        keys_to_delete.push(*key);
-                    }
-                }
-
-                // Delete matching rows
-                for key in keys_to_delete {
-                    tx.delete(&table_name, key)?;
-                }
+                    Ok::<_, SqlError>((matches, false))
+                })?;
             }
             Statement::Update(upd) => {
                 // Extract table name from the table reference
@@ -943,6 +957,38 @@ mod tests {
         execute(&mut tx, "CREATE INDEX idx1 ON t (x)").unwrap();
         let err = execute(&mut tx, "CREATE INDEX idx2 ON t (x)").unwrap_err();
         assert!(matches!(err, SqlError::Database(_)));
+    }
+
+    #[test]
+    fn test_delete_uses_range_delete_and_updates_indexes() {
+        let (db, _tmp) = open_db();
+        let mut tx = db.begin_transaction();
+        execute(&mut tx, "CREATE TABLE users (name TEXT, age INTEGER)").unwrap();
+        execute(&mut tx, "CREATE INDEX idx_name ON users (name)").unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 40)",
+        )
+        .unwrap();
+
+        execute(&mut tx, "DELETE FROM users WHERE age >= 30").unwrap();
+
+        let rows = scan(&mut tx, "users", ..).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.values[1], DbValue::Text("Bob".into()));
+
+        let alice =
+            scan_by_index(&mut tx, "users", "name", b"Alice".as_ref()..=b"Alice".as_ref())
+                .unwrap();
+        let bob = scan_by_index(&mut tx, "users", "name", b"Bob".as_ref()..=b"Bob".as_ref())
+            .unwrap();
+        let charlie =
+            scan_by_index(&mut tx, "users", "name", b"Charlie".as_ref()..=b"Charlie".as_ref())
+                .unwrap();
+
+        assert!(alice.is_empty());
+        assert_eq!(bob.len(), 1);
+        assert!(charlie.is_empty());
     }
 
     #[test]

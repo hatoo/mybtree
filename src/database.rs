@@ -587,6 +587,60 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         Ok(())
     }
 
+    pub fn delete_range_where<F, E: From<DatabaseError>>(
+        &mut self,
+        table_name: &str,
+        range: impl RangeBounds<Key>,
+        mut f: F,
+    ) -> Result<(), E>
+    where
+        F: for<'local> FnMut(Key, &'local rkyv::Archived<Row>) -> Result<(bool, bool), E>,
+    {
+        let meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        #[derive(thiserror::Error)]
+        enum E1<E> {
+            #[error("{0}")]
+            Error(#[from] E),
+        }
+
+        impl<E: From<DatabaseError>> From<TreeError> for E1<E> {
+            fn from(err: TreeError) -> Self {
+                E1::Error(E::from(DatabaseError::TreeError(err)))
+            }
+        }
+
+        self.tx
+            .remove_range_where(meta.root_page, range, |mut tx, key, value| {
+                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(value)
+                    .map_err(|e| E::from(DatabaseError::Internal(e)))?;
+                let row = rkyv::deserialize::<Row, Error>(archived)
+                    .map_err(|e| E::from(DatabaseError::Internal(e)))?;
+                let (should_remove, should_stop) = f(key, archived).map_err(E1::Error)?;
+
+                if should_remove {
+                    for (col_name, idx_root) in &meta.index_trees {
+                        let col_idx = meta
+                            .schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name == *col_name)
+                            .unwrap();
+                        let col_bytes = db_value_to_bytes(&row.values[col_idx]);
+                        tx.index_remove(*idx_root, &col_bytes, key);
+                    }
+                }
+
+                Ok((should_remove, should_stop))
+            })
+            .map_err(|e| match e {
+                E1::Error(e) => e,
+            })?;
+        Ok(())
+    }
+
     pub fn update(&mut self, table_name: &str, key: Key, row: &Row) -> Result<(), DatabaseError> {
         let meta = self
             .find_table_meta(table_name)?
