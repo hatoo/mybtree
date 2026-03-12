@@ -510,16 +510,14 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         Ok(page)
     }
 
-    pub fn free_tree(&mut self, root: NodePtr) -> Result<(), TreeError> {
-        self.active_transactions.deferred_free_trees.push(root);
-        Ok(())
+    pub fn free_tree(&mut self, root: NodePtr) {
+        self.active_transactions.deferred_free_trees.push(root)
     }
 
-    pub fn free_index_tree(&mut self, root: NodePtr) -> Result<(), TreeError> {
+    pub fn free_index_tree(&mut self, root: NodePtr) {
         self.active_transactions
             .deferred_free_index_trees
-            .push(root);
-        Ok(())
+            .push(root)
     }
 }
 

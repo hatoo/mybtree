@@ -210,11 +210,164 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         Ok(None)
     }
 
+    /// Rewrite the catalog entry for `table_name` with the given `meta`.
+    fn update_table_meta(
+        &mut self,
+        table_name: &str,
+        meta: &TableMeta,
+    ) -> Result<(), DatabaseError> {
+        let catalog_key = self
+            .tx
+            .index_read(CATALOG_INDEX_PAGE_NUM, table_name.as_bytes())?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        self.tx.write(
+            CATALOG_PAGE_NUM,
+            catalog_key,
+            rkyv::to_bytes::<Error>(meta)?.to_vec(),
+        );
+        Ok(())
+    }
+
     pub fn get_schema(&mut self, name: &str) -> Result<Schema, DatabaseError> {
         let meta = self
             .find_table_meta(name)?
             .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
         Ok(meta.schema)
+    }
+
+    pub fn create_table(
+        &mut self,
+        name: &str,
+        mut schema: Schema,
+        pk_index: Option<usize>,
+    ) -> Result<(), DatabaseError> {
+        if self.find_table_meta(name)?.is_some() {
+            return Err(DatabaseError::TableAlreadyExists(name.to_string()));
+        }
+
+        // If no explicit primary key, prepend an implicit `_rowid` column.
+        if let Some(pk_idx) = pk_index {
+            schema.primary_key = pk_idx;
+            schema.implicit_pk = false;
+        } else {
+            schema.columns.insert(
+                0,
+                Column {
+                    name: "_rowid".to_string(),
+                    column_type: ColumnType::Integer,
+                    nullable: false,
+                },
+            );
+            schema.primary_key = 0;
+            schema.implicit_pk = true;
+        }
+
+        // Validate PK column is integer and not nullable.
+        let pk_idx = schema.primary_key;
+        let pk_col = &schema.columns[pk_idx];
+        if pk_col.column_type != ColumnType::Integer {
+            return Err(DatabaseError::SchemaMismatch(
+                "primary key column must be INTEGER".to_string(),
+            ));
+        }
+        if pk_col.nullable {
+            return Err(DatabaseError::SchemaMismatch(
+                "primary key column must be NOT NULL".to_string(),
+            ));
+        }
+
+        let root_page = self.tx.init_tree()?;
+        let meta = TableMeta {
+            name: name.to_string(),
+            schema,
+            root_page,
+            index_trees: vec![],
+        };
+
+        let catalog_key = self
+            .tx
+            .insert(CATALOG_PAGE_NUM, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
+        self.tx.index_insert(
+            CATALOG_INDEX_PAGE_NUM,
+            catalog_key,
+            name.as_bytes().to_vec(),
+        );
+
+        Ok(())
+    }
+
+    pub fn drop_table(&mut self, name: &str) -> Result<(), DatabaseError> {
+        let catalog_key = self
+            .tx
+            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+
+        let data = self
+            .tx
+            .read(CATALOG_PAGE_NUM, catalog_key)?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+        let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
+        let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
+
+        self.tx.remove(CATALOG_PAGE_NUM, catalog_key);
+        self.tx
+            .index_remove(CATALOG_INDEX_PAGE_NUM, name.as_bytes(), catalog_key);
+
+        // Free all pages belonging to the table's tree
+        self.tx.free_tree(meta.root_page);
+        // Free all index trees
+        for (_, idx_root) in &meta.index_trees {
+            self.tx.free_index_tree(*idx_root);
+        }
+        Ok(())
+    }
+
+    pub fn create_index(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<(), DatabaseError> {
+        let mut meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        // Validate column exists
+        let col_idx = meta
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name == column_name)
+            .ok_or_else(|| {
+                DatabaseError::SchemaMismatch(format!("column '{}' not found", column_name))
+            })?;
+
+        // Check not already indexed
+        if meta.index_trees.iter().any(|(c, _)| c == column_name) {
+            return Err(DatabaseError::SchemaMismatch(format!(
+                "index already exists on column '{}'",
+                column_name
+            )));
+        }
+
+        let idx_root = self.tx.init_index()?;
+
+        // Back-fill: scan existing rows and insert into index tree
+        self.tx
+            .read_range(meta.root_page, .., |mut tx, key, value| {
+                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(value)?;
+                let row: Row = rkyv::deserialize::<Row, Error>(archived)?;
+                let col_bytes = db_value_to_bytes(&row.values[col_idx]);
+                tx.index_insert(idx_root, key, col_bytes);
+
+                Ok::<_, DatabaseError>(false)
+            })?;
+
+        // Update catalog
+        meta.index_trees.push((column_name.to_string(), idx_root));
+        self.update_table_meta(table_name, &meta)?;
+
+        Ok(())
     }
 
     pub fn scan<F, E: From<DatabaseError>>(
@@ -447,6 +600,24 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         }
 
         Ok(())
+    }
+
+    pub fn get_indexed_columns(&mut self, name: &str) -> Result<Vec<String>, DatabaseError> {
+        let meta = self
+            .find_table_meta(name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
+        Ok(meta.index_trees.iter().map(|(c, _)| c.clone()).collect())
+    }
+
+    pub fn list_tables(&mut self) -> Result<Vec<String>, DatabaseError> {
+        let mut entries = Vec::new();
+        self.tx.read_range(CATALOG_PAGE_NUM, .., |_, _, value| {
+            let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(value)?;
+            entries.push(archived.name.to_string());
+            Ok::<_, DatabaseError>(false)
+        })?;
+
+        Ok(entries)
     }
 }
 
