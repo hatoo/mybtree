@@ -329,6 +329,18 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         Ok(key)
     }
 
+    pub fn remove_range_where<F, E: From<TreeError>>(
+        &mut self,
+        root: NodePtr,
+        range: impl RangeBounds<Key>,
+        mut f: F,
+    ) -> Result<(), E>
+    where
+        for<'local> F: FnMut(LockedTransaction<'local, N>, Key, &[u8]) -> Result<(bool, bool), E>,
+    {
+        todo!()
+    }
+
     pub fn remove_range(
         &mut self,
         root: NodePtr,
