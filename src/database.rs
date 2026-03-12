@@ -474,12 +474,13 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         self.tx
             .index_read_range(idx_root, range, |mut tx, _value, key| {
                 let bytes = {
-                    tx.read(meta.root_page, key)?.ok_or_else(|| {
-                        E::from(DatabaseError::Internal(Error::new(
-                            std::io::Error::other("missing row for index entry"),
-                        )))
-                    })?
-                    .into_owned()
+                    tx.read(meta.root_page, key)?
+                        .ok_or_else(|| {
+                            E::from(DatabaseError::Internal(Error::new(std::io::Error::other(
+                                "missing row for index entry",
+                            ))))
+                        })?
+                        .into_owned()
                 };
                 let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)
                     .map_err(|e| E::from(DatabaseError::Internal(e)))?;
@@ -655,394 +656,6 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
         self.tx.with_lock(|tx| f(LockedDbTransaction { tx }))
     }
 
-    fn find_table_meta(&self, name: &str) -> Result<Option<TableMeta>, DatabaseError> {
-        if let Some(catalog_key) = self
-            .tx
-            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
-        {
-            if let Some(data) = self.tx.read(CATALOG_PAGE_NUM, catalog_key)? {
-                let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
-                return Ok(Some(rkyv::deserialize::<TableMeta, Error>(archived)?));
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn get_schema(&self, name: &str) -> Result<Schema, DatabaseError> {
-        let meta = self
-            .find_table_meta(name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
-        Ok(meta.schema)
-    }
-
-    pub fn create_table(
-        &self,
-        name: &str,
-        mut schema: Schema,
-        pk_index: Option<usize>,
-    ) -> Result<(), DatabaseError> {
-        if self.find_table_meta(name)?.is_some() {
-            return Err(DatabaseError::TableAlreadyExists(name.to_string()));
-        }
-
-        // If no explicit primary key, prepend an implicit `_rowid` column.
-        if let Some(pk_idx) = pk_index {
-            schema.primary_key = pk_idx;
-            schema.implicit_pk = false;
-        } else {
-            schema.columns.insert(
-                0,
-                Column {
-                    name: "_rowid".to_string(),
-                    column_type: ColumnType::Integer,
-                    nullable: false,
-                },
-            );
-            schema.primary_key = 0;
-            schema.implicit_pk = true;
-        }
-
-        // Validate PK column is integer and not nullable.
-        let pk_idx = schema.primary_key;
-        let pk_col = &schema.columns[pk_idx];
-        if pk_col.column_type != ColumnType::Integer {
-            return Err(DatabaseError::SchemaMismatch(
-                "primary key column must be INTEGER".to_string(),
-            ));
-        }
-        if pk_col.nullable {
-            return Err(DatabaseError::SchemaMismatch(
-                "primary key column must be NOT NULL".to_string(),
-            ));
-        }
-
-        let root_page = self.tx.init_tree()?;
-        let meta = TableMeta {
-            name: name.to_string(),
-            schema,
-            root_page,
-            index_trees: vec![],
-        };
-
-        let catalog_key = self
-            .tx
-            .insert(CATALOG_PAGE_NUM, rkyv::to_bytes::<Error>(&meta)?.to_vec())?;
-        self.tx.index_insert(
-            CATALOG_INDEX_PAGE_NUM,
-            catalog_key,
-            name.as_bytes().to_vec(),
-        )?;
-
-        Ok(())
-    }
-
-    pub fn drop_table(&self, name: &str) -> Result<(), DatabaseError> {
-        let catalog_key = self
-            .tx
-            .index_read(CATALOG_INDEX_PAGE_NUM, name.as_bytes())?
-            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
-
-        let data = self
-            .tx
-            .read(CATALOG_PAGE_NUM, catalog_key)?
-            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
-        let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(&data)?;
-        let meta: TableMeta = rkyv::deserialize::<TableMeta, Error>(archived)?;
-
-        self.tx.remove(CATALOG_PAGE_NUM, catalog_key);
-        self.tx
-            .index_remove(CATALOG_INDEX_PAGE_NUM, name.as_bytes(), catalog_key)?;
-
-        // Free all pages belonging to the table's tree
-        self.tx.free_tree(meta.root_page)?;
-        // Free all index trees
-        for (_, idx_root) in &meta.index_trees {
-            self.tx.free_index_tree(*idx_root)?;
-        }
-        Ok(())
-    }
-
-    pub fn create_index(&self, table_name: &str, column_name: &str) -> Result<(), DatabaseError> {
-        let mut meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-
-        // Validate column exists
-        let col_idx = meta
-            .schema
-            .columns
-            .iter()
-            .position(|c| c.name == column_name)
-            .ok_or_else(|| {
-                DatabaseError::SchemaMismatch(format!("column '{}' not found", column_name))
-            })?;
-
-        // Check not already indexed
-        if meta.index_trees.iter().any(|(c, _)| c == column_name) {
-            return Err(DatabaseError::SchemaMismatch(format!(
-                "index already exists on column '{}'",
-                column_name
-            )));
-        }
-
-        let idx_root = self.tx.init_index()?;
-
-        // Back-fill: scan existing rows and insert into index tree
-        let rows = self.tx.read_range(meta.root_page, ..)?;
-        for (row_key, row_bytes) in &rows {
-            if let Ok(archived) = rkyv::access::<rkyv::Archived<Row>, Error>(row_bytes) {
-                let row: Row = rkyv::deserialize::<Row, Error>(archived)?;
-                let col_bytes = db_value_to_bytes(&row.values[col_idx]);
-                self.tx.index_insert(idx_root, *row_key, col_bytes)?;
-            }
-        }
-
-        // Update catalog
-        meta.index_trees.push((column_name.to_string(), idx_root));
-        self.update_table_meta(table_name, &meta)?;
-
-        Ok(())
-    }
-
-    pub fn drop_index(&self, table_name: &str, column_name: &str) -> Result<(), DatabaseError> {
-        let mut meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-
-        let idx_pos = meta
-            .index_trees
-            .iter()
-            .position(|(c, _)| c == column_name)
-            .ok_or_else(|| {
-                DatabaseError::SchemaMismatch(format!("no index on column '{}'", column_name))
-            })?;
-
-        let (_, idx_root) = meta.index_trees.remove(idx_pos);
-        self.tx.free_index_tree(idx_root)?;
-        self.update_table_meta(table_name, &meta)?;
-
-        Ok(())
-    }
-
-    /// Rewrite the catalog entry for `table_name` with the given `meta`.
-    fn update_table_meta(&self, table_name: &str, meta: &TableMeta) -> Result<(), DatabaseError> {
-        let catalog_key = self
-            .tx
-            .index_read(CATALOG_INDEX_PAGE_NUM, table_name.as_bytes())?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-
-        self.tx.write(
-            CATALOG_PAGE_NUM,
-            catalog_key,
-            rkyv::to_bytes::<Error>(meta)?.to_vec(),
-        );
-        Ok(())
-    }
-
-    pub fn insert(&self, table_name: &str, row: &Row) -> Result<Key, DatabaseError> {
-        let meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-
-        let pk_idx = meta.schema.primary_key;
-        let mut row = row.clone();
-
-        // Handle auto-assign for implicit _rowid (Null in PK position).
-        if row.values[pk_idx] == DbValue::Null {
-            let next = self.tx.available_key(meta.root_page)?;
-            row.values[pk_idx] = DbValue::Integer(next as i64);
-        }
-
-        validate_row(&row, &meta.schema)?;
-
-        // Extract PK value and convert to B-tree key.
-        let key = match &row.values[pk_idx] {
-            DbValue::Integer(i) => {
-                if *i < 0 {
-                    return Err(DatabaseError::SchemaMismatch(
-                        "primary key value must be non-negative".to_string(),
-                    ));
-                }
-                *i as Key
-            }
-            _ => unreachable!("PK column validated as integer"),
-        };
-
-        // Check for duplicate key.
-        if self.tx.read(meta.root_page, key)?.is_some() {
-            return Err(DatabaseError::DuplicateKey(key));
-        }
-
-        self.tx
-            .write(meta.root_page, key, rkyv::to_bytes::<Error>(&row)?.to_vec());
-
-        // Update index trees
-        for (col_name, idx_root) in &meta.index_trees {
-            let col_idx = meta
-                .schema
-                .columns
-                .iter()
-                .position(|c| c.name == *col_name)
-                .unwrap();
-            let col_bytes = db_value_to_bytes(&row.values[col_idx]);
-            self.tx.index_insert(*idx_root, key, col_bytes)?;
-        }
-
-        Ok(key)
-    }
-
-    pub fn get(&self, table_name: &str, key: Key) -> Result<Option<Row>, DatabaseError> {
-        let meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-        let data = self.tx.read(meta.root_page, key)?;
-        match data {
-            Some(bytes) => {
-                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)?;
-                Ok(Some(rkyv::deserialize::<Row, Error>(archived)?))
-            }
-            None => Ok(None),
-        }
-    }
-
-    pub fn scan(
-        &self,
-        table_name: &str,
-        range: impl RangeBounds<Key>,
-    ) -> Result<Vec<(Key, Row)>, DatabaseError> {
-        let meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-        let raw = self.tx.read_range(meta.root_page, range)?;
-        let mut result = Vec::with_capacity(raw.len());
-        for (key, bytes) in raw {
-            let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)?;
-            result.push((key, rkyv::deserialize::<Row, Error>(archived)?));
-        }
-        Ok(result)
-    }
-
-    pub fn delete(&self, table_name: &str, key: Key) -> Result<(), DatabaseError> {
-        let meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-        let old_data = self.tx.read(meta.root_page, key)?;
-
-        // Remove from index trees
-        if let Some(old_bytes) = &old_data {
-            let old_row: Row = {
-                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(old_bytes)?;
-                rkyv::deserialize::<Row, Error>(archived)?
-            };
-            for (col_name, idx_root) in &meta.index_trees {
-                let col_idx = meta
-                    .schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *col_name)
-                    .unwrap();
-                let col_bytes = db_value_to_bytes(&old_row.values[col_idx]);
-                self.tx.index_remove(*idx_root, &col_bytes, key)?;
-            }
-        }
-
-        self.tx.remove(meta.root_page, key);
-        Ok(())
-    }
-
-    pub fn update(&self, table_name: &str, key: Key, row: &Row) -> Result<(), DatabaseError> {
-        let meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-        validate_row(row, &meta.schema)?;
-
-        // Remove old values from index trees
-        if !meta.index_trees.is_empty() {
-            let old_data = self.tx.read(meta.root_page, key)?;
-            if let Some(old_bytes) = &old_data {
-                let old_row: Row = {
-                    let archived = rkyv::access::<rkyv::Archived<Row>, Error>(old_bytes)?;
-                    rkyv::deserialize::<Row, Error>(archived)?
-                };
-                for (col_name, idx_root) in &meta.index_trees {
-                    let col_idx = meta
-                        .schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == *col_name)
-                        .unwrap();
-                    let col_bytes = db_value_to_bytes(&old_row.values[col_idx]);
-                    self.tx.index_remove(*idx_root, &col_bytes, key)?;
-                }
-            }
-        }
-
-        self.tx
-            .write(meta.root_page, key, rkyv::to_bytes::<Error>(row)?.to_vec());
-
-        // Insert new values into index trees
-        for (col_name, idx_root) in &meta.index_trees {
-            let col_idx = meta
-                .schema
-                .columns
-                .iter()
-                .position(|c| c.name == *col_name)
-                .unwrap();
-            let col_bytes = db_value_to_bytes(&row.values[col_idx]);
-            self.tx.index_insert(*idx_root, key, col_bytes)?;
-        }
-
-        Ok(())
-    }
-
-    /// Scan rows by an indexed column value range.
-    /// Returns `(key, row)` pairs for rows whose indexed column value falls within `range`.
-    pub fn scan_by_index<'b>(
-        &self,
-        table_name: &str,
-        column_name: &str,
-        range: impl RangeBounds<&'b [u8]>,
-    ) -> Result<Vec<(Key, Row)>, DatabaseError> {
-        let meta = self
-            .find_table_meta(table_name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
-        let idx_root = meta
-            .index_trees
-            .iter()
-            .find(|(c, _)| c == column_name)
-            .map(|(_, r)| *r)
-            .ok_or_else(|| {
-                DatabaseError::SchemaMismatch(format!("no index on column '{}'", column_name))
-            })?;
-
-        let keys = self.tx.index_read_range(idx_root, range)?;
-        let mut result = Vec::new();
-        for key in keys {
-            if let Some(bytes) = self.tx.read(meta.root_page, key)? {
-                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)?;
-                result.push((key, rkyv::deserialize::<Row, Error>(archived)?));
-            }
-        }
-        Ok(result)
-    }
-
-    pub fn get_indexed_columns(&self, name: &str) -> Result<Vec<String>, DatabaseError> {
-        let meta = self
-            .find_table_meta(name)?
-            .ok_or_else(|| DatabaseError::TableNotFound(name.to_string()))?;
-        Ok(meta.index_trees.iter().map(|(c, _)| c.clone()).collect())
-    }
-
-    pub fn list_tables(&self) -> Result<Vec<String>, DatabaseError> {
-        let entries = self.tx.read_range(CATALOG_PAGE_NUM, ..)?;
-        let mut names = Vec::new();
-        for (_, bytes) in &entries {
-            let archived = rkyv::access::<rkyv::Archived<TableMeta>, Error>(bytes)?;
-            names.push(archived.name.to_string());
-        }
-        Ok(names)
-    }
-
     pub fn commit(self) -> Result<(), DatabaseError> {
         self.tx.commit()?;
         Ok(())
@@ -1054,8 +667,8 @@ impl<'a, const N: usize> DbTransaction<'a, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ops::RangeBounds;
     use std::fs;
+    use std::ops::RangeBounds;
     use tempfile::NamedTempFile;
 
     fn open_db() -> (Database<4096>, NamedTempFile) {
@@ -1321,7 +934,8 @@ mod tests {
         tx.commit().unwrap();
 
         let mut tx = db.begin_transaction();
-        update(&mut tx, 
+        update(
+            &mut tx,
             "users",
             key,
             &Row {
@@ -1365,7 +979,8 @@ mod tests {
         let (db, _tmp) = open_db();
         let mut tx = db.begin_transaction();
         create_table(&mut tx, "users", users_schema(), None).unwrap();
-        create_table(&mut tx, 
+        create_table(
+            &mut tx,
             "products",
             Schema {
                 columns: vec![
@@ -1447,7 +1062,8 @@ mod tests {
     fn test_nullable_column() {
         let (db, _tmp) = open_db();
         let mut tx = db.begin_transaction();
-        create_table(&mut tx, 
+        create_table(
+            &mut tx,
             "events",
             Schema {
                 columns: vec![
@@ -1548,7 +1164,8 @@ mod tests {
     fn test_bool_column() {
         let (db, _tmp) = open_db();
         let mut tx = db.begin_transaction();
-        create_table(&mut tx, 
+        create_table(
+            &mut tx,
             "flags",
             Schema {
                 columns: vec![Column {
@@ -1612,8 +1229,12 @@ mod tests {
         // Insert many rows to allocate several pages
         let mut tx = db.begin_transaction();
         for i in 0..100 {
-            insert(&mut tx, "users", &user_row(&format!("user_{}", i), i as i64))
-                .unwrap();
+            insert(
+                &mut tx,
+                "users",
+                &user_row(&format!("user_{}", i), i as i64),
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
 
@@ -1630,8 +1251,12 @@ mod tests {
 
         let mut tx = db.begin_transaction();
         for i in 0..100 {
-            insert(&mut tx, "users2", &user_row(&format!("user_{}", i), i as i64))
-                .unwrap();
+            insert(
+                &mut tx,
+                "users2",
+                &user_row(&format!("user_{}", i), i as i64),
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
 
@@ -1665,8 +1290,12 @@ mod tests {
         // Insert many rows to allocate pages for data + both indexes
         let mut tx = db.begin_transaction();
         for i in 0..100 {
-            insert(&mut tx, "users", &user_row(&format!("user_{}", i), i as i64))
-                .unwrap();
+            insert(
+                &mut tx,
+                "users",
+                &user_row(&format!("user_{}", i), i as i64),
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
 
@@ -1685,8 +1314,12 @@ mod tests {
 
         let mut tx = db.begin_transaction();
         for i in 0..100 {
-            insert(&mut tx, "users2", &user_row(&format!("user_{}", i), i as i64))
-                .unwrap();
+            insert(
+                &mut tx,
+                "users2",
+                &user_row(&format!("user_{}", i), i as i64),
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
 
@@ -1843,7 +1476,8 @@ mod tests {
 
         // Update name from Frank to George
         let mut tx = db.begin_transaction();
-        update(&mut tx, 
+        update(
+            &mut tx,
             "users",
             key,
             &Row {
@@ -1890,8 +1524,7 @@ mod tests {
 
         // The back-filled data should be queryable
         let mut tx = db.begin_transaction();
-        let results =
-            scan_by_index(&mut tx, "users", "name", &b"Alice"[..]..=&b"Bob"[..]).unwrap();
+        let results = scan_by_index(&mut tx, "users", "name", &b"Alice"[..]..=&b"Bob"[..]).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -1932,7 +1565,8 @@ mod tests {
         let mut tx1 = db.begin_transaction();
         let mut tx2 = db.begin_transaction();
 
-        update(&mut tx1, 
+        update(
+            &mut tx1,
             "users",
             key,
             &Row {
@@ -1945,7 +1579,8 @@ mod tests {
         )
         .unwrap();
 
-        update(&mut tx2, 
+        update(
+            &mut tx2,
             "users",
             key,
             &Row {
@@ -1981,7 +1616,8 @@ mod tests {
 
         get(&mut tx1, "users", key).unwrap();
 
-        update(&mut tx2, 
+        update(
+            &mut tx2,
             "users",
             key,
             &Row {
@@ -2058,8 +1694,7 @@ mod tests {
         let mut tx1 = db.begin_transaction();
         let mut tx2 = db.begin_transaction();
 
-        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"Z"[..])
-            .unwrap();
+        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"Z"[..]).unwrap();
 
         insert(&mut tx2, "users", &user_row("Bob", 25)).unwrap();
 
@@ -2079,8 +1714,7 @@ mod tests {
         let mut tx1 = db.begin_transaction();
         let mut tx2 = db.begin_transaction();
 
-        scan_by_index(&mut tx1, "users", "name", &b"Alice"[..]..=&b"Alice"[..])
-            .unwrap();
+        scan_by_index(&mut tx1, "users", "name", &b"Alice"[..]..=&b"Alice"[..]).unwrap();
 
         insert(&mut tx2, "users", &user_row("Alice", 30)).unwrap();
 
@@ -2107,7 +1741,8 @@ mod tests {
         get(&mut tx1, "users", k1).unwrap();
         get(&mut tx2, "users", k2).unwrap();
 
-        update(&mut tx1, 
+        update(
+            &mut tx1,
             "users",
             k1,
             &Row {
@@ -2120,7 +1755,8 @@ mod tests {
         )
         .unwrap();
 
-        update(&mut tx2, 
+        update(
+            &mut tx2,
             "users",
             k2,
             &Row {
@@ -2150,7 +1786,8 @@ mod tests {
 
         // tx1 commits before tx2 starts — no conflict possible
         let mut tx1 = db.begin_transaction();
-        update(&mut tx1, 
+        update(
+            &mut tx1,
             "users",
             key,
             &Row {
@@ -2165,7 +1802,8 @@ mod tests {
         tx1.commit().unwrap();
 
         let mut tx2 = db.begin_transaction();
-        update(&mut tx2, 
+        update(
+            &mut tx2,
             "users",
             key,
             &Row {
@@ -2192,8 +1830,7 @@ mod tests {
         let mut tx1 = db.begin_transaction();
         let mut tx2 = db.begin_transaction();
 
-        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"C"[..])
-            .unwrap();
+        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"C"[..]).unwrap();
 
         insert(&mut tx2, "users", &user_row("Zara", 20)).unwrap();
 
@@ -2237,10 +1874,10 @@ mod tests {
         let mut tx1 = db.begin_transaction();
         let mut tx2 = db.begin_transaction();
 
-        scan_by_index(&mut tx1, "users", "name", &b"B"[..]..&b"C"[..])
-            .unwrap();
+        scan_by_index(&mut tx1, "users", "name", &b"B"[..]..&b"C"[..]).unwrap();
 
-        update(&mut tx2, 
+        update(
+            &mut tx2,
             "users",
             key,
             &Row {
@@ -2374,8 +2011,7 @@ mod tests {
         let mut tx1 = db.begin_transaction();
         let mut tx2 = db.begin_transaction();
 
-        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"Z"[..])
-            .unwrap();
+        scan_by_index(&mut tx1, "users", "name", &b"A"[..]..&b"Z"[..]).unwrap();
         drop_index(&mut tx2, "users", "name").unwrap();
 
         tx1.commit().unwrap_err();
@@ -2427,9 +2063,13 @@ mod tests {
         // Query by age (i64 big-endian bytes for 25)
         let age_25 = 25i64.to_be_bytes().to_vec();
         let age_30 = 30i64.to_be_bytes().to_vec();
-        let by_age =
-            scan_by_index(&mut tx, "users", "age", age_25.as_slice()..=age_30.as_slice())
-                .unwrap();
+        let by_age = scan_by_index(
+            &mut tx,
+            "users",
+            "age",
+            age_25.as_slice()..=age_30.as_slice(),
+        )
+        .unwrap();
         assert_eq!(by_age.len(), 2);
     }
 
@@ -2455,7 +2095,8 @@ mod tests {
         };
         create_table(&mut tx, "t", schema, None).unwrap();
         create_index(&mut tx, "t", "x").unwrap();
-        insert(&mut tx, 
+        insert(
+            &mut tx,
             "t",
             &Row {
                 values: vec![
@@ -2466,7 +2107,8 @@ mod tests {
             },
         )
         .unwrap();
-        insert(&mut tx, 
+        insert(
+            &mut tx,
             "t",
             &Row {
                 values: vec![
@@ -2477,7 +2119,8 @@ mod tests {
             },
         )
         .unwrap();
-        insert(&mut tx, 
+        insert(
+            &mut tx,
             "t",
             &Row {
                 values: vec![
@@ -2488,7 +2131,8 @@ mod tests {
             },
         )
         .unwrap();
-        insert(&mut tx, 
+        insert(
+            &mut tx,
             "t",
             &Row {
                 values: vec![
@@ -2523,7 +2167,8 @@ mod tests {
     fn test_explicit_primary_key() {
         let (db, _tmp) = open_db();
         let mut tx = db.begin_transaction();
-        create_table(&mut tx, 
+        create_table(
+            &mut tx,
             "items",
             Schema {
                 columns: vec![
@@ -2569,7 +2214,8 @@ mod tests {
     fn test_explicit_pk_no_rowid_prepended() {
         let (db, _tmp) = open_db();
         let mut tx = db.begin_transaction();
-        create_table(&mut tx, 
+        create_table(
+            &mut tx,
             "t",
             Schema {
                 columns: vec![
@@ -2602,7 +2248,8 @@ mod tests {
     fn test_duplicate_primary_key_rejected() {
         let (db, _tmp) = open_db();
         let mut tx = db.begin_transaction();
-        create_table(&mut tx, 
+        create_table(
+            &mut tx,
             "items",
             Schema {
                 columns: vec![
@@ -2626,7 +2273,8 @@ mod tests {
         tx.commit().unwrap();
 
         let mut tx = db.begin_transaction();
-        insert(&mut tx, 
+        insert(
+            &mut tx,
             "items",
             &Row {
                 values: vec![DbValue::Integer(1), DbValue::Text("a".into())],
@@ -2648,7 +2296,8 @@ mod tests {
     fn test_negative_pk_rejected() {
         let (db, _tmp) = open_db();
         let mut tx = db.begin_transaction();
-        create_table(&mut tx, 
+        create_table(
+            &mut tx,
             "items",
             Schema {
                 columns: vec![Column {

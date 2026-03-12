@@ -68,8 +68,8 @@ fn open_db(path: Option<&PathBuf>, tmp: bool) -> anyhow::Result<Database<PAGE_SI
 
 fn execute_and_print(db: &Database<PAGE_SIZE>, input: &str) -> anyhow::Result<()> {
     if input == ".tables" {
-        let tx = db.begin_transaction();
-        for name in tx.list_tables()? {
+        let mut tx = db.begin_transaction();
+        for name in tx.with_lock(|mut l| l.list_tables())? {
             println!("{name}");
         }
         return Ok(());
