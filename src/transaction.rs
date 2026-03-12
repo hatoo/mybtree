@@ -338,7 +338,58 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
     where
         for<'local> F: FnMut(LockedTransaction<'local, N>, Key, &[u8]) -> Result<(bool, bool), E>,
     {
-        todo!()
+        let range_bound = (range.start_bound().cloned(), range.end_bound().cloned());
+
+        self.active_transactions.range_reads.push((
+            root,
+            range_bound.0.clone(),
+            range_bound.1.clone(),
+        ));
+
+        let mut keys = BTreeSet::new();
+        self.btree
+            .read_range(root, range_bound.clone(), |_btree, key, _: &[u8]| {
+                self.active_transactions.reads.insert((root, key));
+                keys.insert(key);
+                Ok::<_, TreeError>(false)
+            })?;
+
+        for (&(write_root, write_key), value) in &self.active_transactions.writes {
+            if write_root == root && range_bound.contains(&write_key) && value.is_some() {
+                keys.insert(write_key);
+            }
+        }
+
+        for key in keys {
+            let current_value = match self.active_transactions.writes.get(&(root, key)) {
+                Some(Some(value)) => Some(value.clone()),
+                Some(None) => None,
+                None => self.btree.read(root, key)?.map(|value| value.into_owned()),
+            };
+
+            let Some(value) = current_value else {
+                continue;
+            };
+
+            let (should_remove, should_stop) = f(
+                LockedTransaction {
+                    btree: self.btree,
+                    active_transactions: self.active_transactions,
+                    other_max_write_keys: self.other_max_write_keys.clone(),
+                },
+                key,
+                &value,
+            )?;
+
+            if should_remove {
+                self.active_transactions.writes.insert((root, key), None);
+            }
+            if should_stop {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn remove_range(
@@ -740,6 +791,19 @@ mod tests {
         with_locked(tx, |tx| tx.remove_range(root, range))
     }
 
+    fn remove_range_where<const N: usize, R: RangeBounds<Key>, F, E>(
+        tx: &mut Transaction<'_, N>,
+        root: NodePtr,
+        range: R,
+        f: F,
+    ) -> Result<(), E>
+    where
+        F: for<'local> FnMut(LockedTransaction<'local, N>, Key, &[u8]) -> Result<(bool, bool), E>,
+        E: From<TreeError>,
+    {
+        with_locked(tx, |tx| tx.remove_range_where(root, range, f))
+    }
+
     #[test]
     fn test_begin_transaction() {
         let (store, _root, _temp) = setup_transaction_store();
@@ -981,6 +1045,84 @@ mod tests {
 
         remove(&mut tx, root, 1);
         assert_eq!(read(&mut tx, root, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn test_remove_range_where_calls_callback_in_key_order() {
+        let (store, root, _temp) = setup_transaction_store();
+
+        {
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, b"one".to_vec());
+            write(&mut tx, root, 3, b"three".to_vec());
+            write(&mut tx, root, 5, b"five".to_vec());
+            tx.commit().unwrap();
+        }
+
+        let mut tx = store.begin_transaction();
+        write(&mut tx, root, 2, b"two".to_vec());
+        write(&mut tx, root, 4, b"four".to_vec());
+        write(&mut tx, root, 3, b"THREE".to_vec());
+
+        let mut seen = Vec::new();
+        remove_range_where(&mut tx, root, 1..=5, |_, key, value| {
+            seen.push((key, value.to_vec()));
+            Ok::<_, TreeError>((false, false))
+        })
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![
+                (1, b"one".to_vec()),
+                (2, b"two".to_vec()),
+                (3, b"THREE".to_vec()),
+                (4, b"four".to_vec()),
+                (5, b"five".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_remove_range_where_sees_ongoing_transaction_updates() {
+        let (store, root, _temp) = setup_transaction_store();
+
+        {
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, b"one".to_vec());
+            write(&mut tx, root, 3, b"three".to_vec());
+            write(&mut tx, root, 5, b"five".to_vec());
+            tx.commit().unwrap();
+        }
+
+        let mut tx = store.begin_transaction();
+        write(&mut tx, root, 2, b"two".to_vec());
+        write(&mut tx, root, 4, b"four".to_vec());
+        remove(&mut tx, root, 5);
+
+        let mut seen = Vec::new();
+        remove_range_where(&mut tx, root, 1..=5, |mut locked, key, value| {
+            seen.push((key, value.to_vec()));
+            if key == 2 {
+                locked.write(root, 4, b"FOUR".to_vec());
+            }
+            if key == 3 {
+                locked.write(root, 5, b"FIVE".to_vec());
+            }
+            Ok::<_, TreeError>((false, false))
+        })
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![
+                (1, b"one".to_vec()),
+                (2, b"two".to_vec()),
+                (3, b"three".to_vec()),
+                (4, b"FOUR".to_vec()),
+                (5, b"FIVE".to_vec()),
+            ]
+        );
     }
 
     #[test]
