@@ -3,7 +3,7 @@ mod page;
 mod pager;
 pub mod sql;
 mod transaction;
-mod tree;
+pub mod tree;
 mod types;
 mod util;
 

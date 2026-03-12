@@ -1,7 +1,7 @@
 use std::ops::Bound;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use mybtree::{Btree, Pager};
+use mybtree::{Btree, Pager, tree::TreeError};
 
 fn setup_tree() -> (Btree<4096>, u64) {
     let file = tempfile::tempfile().unwrap();
@@ -127,7 +127,7 @@ fn bench_sequential_insert(c: &mut Criterion) {
                                 Bound::Included(value.as_slice()),
                                 Bound::Included(value.as_slice()),
                             ),
-                            |_, _| {},
+                            |_, _, _| Ok::<_, TreeError>(false),
                         )
                         .unwrap();
                 }
