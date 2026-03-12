@@ -258,6 +258,58 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         Ok(())
     }
 
+    /// Scan rows by an indexed column value range.
+    /// Returns `(key, row)` pairs for rows whose indexed column value falls within `range`.
+    pub fn scan_by_index<'b, F, E: From<DatabaseError>>(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        range: impl RangeBounds<&'b [u8]>,
+        mut f: F,
+    ) -> Result<(), E>
+    where
+        F: for<'local> FnMut(
+            LockedDbTransaction<'local, N>,
+            &'local rkyv::Archived<Row>,
+            Key,
+        ) -> Result<bool, E>,
+    {
+        let meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+        let idx_root = meta
+            .index_trees
+            .iter()
+            .find(|(c, _)| c == column_name)
+            .map(|(_, r)| *r)
+            .ok_or_else(|| {
+                DatabaseError::SchemaMismatch(format!("no index on column '{}'", column_name))
+            })?;
+
+        #[derive(thiserror::Error)]
+        enum E1<E> {
+            #[error("{0}")]
+            Error(#[from] E),
+        }
+
+        impl<E: From<DatabaseError>> From<TreeError> for E1<E> {
+            fn from(err: TreeError) -> Self {
+                E1::Error(E::from(DatabaseError::TreeError(err)))
+            }
+        }
+
+        self.tx
+            .index_read_range(idx_root, range, |tx, value, key| {
+                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(value)
+                    .map_err(|e| E::from(DatabaseError::Internal(e)))?;
+                Ok(f(LockedDbTransaction { tx }, archived, key).map_err(|e| E1::Error(e))?)
+            })
+            .map_err(|e| match e {
+                E1::Error(e) => e,
+            })?;
+        Ok(())
+    }
+
     pub fn insert(&mut self, table_name: &str, row: &Row) -> Result<Key, DatabaseError> {
         let meta = self
             .find_table_meta(table_name)?
@@ -308,6 +360,93 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
         }
 
         Ok(key)
+    }
+
+    pub fn get(&mut self, table_name: &str, key: Key) -> Result<Option<Row>, DatabaseError> {
+        let meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+        let data = self.tx.read(meta.root_page, key)?;
+        match data {
+            Some(bytes) => {
+                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(&bytes)?;
+                Ok(Some(rkyv::deserialize::<Row, Error>(archived)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete(&mut self, table_name: &str, key: Key) -> Result<(), DatabaseError> {
+        let meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+        let old_data = self.tx.read(meta.root_page, key)?;
+
+        // Remove from index trees
+        if let Some(old_bytes) = &old_data {
+            let old_row: Row = {
+                let archived = rkyv::access::<rkyv::Archived<Row>, Error>(old_bytes)?;
+                rkyv::deserialize::<Row, Error>(archived)?
+            };
+            for (col_name, idx_root) in &meta.index_trees {
+                let col_idx = meta
+                    .schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *col_name)
+                    .unwrap();
+                let col_bytes = db_value_to_bytes(&old_row.values[col_idx]);
+                self.tx.index_remove(*idx_root, &col_bytes, key);
+            }
+        }
+
+        self.tx.remove(meta.root_page, key);
+        Ok(())
+    }
+
+    pub fn update(&mut self, table_name: &str, key: Key, row: &Row) -> Result<(), DatabaseError> {
+        let meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+        validate_row(row, &meta.schema)?;
+
+        // Remove old values from index trees
+        if !meta.index_trees.is_empty() {
+            let old_data = self.tx.read(meta.root_page, key)?;
+            if let Some(old_bytes) = &old_data {
+                let old_row: Row = {
+                    let archived = rkyv::access::<rkyv::Archived<Row>, Error>(old_bytes)?;
+                    rkyv::deserialize::<Row, Error>(archived)?
+                };
+                for (col_name, idx_root) in &meta.index_trees {
+                    let col_idx = meta
+                        .schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *col_name)
+                        .unwrap();
+                    let col_bytes = db_value_to_bytes(&old_row.values[col_idx]);
+                    self.tx.index_remove(*idx_root, &col_bytes, key);
+                }
+            }
+        }
+
+        self.tx
+            .write(meta.root_page, key, rkyv::to_bytes::<Error>(row)?.to_vec());
+
+        // Insert new values into index trees
+        for (col_name, idx_root) in &meta.index_trees {
+            let col_idx = meta
+                .schema
+                .columns
+                .iter()
+                .position(|c| c.name == *col_name)
+                .unwrap();
+            let col_bytes = db_value_to_bytes(&row.values[col_idx]);
+            self.tx.index_insert(*idx_root, key, col_bytes);
+        }
+
+        Ok(())
     }
 }
 
