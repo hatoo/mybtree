@@ -714,24 +714,7 @@ impl<const N: usize> Btree<N> {
         }
     }
 
-    pub fn read_range<R: RangeBounds<Key>>(
-        &mut self,
-        root: NodePtr,
-        range: R,
-        mut f: impl FnMut(Key, &[u8]),
-    ) -> Result<(), TreeError> {
-        self.read_range_at(
-            root,
-            &range,
-            |_, k, v| {
-                f(k, v);
-                Ok(false)
-            },
-            0,
-        )
-    }
-
-    pub fn read_range_map<R: RangeBounds<Key>, E: From<TreeError>>(
+    pub fn read_range<R: RangeBounds<Key>, E: From<TreeError>>(
         &mut self,
         root: NodePtr,
         range: R,
@@ -2150,7 +2133,12 @@ mod tests {
         range: R,
     ) -> Vec<Key> {
         let mut keys = Vec::new();
-        btree.read_range(root, range, |k, _| keys.push(k)).unwrap();
+        btree
+            .read_range(root, range, |_btree, k, _| {
+                keys.push(k);
+                Ok::<_, TreeError>(false)
+            })
+            .unwrap();
         keys
     }
 
@@ -2487,7 +2475,10 @@ mod tests {
 
         let mut results = Vec::new();
         btree
-            .read_range(root, 0..=2, |k, v| results.push((k, v.to_vec())))
+            .read_range(root, 0..=2, |_btree, k, v| {
+                results.push((k, v.to_vec()));
+                Ok::<_, TreeError>(false)
+            })
             .unwrap();
 
         assert_eq!(results.len(), 3);

@@ -230,7 +230,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             .map(|((_, k), v)| (*k, v.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut last_bound = Bound::Unbounded;
-        btree.read_range_map(root, range_bound.clone(), |btree, k, v| {
+        btree.read_range(root, range_bound.clone(), |btree, k, v| {
             active_transactions.reads.insert((root, k));
 
             // check active writes between last_key and k for this root
@@ -339,7 +339,7 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
         // Find all keys in range from btree
         let mut keys_to_remove: Vec<Key> = Vec::new();
         self.btree
-            .read_range_map(root, range_bound.clone(), |_btree, key, _: &[u8]| {
+            .read_range(root, range_bound.clone(), |_btree, key, _: &[u8]| {
                 keys_to_remove.push(key);
                 Ok::<_, TreeError>(false)
             })?;
