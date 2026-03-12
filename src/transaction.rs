@@ -958,7 +958,7 @@ impl<'a, const N: usize> Drop for Transaction<'a, N> {
 mod tests {
     use super::*;
     use crate::{NodePtr, Pager};
-    use std::fs;
+    use std::{fs, ops::RangeBounds};
     use tempfile::NamedTempFile;
 
     fn setup_transaction_store() -> (TransactionStore<4096>, NodePtr, NamedTempFile) {
@@ -976,6 +976,60 @@ mod tests {
 
         let store = TransactionStore::new(btree);
         (store, root, temp_file)
+    }
+
+    fn with_locked<const N: usize, T>(
+        tx: &mut Transaction<'_, N>,
+        f: impl FnOnce(&mut LockedTransaction<'_, N>) -> T,
+    ) -> T {
+        tx.with_lock(|mut locked| f(&mut locked))
+    }
+
+    fn read<const N: usize>(
+        tx: &mut Transaction<'_, N>,
+        root: NodePtr,
+        key: Key,
+    ) -> Result<Option<Vec<u8>>, TreeError> {
+        with_locked(tx, |tx| tx.read(root, key).map(|v| v.map(|v| v.into_owned())))
+    }
+
+    fn write<const N: usize>(tx: &mut Transaction<'_, N>, root: NodePtr, key: Key, value: Vec<u8>) {
+        with_locked(tx, |tx| tx.write(root, key, value));
+    }
+
+    fn remove<const N: usize>(tx: &mut Transaction<'_, N>, root: NodePtr, key: Key) {
+        with_locked(tx, |tx| tx.remove(root, key));
+    }
+
+    fn insert<const N: usize>(
+        tx: &mut Transaction<'_, N>,
+        root: NodePtr,
+        value: Vec<u8>,
+    ) -> Result<Key, TreeError> {
+        with_locked(tx, |tx| tx.insert(root, value))
+    }
+
+    fn read_range<const N: usize, R: RangeBounds<Key>>(
+        tx: &mut Transaction<'_, N>,
+        root: NodePtr,
+        range: R,
+    ) -> Result<Vec<(Key, Vec<u8>)>, TreeError> {
+        let mut results = Vec::new();
+        with_locked(tx, |tx| {
+            tx.read_range(root, range, |_, key, value| {
+                results.push((key, value.to_vec()));
+                Ok::<_, TreeError>(false)
+            })
+        })?;
+        Ok(results)
+    }
+
+    fn remove_range<const N: usize, R: RangeBounds<Key>>(
+        tx: &mut Transaction<'_, N>,
+        root: NodePtr,
+        range: R,
+    ) -> Result<(), TreeError> {
+        with_locked(tx, |tx| tx.remove_range(root, range))
     }
 
     #[test]
@@ -1000,13 +1054,13 @@ mod tests {
     #[test]
     fn test_write_and_read_in_transaction() {
         let (store, root, _temp) = setup_transaction_store();
-        let tx = store.begin_transaction();
+        let mut tx = store.begin_transaction();
 
         let key = 1u64;
         let value = vec![1, 2, 3, 4, 5];
 
-        tx.write(root, key, value.clone());
-        let read_value = tx.read(root, key).unwrap();
+        write(&mut tx, root, key, value.clone());
+        let read_value = read(&mut tx, root, key).unwrap();
 
         assert_eq!(read_value, Some(value));
     }
@@ -1014,45 +1068,45 @@ mod tests {
     #[test]
     fn test_read_nonexistent_key() {
         let (store, root, _temp) = setup_transaction_store();
-        let tx = store.begin_transaction();
+        let mut tx = store.begin_transaction();
 
-        let read_value = tx.read(root, 999).unwrap();
+        let read_value = read(&mut tx, root, 999).unwrap();
         assert_eq!(read_value, None);
     }
 
     #[test]
     fn test_write_multiple_keys() {
         let (store, root, _temp) = setup_transaction_store();
-        let tx = store.begin_transaction();
+        let mut tx = store.begin_transaction();
 
-        tx.write(root, 1, vec![1, 2, 3]);
-        tx.write(root, 2, vec![4, 5, 6]);
-        tx.write(root, 3, vec![7, 8, 9]);
+        write(&mut tx, root, 1, vec![1, 2, 3]);
+        write(&mut tx, root, 2, vec![4, 5, 6]);
+        write(&mut tx, root, 3, vec![7, 8, 9]);
 
-        assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
-        assert_eq!(tx.read(root, 2).unwrap(), Some(vec![4, 5, 6]));
-        assert_eq!(tx.read(root, 3).unwrap(), Some(vec![7, 8, 9]));
+        assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(read(&mut tx, root, 2).unwrap(), Some(vec![4, 5, 6]));
+        assert_eq!(read(&mut tx, root, 3).unwrap(), Some(vec![7, 8, 9]));
     }
 
     #[test]
     fn test_overwrite_value() {
         let (store, root, _temp) = setup_transaction_store();
-        let tx = store.begin_transaction();
+        let mut tx = store.begin_transaction();
 
         let key = 1u64;
-        tx.write(root, key, vec![1, 2, 3]);
-        assert_eq!(tx.read(root, key).unwrap(), Some(vec![1, 2, 3]));
+        write(&mut tx, root, key, vec![1, 2, 3]);
+        assert_eq!(read(&mut tx, root, key).unwrap(), Some(vec![1, 2, 3]));
 
-        tx.write(root, key, vec![4, 5, 6]);
-        assert_eq!(tx.read(root, key).unwrap(), Some(vec![4, 5, 6]));
+        write(&mut tx, root, key, vec![4, 5, 6]);
+        assert_eq!(read(&mut tx, root, key).unwrap(), Some(vec![4, 5, 6]));
     }
 
     #[test]
     fn test_commit_single_transaction() {
         let (store, root, _temp) = setup_transaction_store();
-        let tx = store.begin_transaction();
+        let mut tx = store.begin_transaction();
 
-        tx.write(root, 1, vec![1, 2, 3]);
+        write(&mut tx, root, 1, vec![1, 2, 3]);
         let result = tx.commit();
         assert!(result.is_ok());
     }
@@ -1061,11 +1115,11 @@ mod tests {
     fn test_concurrent_reads_no_conflict() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.write(root, 1, vec![1, 2, 3]);
-        tx2.write(root, 2, vec![4, 5, 6]);
+        write(&mut tx1, root, 1, vec![1, 2, 3]);
+        write(&mut tx2, root, 2, vec![4, 5, 6]);
 
         assert!(tx1.commit().is_ok());
         assert!(tx2.commit().is_ok());
@@ -1075,11 +1129,11 @@ mod tests {
     fn test_write_write_conflict() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.write(root, 1, vec![1, 2, 3]);
-        tx2.write(root, 1, vec![4, 5, 6]);
+        write(&mut tx1, root, 1, vec![1, 2, 3]);
+        write(&mut tx2, root, 1, vec![4, 5, 6]);
 
         // Both transactions write to the same key, so first one to commit should fail
         // because there's an active transaction with conflicting writes
@@ -1091,11 +1145,11 @@ mod tests {
     fn test_read_write_conflict() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.read(root, 1).unwrap();
-        tx2.write(root, 1, vec![4, 5, 6]);
+        read(&mut tx1, root, 1).unwrap();
+        write(&mut tx2, root, 1, vec![4, 5, 6]);
 
         // tx2 tries to commit: it writes to key 1 that tx1 read
         // The commit check: does tx1.reads contain any of tx2.writes? No, tx1 reads 1 but tx2 writes 1
@@ -1110,11 +1164,11 @@ mod tests {
     fn test_write_read_conflict() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.write(root, 1, vec![1, 2, 3]);
-        tx2.read(root, 1).unwrap();
+        write(&mut tx1, root, 1, vec![1, 2, 3]);
+        read(&mut tx2, root, 1).unwrap();
 
         // tx1 tries to commit: it writes to key 1. tx2 is active and read from key 1.
         // The check: does tx1.writes (1) conflict with tx2?
@@ -1128,13 +1182,13 @@ mod tests {
     fn test_multiple_concurrent_transactions() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
-        let tx3 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
+        let mut tx3 = store.begin_transaction();
 
-        tx1.write(root, 1, vec![1, 2, 3]);
-        tx2.write(root, 2, vec![4, 5, 6]);
-        tx3.write(root, 3, vec![7, 8, 9]);
+        write(&mut tx1, root, 1, vec![1, 2, 3]);
+        write(&mut tx2, root, 2, vec![4, 5, 6]);
+        write(&mut tx3, root, 3, vec![7, 8, 9]);
 
         assert!(tx1.commit().is_ok());
         assert!(tx2.commit().is_ok());
@@ -1152,11 +1206,11 @@ mod tests {
     fn test_conflict_error_type() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.write(root, 1, vec![1, 2, 3]);
-        tx2.write(root, 1, vec![4, 5, 6]);
+        write(&mut tx1, root, 1, vec![1, 2, 3]);
+        write(&mut tx2, root, 1, vec![4, 5, 6]);
 
         let result = tx1.commit();
         assert!(result.is_err());
@@ -1171,15 +1225,15 @@ mod tests {
 
         // First transaction
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1, 2, 3]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1, 2, 3]);
             assert!(tx.commit().is_ok());
         }
 
         // Second transaction
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 2, vec![4, 5, 6]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 2, vec![4, 5, 6]);
             assert!(tx.commit().is_ok());
         }
     }
@@ -1190,35 +1244,35 @@ mod tests {
 
         // First, insert a key
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1, 2, 3]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1, 2, 3]);
             assert!(tx.commit().is_ok());
         }
 
         // Then remove it
         {
-            let tx = store.begin_transaction();
-            tx.remove(root, 1);
+            let mut tx = store.begin_transaction();
+            remove(&mut tx, root, 1);
             assert!(tx.commit().is_ok());
         }
 
         // Verify it's gone
         {
-            let tx = store.begin_transaction();
-            assert_eq!(tx.read(root, 1).unwrap(), None);
+            let mut tx = store.begin_transaction();
+            assert_eq!(read(&mut tx, root, 1).unwrap(), None);
         }
     }
 
     #[test]
     fn test_remove_in_transaction() {
         let (store, root, _temp) = setup_transaction_store();
-        let tx = store.begin_transaction();
+        let mut tx = store.begin_transaction();
 
-        tx.write(root, 1, vec![1, 2, 3]);
-        assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
+        write(&mut tx, root, 1, vec![1, 2, 3]);
+        assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1, 2, 3]));
 
-        tx.remove(root, 1);
-        assert_eq!(tx.read(root, 1).unwrap(), None);
+        remove(&mut tx, root, 1);
+        assert_eq!(read(&mut tx, root, 1).unwrap(), None);
     }
 
     #[test]
@@ -1227,17 +1281,17 @@ mod tests {
 
         // Write in first transaction
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1, 2, 3]);
-            tx.write(root, 2, vec![4, 5, 6]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1, 2, 3]);
+            write(&mut tx, root, 2, vec![4, 5, 6]);
             assert!(tx.commit().is_ok());
         }
 
         // Read in second transaction to verify persistence
         {
-            let tx = store.begin_transaction();
-            assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
-            assert_eq!(tx.read(root, 2).unwrap(), Some(vec![4, 5, 6]));
+            let mut tx = store.begin_transaction();
+            assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1, 2, 3]));
+            assert_eq!(read(&mut tx, root, 2).unwrap(), Some(vec![4, 5, 6]));
         }
     }
 
@@ -1245,11 +1299,11 @@ mod tests {
     fn test_commit_after_conflict_fails() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.write(root, 1, vec![1, 2, 3]);
-        tx2.write(root, 1, vec![4, 5, 6]);
+        write(&mut tx1, root, 1, vec![1, 2, 3]);
+        write(&mut tx2, root, 1, vec![4, 5, 6]);
 
         // First commit should fail due to conflict
         assert!(tx1.commit().is_err());
@@ -1264,16 +1318,16 @@ mod tests {
 
         // First transaction writes
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1, 2, 3]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1, 2, 3]);
             assert!(tx.commit().is_ok());
         }
 
         // Second transaction reads and writes to different key
         {
-            let tx = store.begin_transaction();
-            assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
-            tx.write(root, 2, vec![4, 5, 6]);
+            let mut tx = store.begin_transaction();
+            assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1, 2, 3]));
+            write(&mut tx, root, 2, vec![4, 5, 6]);
             assert!(tx.commit().is_ok());
         }
     }
@@ -1283,15 +1337,15 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1, 2, 3]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1, 2, 3]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx = store.begin_transaction();
-        assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
-        assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
-        assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
+        let mut tx = store.begin_transaction();
+        assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1, 2, 3]));
     }
 
     #[test]
@@ -1299,15 +1353,15 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1, 2, 3]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1, 2, 3]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx = store.begin_transaction();
-        assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1, 2, 3]));
-        tx.write(root, 1, vec![4, 5, 6]);
-        assert_eq!(tx.read(root, 1).unwrap(), Some(vec![4, 5, 6]));
+        let mut tx = store.begin_transaction();
+        assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1, 2, 3]));
+        write(&mut tx, root, 1, vec![4, 5, 6]);
+        assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![4, 5, 6]));
         assert!(tx.commit().is_ok());
     }
 
@@ -1317,27 +1371,27 @@ mod tests {
 
         // Setup: write initial values
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1]);
-            tx.write(root, 2, vec![2]);
-            tx.write(root, 3, vec![3]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1]);
+            write(&mut tx, root, 2, vec![2]);
+            write(&mut tx, root, 3, vec![3]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
-        let tx3 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
+        let mut tx3 = store.begin_transaction();
 
         // tx1 reads 1, writes 4
-        tx1.read(root, 1).unwrap();
-        tx1.write(root, 4, vec![4, 4]);
+        read(&mut tx1, root, 1).unwrap();
+        write(&mut tx1, root, 4, vec![4, 4]);
 
         // tx2 reads 2, writes 3
-        tx2.read(root, 2).unwrap();
-        tx2.write(root, 3, vec![3, 3]);
+        read(&mut tx2, root, 2).unwrap();
+        write(&mut tx2, root, 3, vec![3, 3]);
 
         // tx3 writes 5
-        tx3.write(root, 5, vec![5, 5]);
+        write(&mut tx3, root, 5, vec![5, 5]);
 
         // tx3 should succeed (writes to 5, no conflicts with any other transaction)
         assert!(tx3.commit().is_ok());
@@ -1354,16 +1408,16 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1, 2, 3]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1, 2, 3]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.read(root, 1).unwrap();
-        tx2.remove(root, 1);
+        read(&mut tx1, root, 1).unwrap();
+        remove(&mut tx2, root, 1);
 
         // tx2 removes key 1 that tx1 read -> conflict
         assert!(tx2.commit().is_err());
@@ -1374,17 +1428,17 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1]);
-            tx.write(root, 3, vec![3]);
-            tx.write(root, 5, vec![5]);
-            tx.write(root, 7, vec![7]);
-            tx.write(root, 9, vec![9]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1]);
+            write(&mut tx, root, 3, vec![3]);
+            write(&mut tx, root, 5, vec![5]);
+            write(&mut tx, root, 7, vec![7]);
+            write(&mut tx, root, 9, vec![9]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx = store.begin_transaction();
-        let results = tx.read_range(root, 2..=7).unwrap();
+        let mut tx = store.begin_transaction();
+        let results = read_range(&mut tx, root, 2..=7).unwrap();
         assert_eq!(results, vec![(3, vec![3]), (5, vec![5]), (7, vec![7])]);
     }
 
@@ -1393,15 +1447,15 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1]);
-            tx.write(root, 5, vec![5]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1]);
+            write(&mut tx, root, 5, vec![5]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx = store.begin_transaction();
-        tx.write(root, 3, vec![3]);
-        let results = tx.read_range(root, 1..=5).unwrap();
+        let mut tx = store.begin_transaction();
+        write(&mut tx, root, 3, vec![3]);
+        let results = read_range(&mut tx, root, 1..=5).unwrap();
         assert_eq!(results, vec![(1, vec![1]), (3, vec![3]), (5, vec![5])]);
     }
 
@@ -1410,16 +1464,16 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1]);
-            tx.write(root, 3, vec![3]);
-            tx.write(root, 5, vec![5]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1]);
+            write(&mut tx, root, 3, vec![3]);
+            write(&mut tx, root, 5, vec![5]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx = store.begin_transaction();
-        tx.remove(root, 3);
-        let results = tx.read_range(root, 1..=5).unwrap();
+        let mut tx = store.begin_transaction();
+        remove(&mut tx, root, 3);
+        let results = read_range(&mut tx, root, 1..=5).unwrap();
         assert_eq!(results, vec![(1, vec![1]), (5, vec![5])]);
     }
 
@@ -1427,8 +1481,8 @@ mod tests {
     fn test_read_range_empty() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx = store.begin_transaction();
-        let results = tx.read_range(root, 1..=10).unwrap();
+        let mut tx = store.begin_transaction();
+        let results = read_range(&mut tx, root, 1..=10).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1437,27 +1491,27 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 1, vec![1]);
-            tx.write(root, 3, vec![3]);
-            tx.write(root, 5, vec![5]);
-            tx.write(root, 7, vec![7]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 1, vec![1]);
+            write(&mut tx, root, 3, vec![3]);
+            write(&mut tx, root, 5, vec![5]);
+            write(&mut tx, root, 7, vec![7]);
             assert!(tx.commit().is_ok());
         }
 
         {
-            let tx = store.begin_transaction();
-            tx.remove_range(root, 2..=5).unwrap();
+            let mut tx = store.begin_transaction();
+            remove_range(&mut tx, root, 2..=5).unwrap();
             assert!(tx.commit().is_ok());
         }
 
         // Verify only keys outside range remain
         {
-            let tx = store.begin_transaction();
-            assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1]));
-            assert_eq!(tx.read(root, 3).unwrap(), None);
-            assert_eq!(tx.read(root, 5).unwrap(), None);
-            assert_eq!(tx.read(root, 7).unwrap(), Some(vec![7]));
+            let mut tx = store.begin_transaction();
+            assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1]));
+            assert_eq!(read(&mut tx, root, 3).unwrap(), None);
+            assert_eq!(read(&mut tx, root, 5).unwrap(), None);
+            assert_eq!(read(&mut tx, root, 7).unwrap(), Some(vec![7]));
         }
     }
 
@@ -1465,30 +1519,30 @@ mod tests {
     fn test_remove_range_with_local_writes() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx = store.begin_transaction();
-        tx.write(root, 1, vec![1]);
-        tx.write(root, 3, vec![3]);
-        tx.write(root, 5, vec![5]);
-        tx.remove_range(root, 2..=4).unwrap();
+        let mut tx = store.begin_transaction();
+        write(&mut tx, root, 1, vec![1]);
+        write(&mut tx, root, 3, vec![3]);
+        write(&mut tx, root, 5, vec![5]);
+        remove_range(&mut tx, root, 2..=4).unwrap();
 
         // Key 3 should be removed, 1 and 5 should remain
-        assert_eq!(tx.read(root, 1).unwrap(), Some(vec![1]));
-        assert_eq!(tx.read(root, 3).unwrap(), None);
-        assert_eq!(tx.read(root, 5).unwrap(), Some(vec![5]));
+        assert_eq!(read(&mut tx, root, 1).unwrap(), Some(vec![1]));
+        assert_eq!(read(&mut tx, root, 3).unwrap(), None);
+        assert_eq!(read(&mut tx, root, 5).unwrap(), Some(vec![5]));
     }
 
     #[test]
     fn test_read_range_conflict_with_write() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
         // tx1 reads a range
-        tx1.read_range(root, 1..=10).unwrap();
+        read_range(&mut tx1, root, 1..=10).unwrap();
 
         // tx2 writes to a key within that range
-        tx2.write(root, 5, vec![5]);
+        write(&mut tx2, root, 5, vec![5]);
 
         // tx2 should conflict because tx1 has a range read covering key 5
         assert!(tx2.commit().is_err());
@@ -1498,14 +1552,14 @@ mod tests {
     fn test_read_range_no_conflict_outside() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
         // tx1 reads a range
-        tx1.read_range(root, 1..=10).unwrap();
+        read_range(&mut tx1, root, 1..=10).unwrap();
 
         // tx2 writes to a key outside that range
-        tx2.write(root, 20, vec![20]);
+        write(&mut tx2, root, 20, vec![20]);
 
         // No conflict expected
         assert!(tx2.commit().is_ok());
@@ -1516,16 +1570,16 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 3, vec![3]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 3, vec![3]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.remove_range(root, 1..=5).unwrap();
-        tx2.write(root, 4, vec![4]);
+        remove_range(&mut tx1, root, 1..=5).unwrap();
+        write(&mut tx2, root, 4, vec![4]);
 
         // tx2 writes to key 4, which is within tx1's range read -> conflict
         assert!(tx2.commit().is_err());
@@ -1535,11 +1589,11 @@ mod tests {
     fn test_write_conflicts_with_range_read() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        tx1.read_range(root, 1..=10).unwrap();
-        tx2.write(root, 5, vec![5]);
+        read_range(&mut tx1, root, 1..=10).unwrap();
+        write(&mut tx2, root, 5, vec![5]);
 
         // tx1 commits: its range_reads cover 1..=10, tx2 writes to 5 which is in range -> conflict
         assert!(tx1.commit().is_err());
@@ -1549,16 +1603,16 @@ mod tests {
     fn test_insert_returns_unique_key() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx = store.begin_transaction();
-        let k1 = tx.insert(root, vec![1]).unwrap();
-        let k2 = tx.insert(root, vec![2]).unwrap();
-        let k3 = tx.insert(root, vec![3]).unwrap();
+        let mut tx = store.begin_transaction();
+        let k1 = insert(&mut tx, root, vec![1]).unwrap();
+        let k2 = insert(&mut tx, root, vec![2]).unwrap();
+        let k3 = insert(&mut tx, root, vec![3]).unwrap();
 
         assert_ne!(k1, k2);
         assert_ne!(k2, k3);
-        assert_eq!(tx.read(root, k1).unwrap(), Some(vec![1]));
-        assert_eq!(tx.read(root, k2).unwrap(), Some(vec![2]));
-        assert_eq!(tx.read(root, k3).unwrap(), Some(vec![3]));
+        assert_eq!(read(&mut tx, root, k1).unwrap(), Some(vec![1]));
+        assert_eq!(read(&mut tx, root, k2).unwrap(), Some(vec![2]));
+        assert_eq!(read(&mut tx, root, k3).unwrap(), Some(vec![3]));
     }
 
     #[test]
@@ -1566,15 +1620,15 @@ mod tests {
         let (store, root, _temp) = setup_transaction_store();
 
         {
-            let tx = store.begin_transaction();
-            tx.write(root, 10, vec![10]);
+            let mut tx = store.begin_transaction();
+            write(&mut tx, root, 10, vec![10]);
             assert!(tx.commit().is_ok());
         }
 
-        let tx = store.begin_transaction();
-        let key = tx.insert(root, vec![42]).unwrap();
+        let mut tx = store.begin_transaction();
+        let key = insert(&mut tx, root, vec![42]).unwrap();
         assert!(key > 10);
-        assert_eq!(tx.read(root, key).unwrap(), Some(vec![42]));
+        assert_eq!(read(&mut tx, root, key).unwrap(), Some(vec![42]));
         assert!(tx.commit().is_ok());
     }
 
@@ -1582,11 +1636,11 @@ mod tests {
     fn test_insert_concurrent_no_conflict() {
         let (store, root, _temp) = setup_transaction_store();
 
-        let tx1 = store.begin_transaction();
-        let tx2 = store.begin_transaction();
+        let mut tx1 = store.begin_transaction();
+        let mut tx2 = store.begin_transaction();
 
-        let k1 = tx1.insert(root, vec![1]).unwrap();
-        let k2 = tx2.insert(root, vec![2]).unwrap();
+        let k1 = insert(&mut tx1, root, vec![1]).unwrap();
+        let k2 = insert(&mut tx2, root, vec![2]).unwrap();
 
         // Keys should be different, so no conflict
         assert_ne!(k1, k2);
@@ -1600,14 +1654,14 @@ mod tests {
 
         let key;
         {
-            let tx = store.begin_transaction();
-            key = tx.insert(root, vec![99]).unwrap();
+            let mut tx = store.begin_transaction();
+            key = insert(&mut tx, root, vec![99]).unwrap();
             assert!(tx.commit().is_ok());
         }
 
         {
-            let tx = store.begin_transaction();
-            assert_eq!(tx.read(root, key).unwrap(), Some(vec![99]));
+            let mut tx = store.begin_transaction();
+            assert_eq!(read(&mut tx, root, key).unwrap(), Some(vec![99]));
         }
     }
 }
