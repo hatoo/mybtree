@@ -346,28 +346,57 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             range_bound.1.clone(),
         ));
 
-        let mut keys = BTreeSet::new();
-        self.btree
-            .read_range(root, range_bound.clone(), |_btree, key, _: &[u8]| {
+        let mut next_key = Some(range_bound.0.clone());
+
+        while let Some(search_from) = next_key.clone() {
+            let next_write_key = self
+                .active_transactions
+                .writes
+                .range(match search_from.clone() {
+                    Bound::Included(key) => (Bound::Included((root, key)), Bound::Unbounded),
+                    Bound::Excluded(key) => (Bound::Excluded((root, key)), Bound::Unbounded),
+                    Bound::Unbounded => (Bound::Included((root, 0)), Bound::Unbounded),
+                })
+                .take_while(|((write_root, _), _)| *write_root == root)
+                .find_map(|(&(write_root, write_key), value)| {
+                    (write_root == root
+                        && range_bound.contains(&write_key)
+                        && value.is_some())
+                    .then_some(write_key)
+                });
+
+            let mut next_tree_entry = None;
+            self.btree.read_range(
+                root,
+                (search_from, range_bound.1.clone()),
+                |_btree, key, value: &[u8]| {
+                    next_tree_entry = Some((key, value.to_vec()));
+                    Ok::<_, TreeError>(true)
+                },
+            )?;
+
+            let next_tree_key = next_tree_entry.as_ref().map(|(key, _)| *key);
+            let key = match (next_write_key, next_tree_key) {
+                (Some(write_key), Some(tree_key)) => write_key.min(tree_key),
+                (Some(write_key), None) => write_key,
+                (None, Some(tree_key)) => tree_key,
+                (None, None) => break,
+            };
+
+            if next_tree_key == Some(key) {
                 self.active_transactions.reads.insert((root, key));
-                keys.insert(key);
-                Ok::<_, TreeError>(false)
-            })?;
-
-        for (&(write_root, write_key), value) in &self.active_transactions.writes {
-            if write_root == root && range_bound.contains(&write_key) && value.is_some() {
-                keys.insert(write_key);
             }
-        }
 
-        for key in keys {
             let current_value = match self.active_transactions.writes.get(&(root, key)) {
                 Some(Some(value)) => Some(value.clone()),
                 Some(None) => None,
-                None => self.btree.read(root, key)?.map(|value| value.into_owned()),
+                None => next_tree_entry
+                    .filter(|(tree_key, _)| *tree_key == key)
+                    .map(|(_, value)| value),
             };
 
             let Some(value) = current_value else {
+                next_key = Some(Bound::Excluded(key));
                 continue;
             };
 
@@ -387,6 +416,8 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             if should_stop {
                 break;
             }
+
+            next_key = Some(Bound::Excluded(key));
         }
 
         Ok(())
