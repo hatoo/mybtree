@@ -364,21 +364,6 @@ fn eval_where(expr: &Expr, row: &Row, schema: &Schema) -> Result<bool, SqlError>
     }
 }
 
-fn collect_scan<const N: usize>(
-    tx: &mut LockedDbTransaction<'_, N>,
-    table_name: &str,
-) -> Result<Vec<(crate::types::Key, Row)>, SqlError> {
-    let mut rows = Vec::new();
-    tx.scan(table_name, .., |_, key, row| {
-        rows.push((
-            key,
-            rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap(),
-        ));
-        Ok::<_, SqlError>(false)
-    })?;
-    Ok(rows)
-}
-
 fn push_projected_row(
     result: &mut Vec<Row>,
     row: &rkyv::Archived<Row>,
@@ -397,6 +382,29 @@ fn push_projected_row(
         });
     }
     Ok(())
+}
+
+fn build_updated_row(
+    row: &rkyv::Archived<Row>,
+    schema: &Schema,
+    selection: Option<&Expr>,
+    assignments: &std::collections::HashMap<usize, Expr>,
+) -> Result<Option<Row>, SqlError> {
+    let mut row = rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
+    let matches = match selection {
+        Some(where_expr) => eval_where(where_expr, &row, schema)?,
+        None => true,
+    };
+    if !matches {
+        return Ok(None);
+    }
+
+    for (&col_idx, expr) in assignments {
+        let new_value = eval_expr(expr, &row, schema)?;
+        row.values[col_idx] = new_value;
+    }
+
+    Ok(Some(row))
 }
 
 fn execute_locked<const N: usize>(
@@ -652,25 +660,65 @@ fn execute_locked<const N: usize>(
                     }
                 }
 
-                // Scan all rows
-                let rows = collect_scan(tx, &table_name)?;
+                let eq_cond = upd.selection.as_ref().and_then(try_extract_eq_condition);
 
-                // Update matching rows
-                for (key, mut row) in rows {
-                    let matches = match &upd.selection {
-                        Some(where_expr) => eval_where(where_expr, &row, &schema)?,
-                        None => true,
-                    };
+                if let Some((ref col_name, ref value)) = eq_cond {
+                    let col_idx = resolve_column(col_name, &schema)?;
+                    let pk_idx = schema.primary_key;
 
-                    if matches {
-                        // Apply assignments
-                        for (&col_idx, expr) in &assignments {
-                            let new_value = eval_expr(expr, &row, &schema)?;
-                            row.values[col_idx] = new_value;
+                    if pk_idx == col_idx {
+                        if let DbValue::Integer(i) = value
+                            && *i >= 0
+                            && let Some(row) = tx.get(&table_name, *i as u64)?
+                        {
+                            let matches = match &upd.selection {
+                                Some(where_expr) => eval_where(where_expr, &row, &schema)?,
+                                None => true,
+                            };
+                            if matches {
+                                let mut row = row;
+                                for (&col_idx, expr) in &assignments {
+                                    let new_value = eval_expr(expr, &row, &schema)?;
+                                    row.values[col_idx] = new_value;
+                                }
+                                tx.update(&table_name, *i as u64, &row)?;
+                            }
                         }
-                        tx.update(&table_name, key, &row)?;
+                        continue;
+                    }
+
+                    let indexed_cols = tx.get_indexed_columns(&table_name)?;
+                    if indexed_cols.contains(&col_name.to_string()) {
+                        let bytes = db_value_to_bytes(value);
+                        tx.scan_by_index(
+                            &table_name,
+                            col_name,
+                            bytes.as_slice()..=bytes.as_slice(),
+                            |mut tx, row, key| {
+                                if let Some(row) = build_updated_row(
+                                    row,
+                                    &schema,
+                                    upd.selection.as_ref(),
+                                    &assignments,
+                                )? {
+                                    tx.update(&table_name, key, &row)?;
+                                }
+                                Ok::<_, SqlError>(false)
+                            },
+                        )?;
+                        continue;
                     }
                 }
+
+                let pk_range = select_pk_range(upd.selection.as_ref(), &schema);
+                tx.scan(&table_name, pk_range, |mut tx, key, row| {
+                    if let Some(row) =
+                        build_updated_row(row, &schema, upd.selection.as_ref(), &assignments)?
+                    {
+                        tx.update(&table_name, key, &row)?;
+                    }
+                    Ok::<_, SqlError>(false)
+                })?;
             }
             _ => return Err(SqlError::UnsupportedStatement),
         }
@@ -1821,6 +1869,35 @@ mod tests {
         assert_eq!(row.values[0], DbValue::Integer(2)); // id column
         assert_eq!(row.values[1], DbValue::Text("gadget".into())); // name column
         assert_eq!(row.values[2], DbValue::Float(15.50)); // price column
+    }
+
+    #[test]
+    fn test_update_pk_range_table() {
+        let (db, _tmp) = open_db();
+        let mut tx = db.begin_transaction();
+        execute(
+            &mut tx,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)",
+        )
+        .unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO items VALUES (1, 'widget', 9.99), (2, 'gadget', 19.99), (3, 'thing', 29.99)",
+        )
+        .unwrap();
+
+        execute(
+            &mut tx,
+            "UPDATE items SET price = 15.50 WHERE id >= 2 AND id < 3",
+        )
+        .unwrap();
+
+        let row1 = get(&mut tx, "items", 1).unwrap().unwrap();
+        let row2 = get(&mut tx, "items", 2).unwrap().unwrap();
+        let row3 = get(&mut tx, "items", 3).unwrap().unwrap();
+        assert_eq!(row1.values[2], DbValue::Float(9.99));
+        assert_eq!(row2.values[2], DbValue::Float(15.50));
+        assert_eq!(row3.values[2], DbValue::Float(29.99));
     }
 
     #[test]
