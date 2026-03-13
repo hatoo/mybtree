@@ -4,7 +4,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::ops::Bound;
+use std::{cmp::Ordering, ops::Bound};
 
 use crate::database::{
     Column, ColumnType, DatabaseError, DbTransaction, DbValue, LockedDbTransaction, Row, Schema,
@@ -148,28 +148,174 @@ fn try_extract_eq_condition(expr: &Expr) -> Option<(String, DbValue)> {
     None
 }
 
-fn select_pk_eq_range(selection: Option<&Expr>, schema: &Schema) -> (Bound<u64>, Bound<u64>) {
-    let Some((column_name, value)) = selection.and_then(try_extract_eq_condition) else {
-        return (Bound::Unbounded, Bound::Unbounded);
-    };
-
-    let Some(pk_column) = schema.columns.get(schema.primary_key) else {
-        return (Bound::Unbounded, Bound::Unbounded);
-    };
-
-    if column_name != pk_column.name {
-        return (Bound::Unbounded, Bound::Unbounded);
+fn normalize_comparison(
+    left: &Expr,
+    op: BinaryOperator,
+    right: &Expr,
+) -> Option<(String, BinaryOperator, DbValue)> {
+    if let Expr::Identifier(ident) = left
+        && let Ok(val) = expr_to_dbvalue(right)
+    {
+        return Some((ident.value.clone(), op, val));
     }
 
-    let DbValue::Integer(key) = value else {
-        return (Bound::Unbounded, Bound::Unbounded);
-    };
-    if key < 0 {
-        return (Bound::Included(1), Bound::Excluded(1));
+    if let Expr::Identifier(ident) = right
+        && let Ok(val) = expr_to_dbvalue(left)
+    {
+        let reversed = match op {
+            BinaryOperator::Eq => BinaryOperator::Eq,
+            BinaryOperator::NotEq => BinaryOperator::NotEq,
+            BinaryOperator::Lt => BinaryOperator::Gt,
+            BinaryOperator::LtEq => BinaryOperator::GtEq,
+            BinaryOperator::Gt => BinaryOperator::Lt,
+            BinaryOperator::GtEq => BinaryOperator::LtEq,
+            _ => return None,
+        };
+        return Some((ident.value.clone(), reversed, val));
     }
 
-    let key = key as u64;
-    (Bound::Included(key), Bound::Included(key))
+    None
+}
+
+fn earlier_end(a: &Bound<u64>, b: &Bound<u64>) -> Ordering {
+    match (a, b) {
+        (Bound::Unbounded, Bound::Unbounded) => Ordering::Equal,
+        (Bound::Unbounded, _) => Ordering::Greater,
+        (_, Bound::Unbounded) => Ordering::Less,
+        (Bound::Included(a), Bound::Included(b)) => a.cmp(b),
+        (Bound::Included(a), Bound::Excluded(b)) => match a.cmp(b) {
+            Ordering::Equal => Ordering::Greater,
+            ord => ord,
+        },
+        (Bound::Excluded(a), Bound::Included(b)) => match a.cmp(b) {
+            Ordering::Equal => Ordering::Less,
+            ord => ord,
+        },
+        (Bound::Excluded(a), Bound::Excluded(b)) => a.cmp(b),
+    }
+}
+
+fn later_start(a: &Bound<u64>, b: &Bound<u64>) -> Ordering {
+    match (a, b) {
+        (Bound::Unbounded, Bound::Unbounded) => Ordering::Equal,
+        (Bound::Unbounded, _) => Ordering::Less,
+        (_, Bound::Unbounded) => Ordering::Greater,
+        (Bound::Included(a), Bound::Included(b)) => a.cmp(b),
+        (Bound::Included(a), Bound::Excluded(b)) => match a.cmp(b) {
+            Ordering::Equal => Ordering::Less,
+            ord => ord,
+        },
+        (Bound::Excluded(a), Bound::Included(b)) => match a.cmp(b) {
+            Ordering::Equal => Ordering::Greater,
+            ord => ord,
+        },
+        (Bound::Excluded(a), Bound::Excluded(b)) => a.cmp(b),
+    }
+}
+
+fn range_is_empty(start: &Bound<u64>, end: &Bound<u64>) -> bool {
+    match (start, end) {
+        (Bound::Included(s), Bound::Included(e)) => s > e,
+        (Bound::Included(s), Bound::Excluded(e)) => s >= e,
+        (Bound::Excluded(s), Bound::Included(e)) => s >= e,
+        (Bound::Excluded(s), Bound::Excluded(e)) => s >= e,
+        _ => false,
+    }
+}
+
+fn intersect_ranges(
+    left: (Bound<u64>, Bound<u64>),
+    right: (Bound<u64>, Bound<u64>),
+) -> (Bound<u64>, Bound<u64>) {
+    let start = if later_start(&left.0, &right.0).is_ge() {
+        left.0
+    } else {
+        right.0
+    };
+    let end = if earlier_end(&left.1, &right.1).is_le() {
+        left.1
+    } else {
+        right.1
+    };
+
+    if range_is_empty(&start, &end) {
+        (Bound::Included(1), Bound::Excluded(1))
+    } else {
+        (start, end)
+    }
+}
+
+fn pk_range_from_comparison(op: &BinaryOperator, value: i64) -> Option<(Bound<u64>, Bound<u64>)> {
+    match op {
+        BinaryOperator::Eq => {
+            if value < 0 {
+                Some((Bound::Included(1), Bound::Excluded(1)))
+            } else {
+                let key = value as u64;
+                Some((Bound::Included(key), Bound::Included(key)))
+            }
+        }
+        BinaryOperator::Gt => {
+            if value < 0 {
+                Some((Bound::Unbounded, Bound::Unbounded))
+            } else {
+                Some((Bound::Excluded(value as u64), Bound::Unbounded))
+            }
+        }
+        BinaryOperator::GtEq => {
+            if value <= 0 {
+                Some((Bound::Unbounded, Bound::Unbounded))
+            } else {
+                Some((Bound::Included(value as u64), Bound::Unbounded))
+            }
+        }
+        BinaryOperator::Lt => {
+            if value <= 0 {
+                Some((Bound::Included(1), Bound::Excluded(1)))
+            } else {
+                Some((Bound::Unbounded, Bound::Excluded(value as u64)))
+            }
+        }
+        BinaryOperator::LtEq => {
+            if value < 0 {
+                Some((Bound::Included(1), Bound::Excluded(1)))
+            } else {
+                Some((Bound::Unbounded, Bound::Included(value as u64)))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn select_pk_range(selection: Option<&Expr>, schema: &Schema) -> (Bound<u64>, Bound<u64>) {
+    fn extract(expr: &Expr, schema: &Schema) -> Option<(Bound<u64>, Bound<u64>)> {
+        match expr {
+            Expr::Nested(inner) => extract(inner, schema),
+            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+                match (extract(left, schema), extract(right, schema)) {
+                    (Some(left), Some(right)) => Some(intersect_ranges(left, right)),
+                    (Some(range), None) | (None, Some(range)) => Some(range),
+                    (None, None) => None,
+                }
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let (column_name, op, value) = normalize_comparison(left, op.clone(), right)?;
+                let pk_column = schema.columns.get(schema.primary_key)?;
+                if column_name != pk_column.name {
+                    return None;
+                }
+                let DbValue::Integer(value) = value else {
+                    return None;
+                };
+                pk_range_from_comparison(&op, value)
+            }
+            _ => None,
+        }
+    }
+
+    selection
+        .and_then(|expr| extract(expr, schema))
+        .unwrap_or((Bound::Unbounded, Bound::Unbounded))
 }
 
 fn eval_where(expr: &Expr, row: &Row, schema: &Schema) -> Result<bool, SqlError> {
@@ -233,21 +379,24 @@ fn collect_scan<const N: usize>(
     Ok(rows)
 }
 
-fn collect_scan_by_index<const N: usize>(
-    tx: &mut LockedDbTransaction<'_, N>,
-    table_name: &str,
-    column_name: &str,
-    value: &[u8],
-) -> Result<Vec<(crate::types::Key, Row)>, SqlError> {
-    let mut rows = Vec::new();
-    tx.scan_by_index(table_name, column_name, value..=value, |_, row, key| {
-        rows.push((
-            key,
-            rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap(),
-        ));
-        Ok::<_, SqlError>(false)
-    })?;
-    Ok(rows)
+fn push_projected_row(
+    result: &mut Vec<Row>,
+    row: &rkyv::Archived<Row>,
+    selection: Option<&Expr>,
+    schema: &Schema,
+    col_indices: &[usize],
+) -> Result<(), SqlError> {
+    let row = rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
+    let matches = match selection {
+        Some(where_expr) => eval_where(where_expr, &row, schema)?,
+        None => true,
+    };
+    if matches {
+        result.push(Row {
+            values: col_indices.iter().map(|&i| row.values[i].clone()).collect(),
+        });
+    }
+    Ok(())
 }
 
 fn execute_locked<const N: usize>(
@@ -371,71 +520,65 @@ fn execute_locked<const N: usize>(
                 // Try to use an index or PK for simple `col = value` WHERE clauses.
                 let eq_cond = select.selection.as_ref().and_then(try_extract_eq_condition);
 
-                let rows: Vec<(crate::types::Key, Row)> =
-                    if let Some((ref col_name, ref value)) = eq_cond {
-                        let col_idx = resolve_column(col_name, &schema)?;
-                        let pk_idx = schema.primary_key;
+                if let Some((ref col_name, ref value)) = eq_cond {
+                    let col_idx = resolve_column(col_name, &schema)?;
+                    let pk_idx = schema.primary_key;
 
-                        if pk_idx == col_idx {
-                            // Primary key point lookup
-                            if let DbValue::Integer(i) = value {
-                                if *i >= 0 {
-                                    match tx.get(&table_name, *i as u64)? {
-                                        Some(row) => vec![(*i as u64, row)],
-                                        None => vec![],
-                                    }
-                                } else {
-                                    vec![]
-                                }
-                            } else {
-                                // PK is always integer; non-integer value can't match
-                                vec![]
-                            }
-                        } else {
-                            let indexed_cols = tx.get_indexed_columns(&table_name)?;
-                            if indexed_cols.contains(&col_name.to_string()) {
-                                // Index scan
-                                let bytes = db_value_to_bytes(value);
-                                collect_scan_by_index(tx, &table_name, col_name, bytes.as_slice())?
-                            } else {
-                                // No index — fall back to full scan
-                                tx.scan(&table_name, .., |_, _key, row| {
-                                    let row =
-                                        rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
-                                    let matches = match &select.selection {
-                                        Some(where_expr) => eval_where(where_expr, &row, &schema)?,
-                                        None => true,
-                                    };
-                                    if matches {
-                                        let projected = Row {
-                                            values: col_indices
-                                                .iter()
-                                                .map(|&i| row.values[i].clone())
-                                                .collect(),
-                                        };
-                                        result.push(projected);
-                                    }
-                                    Ok::<_, SqlError>(false)
-                                })?;
-                                return Ok(result);
+                    if pk_idx == col_idx {
+                        // Primary key point lookup
+                        if let DbValue::Integer(i) = value
+                            && *i >= 0
+                            && let Some(row) = tx.get(&table_name, *i as u64)?
+                        {
+                            let matches = match &select.selection {
+                                Some(where_expr) => eval_where(where_expr, &row, &schema)?,
+                                None => true,
+                            };
+                            if matches {
+                                result.push(Row {
+                                    values: col_indices
+                                        .iter()
+                                        .map(|&i| row.values[i].clone())
+                                        .collect(),
+                                });
                             }
                         }
-                    } else {
-                        collect_scan(tx, &table_name)?
-                    };
+                        continue;
+                    }
 
-                for (_, row) in &rows {
-                    let matches = match &select.selection {
-                        Some(where_expr) => eval_where(where_expr, row, &schema)?,
-                        None => true,
-                    };
-                    if matches {
-                        let projected = Row {
-                            values: col_indices.iter().map(|&i| row.values[i].clone()).collect(),
-                        };
-                        result.push(projected);
+                    let indexed_cols = tx.get_indexed_columns(&table_name)?;
+                    if indexed_cols.contains(&col_name.to_string()) {
+                        let bytes = db_value_to_bytes(value);
+                        tx.scan_by_index(
+                            &table_name,
+                            col_name,
+                            bytes.as_slice()..=bytes.as_slice(),
+                            |_, row, _key| {
+                                push_projected_row(
+                                    &mut result,
+                                    row,
+                                    select.selection.as_ref(),
+                                    &schema,
+                                    &col_indices,
+                                )?;
+                                Ok::<_, SqlError>(false)
+                            },
+                        )?;
+                        continue;
                     }
                 }
+
+                let pk_range = select_pk_range(select.selection.as_ref(), &schema);
+                tx.scan(&table_name, pk_range, |_, _key, row| {
+                    push_projected_row(
+                        &mut result,
+                        row,
+                        select.selection.as_ref(),
+                        &schema,
+                        &col_indices,
+                    )?;
+                    Ok::<_, SqlError>(false)
+                })?;
             }
             Statement::CreateIndex(ci) => {
                 let table_name = ci.table_name.to_string();
@@ -462,7 +605,7 @@ fn execute_locked<const N: usize>(
                 };
 
                 let schema = tx.get_schema(&table_name)?;
-                let pk_range = select_pk_eq_range(del.selection.as_ref(), &schema);
+                let pk_range = select_pk_range(del.selection.as_ref(), &schema);
                 tx.delete_range_where(&table_name, pk_range, |_, row| {
                     let row = rkyv::deserialize::<Row, rkyv::rancor::Error>(row).unwrap();
                     let matches = match &del.selection {
@@ -1457,6 +1600,26 @@ mod tests {
         // Non-existent PK
         let rows = execute(&mut tx, "SELECT name FROM items WHERE id = 99").unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_select_pk_range_lookup() {
+        let (db, _tmp) = open_db();
+        let mut tx = db.begin_transaction();
+        execute(
+            &mut tx,
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO items VALUES (10, 'widget'), (20, 'gadget'), (30, 'doohickey')",
+        )
+        .unwrap();
+
+        let rows = execute(&mut tx, "SELECT name FROM items WHERE id >= 20 AND id < 30").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], DbValue::Text("gadget".into()));
     }
 
     #[test]
