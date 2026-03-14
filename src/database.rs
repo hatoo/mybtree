@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::RangeBounds;
 
 use rkyv::rancor::{Error, Source};
@@ -556,6 +557,18 @@ impl<'a, const N: usize> LockedDbTransaction<'a, N> {
             }
             None => Ok(None),
         }
+    }
+
+    pub fn get_value(
+        &mut self,
+        table_name: &str,
+        key: Key,
+    ) -> Result<Option<Cow<'_, [u8]>>, DatabaseError> {
+        let meta = self
+            .find_table_meta(table_name)?
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+        let data = self.tx.read(meta.root_page, key)?;
+        Ok(data)
     }
 
     pub fn delete(&mut self, table_name: &str, key: Key) -> Result<(), DatabaseError> {

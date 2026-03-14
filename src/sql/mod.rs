@@ -1,9 +1,12 @@
-use std::ops::Bound;
+use std::{borrow::Cow, ops::Bound};
 
 use rkyv::rancor::Error;
 use sqlparser::ast::SelectItem;
 
-use crate::{DatabaseError, DbTransaction, Key, Row, database::LockedDbTransaction};
+use crate::{
+    DatabaseError, DbTransaction, Key, Row,
+    database::{ArchivedRow, LockedDbTransaction},
+};
 
 enum Scanner {
     PkEqual {
@@ -43,28 +46,80 @@ pub enum SqlError {
 impl Scanner {
     fn scan<'a, F, E: From<DatabaseError>, const N: usize>(
         &self,
-        locked_tx: &mut LockedDbTransaction<'a, N>,
+        mut locked_tx: LockedDbTransaction<'a, N>,
         mut f: F,
     ) -> Result<(), E>
     where
-        F: for<'local> FnMut(&mut LockedDbTransaction<'local, N>, Key, Row) -> Result<bool, E>,
+        F: for<'local> FnMut(
+            LockedDbTransaction<'local, N>,
+            Key,
+            &'local ArchivedRow,
+        ) -> Result<bool, E>,
     {
         match self {
             Scanner::PkEqual { table, pk } => {
-                if let Some(row) = locked_tx.get(table, *pk)? {
-                    f(locked_tx, *pk, row)?;
+                if let Some(value) = locked_tx.get_value(table, *pk)? {
+                    let value = match value {
+                        Cow::Borrowed(v) => v.to_vec(),
+                        Cow::Owned(v) => v,
+                    };
+                    let value = rkyv::access::<rkyv::Archived<Row>, Error>(&value)
+                        .map_err(|e| DatabaseError::Internal(e))?;
+                    f(locked_tx, *pk, value)?;
                 }
             }
             Scanner::PkRange { table, range } => {
-                locked_tx.scan(table.as_str(), *range, |mut tx, key, value| {
-                    let value = rkyv::deserialize::<Row, Error>(value)
-                        .map_err(|e| DatabaseError::Internal(e))?;
-                    f(&mut tx, key, value)
-                })?;
+                locked_tx.scan(table.as_str(), *range, f)?;
             }
-            _ => unimplemented!(),
+            Scanner::IndexEqual {
+                table,
+                index,
+                value,
+            } => {
+                let v = value.as_slice();
+                locked_tx.scan_by_index(
+                    table.as_str(),
+                    index.as_str(),
+                    v..=v,
+                    |tx, archived, key| f(tx, key, archived),
+                )?;
+            }
+            Scanner::IndexRange {
+                table,
+                index,
+                range,
+            } => {
+                fn map_bound(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+                    match b {
+                        Bound::Included(v) => Bound::Included(v.as_slice()),
+                        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+                        Bound::Unbounded => Bound::Unbounded,
+                    }
+                }
+                locked_tx.scan_by_index(
+                    table.as_str(),
+                    index.as_str(),
+                    (map_bound(&range.0), map_bound(&range.1)),
+                    |tx, archived, key| f(tx, key, archived),
+                )?;
+            }
         }
         Ok(())
+    }
+}
+
+impl Statement {
+    fn execute<'a, const N: usize>(
+        &self,
+        locked_tx: LockedDbTransaction<'a, N>,
+    ) -> Result<(), SqlError> {
+        match self {
+            Statement::Select {
+                table,
+                scanner,
+                projections,
+            } => scanner.scan(locked_tx, |_tx, key, row| todo!()),
+        }
     }
 }
 
