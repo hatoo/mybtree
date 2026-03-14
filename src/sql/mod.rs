@@ -1,12 +1,16 @@
-use std::{borrow::Cow, cmp::Ordering, ops::Bound};
+use std::{borrow::Cow, ops::Bound};
 
 use rkyv::rancor::Error;
-use sqlparser::ast::{BinaryOperator, Expr, SelectItem, Value};
+use sqlparser::ast::{Expr, SelectItem, Value};
 
 use crate::{
     Column, ColumnType, DatabaseError, DbTransaction, DbValue, Key, Row, Schema,
     database::{ArchivedRow, LockedDbTransaction},
 };
+
+use expr::{eval_expr_bool, eval_value, eval_value_expr};
+
+pub mod expr;
 
 enum Scanner {
     PkEqual {
@@ -35,6 +39,11 @@ enum Statement {
         scanner: Scanner,
         projections: Vec<SelectItem>,
         filter: Option<Expr>,
+    },
+    CreateTable {
+        name: String,
+        schema: Schema,
+        pk_index: Option<usize>,
     },
 }
 
@@ -123,6 +132,14 @@ impl Statement {
         mut locked_tx: LockedDbTransaction<'a, N>,
     ) -> Result<Vec<Row>, SqlError> {
         match self {
+            Statement::CreateTable {
+                name,
+                schema,
+                pk_index,
+            } => {
+                locked_tx.create_table(name, schema.clone(), *pk_index)?;
+                Ok(vec![])
+            }
             Statement::Select {
                 table,
                 scanner,
@@ -178,122 +195,10 @@ fn project_row(schema: &Schema, row: &Row, projections: &[SelectItem]) -> Result
     Ok(Row { values })
 }
 
-fn eval_value(v: &Value) -> Result<DbValue, SqlError> {
-    match v {
-        Value::Number(n, _) => {
-            if let Ok(i) = n.parse::<i64>() {
-                Ok(DbValue::Integer(i))
-            } else if let Ok(f) = n.parse::<f64>() {
-                Ok(DbValue::Float(f))
-            } else {
-                Err(SqlError::UnsupportedExpr)
-            }
-        }
-        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(DbValue::Text(s.clone())),
-        Value::Boolean(b) => Ok(DbValue::Bool(*b)),
-        Value::Null => Ok(DbValue::Null),
-        _ => Err(SqlError::UnsupportedExpr),
-    }
-}
-
-fn eval_expr_value(expr: &Expr, schema: &Schema, row: &Row) -> Result<DbValue, SqlError> {
-    match expr {
-        Expr::Identifier(ident) => {
-            let col_idx = schema
-                .columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
-                .ok_or_else(|| SqlError::ColumnNotFound(ident.value.clone()))?;
-            Ok(row.values[col_idx].clone())
-        }
-        Expr::CompoundIdentifier(parts) => {
-            let name = parts.last().map(|i| i.value.as_str()).unwrap_or("");
-            let col_idx = schema
-                .columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| SqlError::ColumnNotFound(name.to_string()))?;
-            Ok(row.values[col_idx].clone())
-        }
-        Expr::Value(v) => eval_value(&v.value),
-        _ => Err(SqlError::UnsupportedExpr),
-    }
-}
-
-fn compare_db_values(a: &DbValue, b: &DbValue) -> Option<Ordering> {
-    match (a, b) {
-        (DbValue::Integer(x), DbValue::Integer(y)) => Some(x.cmp(y)),
-        (DbValue::Float(x), DbValue::Float(y)) => x.partial_cmp(y),
-        (DbValue::Integer(x), DbValue::Float(y)) => (*x as f64).partial_cmp(y),
-        (DbValue::Float(x), DbValue::Integer(y)) => x.partial_cmp(&(*y as f64)),
-        (DbValue::Text(x), DbValue::Text(y)) => Some(x.cmp(y)),
-        (DbValue::Bool(x), DbValue::Bool(y)) => Some(x.cmp(y)),
-        _ => None,
-    }
-}
-
-fn eval_expr_bool(expr: &Expr, schema: &Schema, row: &Row) -> Result<bool, SqlError> {
-    match expr {
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And => {
-                Ok(eval_expr_bool(left, schema, row)? && eval_expr_bool(right, schema, row)?)
-            }
-            BinaryOperator::Or => {
-                Ok(eval_expr_bool(left, schema, row)? || eval_expr_bool(right, schema, row)?)
-            }
-            BinaryOperator::Eq => {
-                let lv = eval_expr_value(left, schema, row)?;
-                let rv = eval_expr_value(right, schema, row)?;
-                Ok(lv == rv)
-            }
-            BinaryOperator::NotEq => {
-                let lv = eval_expr_value(left, schema, row)?;
-                let rv = eval_expr_value(right, schema, row)?;
-                Ok(lv != rv)
-            }
-            BinaryOperator::Lt => {
-                let lv = eval_expr_value(left, schema, row)?;
-                let rv = eval_expr_value(right, schema, row)?;
-                Ok(compare_db_values(&lv, &rv) == Some(Ordering::Less))
-            }
-            BinaryOperator::LtEq => {
-                let lv = eval_expr_value(left, schema, row)?;
-                let rv = eval_expr_value(right, schema, row)?;
-                Ok(matches!(
-                    compare_db_values(&lv, &rv),
-                    Some(Ordering::Less | Ordering::Equal)
-                ))
-            }
-            BinaryOperator::Gt => {
-                let lv = eval_expr_value(left, schema, row)?;
-                let rv = eval_expr_value(right, schema, row)?;
-                Ok(compare_db_values(&lv, &rv) == Some(Ordering::Greater))
-            }
-            BinaryOperator::GtEq => {
-                let lv = eval_expr_value(left, schema, row)?;
-                let rv = eval_expr_value(right, schema, row)?;
-                Ok(matches!(
-                    compare_db_values(&lv, &rv),
-                    Some(Ordering::Greater | Ordering::Equal)
-                ))
-            }
-            _ => Err(SqlError::UnsupportedExpr),
-        },
-        Expr::IsNull(e) => {
-            let v = eval_expr_value(e, schema, row)?;
-            Ok(v == DbValue::Null)
-        }
-        Expr::IsNotNull(e) => {
-            let v = eval_expr_value(e, schema, row)?;
-            Ok(v != DbValue::Null)
-        }
-        Expr::Nested(e) => eval_expr_bool(e, schema, row),
-        _ => Err(SqlError::UnsupportedExpr),
-    }
-}
-
 /// Try to extract a simple `pk_col = integer` pattern for PkEqual scanner optimisation.
 fn try_pk_equal(table: &str, schema: &Schema, expr: &Expr) -> Option<Scanner> {
+    use sqlparser::ast::BinaryOperator;
+
     let Expr::BinaryOp {
         left,
         op: BinaryOperator::Eq,
@@ -538,22 +443,6 @@ fn execute_insert<const N: usize>(
 
         Ok(vec![])
     })
-}
-
-fn eval_value_expr(expr: &sqlparser::ast::Expr) -> Result<DbValue, SqlError> {
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::Value(v) => eval_value(&v.value),
-        Expr::UnaryOp {
-            op: sqlparser::ast::UnaryOperator::Minus,
-            expr,
-        } => match eval_value_expr(expr)? {
-            DbValue::Integer(i) => Ok(DbValue::Integer(-i)),
-            DbValue::Float(f) => Ok(DbValue::Float(-f)),
-            _ => Err(SqlError::UnsupportedExpr),
-        },
-        _ => Err(SqlError::UnsupportedExpr),
-    }
 }
 
 #[cfg(test)]
