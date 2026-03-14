@@ -613,25 +613,6 @@ impl<'a, const N: usize> Transaction<'a, N> {
             ref mut active_transactions,
             ..
         } = inner.deref_mut();
-        let other_max_write_keys = active_transactions
-            .iter()
-            .filter(|(tx_id, _)| **tx_id != self.tx_id)
-            .flat_map(|(_, op)| {
-                op.writes
-                    .iter()
-                    .filter(|(_, value)| value.is_some())
-                    .map(|((root, key), _)| (*root, *key))
-            })
-            .fold(BTreeMap::new(), |mut acc, (root, key)| {
-                acc.entry(root)
-                    .and_modify(|max_key| {
-                        if key > *max_key {
-                            *max_key = key;
-                        }
-                    })
-                    .or_insert(key);
-                acc
-            });
         let op = active_transactions.get_mut(&self.tx_id).unwrap();
         let locked_tx = LockedTransaction {
             btree,
