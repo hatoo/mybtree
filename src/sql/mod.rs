@@ -149,11 +149,11 @@ impl Statement {
                         .map_err(DatabaseError::Internal)?;
                     if let Some(expr) = filter {
                         if !eval_expr_bool(expr, &schema, &row)? {
-                            return Ok(true);
+                            return Ok(false);
                         }
                     }
                     rows.push(project_row(&schema, &row, projections)?);
-                    Ok(true)
+                    Ok(false)
                 })?;
                 Ok(rows)
             }
@@ -202,9 +202,7 @@ fn eval_value(v: &Value) -> Result<DbValue, SqlError> {
                 Err(SqlError::UnsupportedExpr)
             }
         }
-        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
-            Ok(DbValue::Text(s.clone()))
-        }
+        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(DbValue::Text(s.clone())),
         Value::Boolean(b) => Ok(DbValue::Bool(*b)),
         Value::Null => Ok(DbValue::Null),
         _ => Err(SqlError::UnsupportedExpr),
@@ -309,7 +307,12 @@ fn eval_expr_bool(expr: &Expr, schema: &Schema, row: &Row) -> Result<bool, SqlEr
 
 /// Try to extract a simple `pk_col = integer` pattern for PkEqual scanner optimisation.
 fn try_pk_equal(table: &str, schema: &Schema, expr: &Expr) -> Option<Scanner> {
-    let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr else {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
         return None;
     };
     let pk_name = &schema.columns[schema.primary_key].name;
@@ -354,6 +357,7 @@ pub fn execute<const N: usize>(
         last = match stmt {
             SqlStatement::Query(query) => execute_query(tx, *query)?,
             SqlStatement::CreateTable(ct) => execute_create_table(tx, ct)?,
+            SqlStatement::Insert(insert) => execute_insert(tx, insert)?,
             _ => return Err(SqlError::UnsupportedStatement),
         };
     }
@@ -488,4 +492,142 @@ fn execute_create_table<const N: usize>(
         locked_tx.create_table(&table_name, schema, pk_index)?;
         Ok(vec![])
     })
+}
+
+fn execute_insert<const N: usize>(
+    tx: &mut DbTransaction<'_, N>,
+    insert: sqlparser::ast::Insert,
+) -> Result<Vec<Row>, SqlError> {
+    use sqlparser::ast::{Expr, SetExpr, TableObject};
+
+    let TableObject::TableName(obj_name) = insert.table else {
+        return Err(SqlError::UnsupportedStatement);
+    };
+    let table_name = obj_name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .ok_or(SqlError::UnsupportedStatement)?;
+
+    // Named columns from INSERT INTO t (col1, col2) — may be empty.
+    let col_names: Vec<String> = insert.columns.iter().map(|i| i.value.clone()).collect();
+
+    let SetExpr::Values(values_list) = *insert.source.ok_or(SqlError::UnsupportedStatement)?.body
+    else {
+        return Err(SqlError::UnsupportedStatement);
+    };
+
+    tx.with_lock(|mut locked_tx| {
+        let schema = locked_tx.get_schema(&table_name)?;
+
+        for value_row in &values_list.rows {
+            // Build a full row initialised to Null.
+            let mut values = vec![DbValue::Null; schema.columns.len()];
+
+            if col_names.is_empty() {
+                // No column list: values map positionally, skipping implicit PK.
+                let start = if schema.implicit_pk { 1 } else { 0 };
+                for (i, expr) in value_row.iter().enumerate() {
+                    let col_idx = start + i;
+                    if col_idx >= schema.columns.len() {
+                        return Err(SqlError::UnsupportedExpr);
+                    }
+                    values[col_idx] = eval_value_expr(expr)?;
+                }
+            } else {
+                for (col_name, expr) in col_names.iter().zip(value_row.iter()) {
+                    let col_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                        .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+                    values[col_idx] = eval_value_expr(expr)?;
+                }
+            }
+
+            locked_tx.insert(&table_name, &Row { values })?;
+        }
+
+        Ok(vec![])
+    })
+}
+
+fn eval_value_expr(expr: &sqlparser::ast::Expr) -> Result<DbValue, SqlError> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Value(v) => eval_value(&v.value),
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr,
+        } => match eval_value_expr(expr)? {
+            DbValue::Integer(i) => Ok(DbValue::Integer(-i)),
+            DbValue::Float(f) => Ok(DbValue::Float(-f)),
+            _ => Err(SqlError::UnsupportedExpr),
+        },
+        _ => Err(SqlError::UnsupportedExpr),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::NamedTempFile;
+
+    use crate::{Database, DbValue, Pager};
+
+    use super::execute;
+
+    fn open_db() -> (Database<4096>, NamedTempFile) {
+        let temp = NamedTempFile::new().unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        let pager = Pager::<4096>::new(file);
+        let db = Database::create(pager).unwrap();
+        (db, temp)
+    }
+
+    #[test]
+    fn create_insert_select() {
+        let (db, _temp) = open_db();
+        let mut tx = db.begin_transaction();
+
+        execute(
+            &mut tx,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
+        )
+        .unwrap();
+
+        execute(
+            &mut tx,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
+        )
+        .unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let mut tx = db.begin_transaction();
+
+        let rows = execute(&mut tx, "SELECT name, age FROM users").unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::Text("Alice".into()), DbValue::Integer(30)]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::Text("Bob".into()), DbValue::Integer(25)]
+        );
+
+        tx.commit().unwrap();
+    }
 }
