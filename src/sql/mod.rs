@@ -1,10 +1,10 @@
 use std::{borrow::Cow, ops::Bound};
 
 use rkyv::rancor::Error;
-use sqlparser::ast::SelectItem;
+use sqlparser::ast::{Expr, SelectItem};
 
 use crate::{
-    DatabaseError, DbTransaction, Key, Row,
+    DatabaseError, DbTransaction, Key, Row, Schema,
     database::{ArchivedRow, LockedDbTransaction},
 };
 
@@ -41,6 +41,10 @@ enum Statement {
 pub enum SqlError {
     #[error("Database error: {0}")]
     Database(#[from] crate::DatabaseError),
+    #[error("column not found: {0}")]
+    ColumnNotFound(String),
+    #[error("unsupported select item")]
+    UnsupportedSelectItem,
 }
 
 impl Scanner {
@@ -111,7 +115,7 @@ impl Scanner {
 impl Statement {
     fn execute<'a, const N: usize>(
         &self,
-        locked_tx: LockedDbTransaction<'a, N>,
+        mut locked_tx: LockedDbTransaction<'a, N>,
     ) -> Result<Vec<Row>, SqlError> {
         match self {
             Statement::Select {
@@ -119,12 +123,48 @@ impl Statement {
                 scanner,
                 projections,
             } => {
+                let schema = locked_tx.get_schema(table)?;
                 let mut rows = Vec::new();
-                scanner.scan::<_, SqlError, N>(locked_tx, |_tx, key, row| todo!())?;
+                scanner.scan::<_, SqlError, N>(locked_tx, |_tx, _key, archived| {
+                    let row: Row = rkyv::deserialize::<Row, Error>(archived)
+                        .map_err(DatabaseError::Internal)?;
+                    rows.push(project_row(&schema, &row, projections)?);
+                    Ok(true)
+                })?;
                 Ok(rows)
             }
         }
     }
+}
+
+fn project_row(schema: &Schema, row: &Row, projections: &[SelectItem]) -> Result<Row, SqlError> {
+    let mut values = Vec::new();
+    for item in projections {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (i, _col) in schema.columns.iter().enumerate() {
+                    if schema.implicit_pk && i == schema.primary_key {
+                        continue;
+                    }
+                    values.push(row.values[i].clone());
+                }
+            }
+            SelectItem::UnnamedExpr(Expr::Identifier(ident))
+            | SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(ident),
+                ..
+            } => {
+                let col_idx = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                    .ok_or_else(|| SqlError::ColumnNotFound(ident.value.clone()))?;
+                values.push(row.values[col_idx].clone());
+            }
+            _ => return Err(SqlError::UnsupportedSelectItem),
+        }
+    }
+    Ok(Row { values })
 }
 
 pub fn execute<const N: usize>(
