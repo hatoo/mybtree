@@ -112,13 +112,17 @@ impl Statement {
     fn execute<'a, const N: usize>(
         &self,
         locked_tx: LockedDbTransaction<'a, N>,
-    ) -> Result<(), SqlError> {
+    ) -> Result<Vec<Row>, SqlError> {
         match self {
             Statement::Select {
                 table,
                 scanner,
                 projections,
-            } => scanner.scan(locked_tx, |_tx, key, row| todo!()),
+            } => {
+                let mut rows = Vec::new();
+                scanner.scan::<_, SqlError, N>(locked_tx, |_tx, key, row| todo!())?;
+                Ok(rows)
+            }
         }
     }
 }
