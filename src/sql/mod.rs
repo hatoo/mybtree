@@ -498,7 +498,7 @@ fn execute_insert<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     insert: sqlparser::ast::Insert,
 ) -> Result<Vec<Row>, SqlError> {
-    use sqlparser::ast::{Expr, SetExpr, TableObject};
+    use sqlparser::ast::{SetExpr, TableObject};
 
     let TableObject::TableName(obj_name) = insert.table else {
         return Err(SqlError::UnsupportedStatement);
