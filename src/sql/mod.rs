@@ -4,7 +4,7 @@ use rkyv::rancor::Error;
 use sqlparser::ast::{BinaryOperator, Expr, SelectItem, Value};
 
 use crate::{
-    DatabaseError, DbTransaction, DbValue, Key, Row, Schema,
+    Column, ColumnType, DatabaseError, DbTransaction, DbValue, Key, Row, Schema,
     database::{ArchivedRow, LockedDbTransaction},
 };
 
@@ -35,6 +35,11 @@ enum Statement {
         scanner: Scanner,
         projections: Vec<SelectItem>,
         filter: Option<Expr>,
+    },
+    CreateTable {
+        name: String,
+        schema: Schema,
+        pk_index: Option<usize>,
     },
 }
 
@@ -123,6 +128,14 @@ impl Statement {
         mut locked_tx: LockedDbTransaction<'a, N>,
     ) -> Result<Vec<Row>, SqlError> {
         match self {
+            Statement::CreateTable {
+                name,
+                schema,
+                pk_index,
+            } => {
+                locked_tx.create_table(name, schema.clone(), *pk_index)?;
+                Ok(vec![])
+            }
             Statement::Select {
                 table,
                 scanner,
@@ -329,20 +342,29 @@ pub fn execute<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     sql: &str,
 ) -> Result<Vec<Row>, SqlError> {
-    use sqlparser::ast::{SetExpr, Statement as SqlStatement, TableFactor};
+    use sqlparser::ast::Statement as SqlStatement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    let mut stmts =
+    let stmts =
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
-    if stmts.len() != 1 {
-        return Err(SqlError::UnsupportedStatement);
+    let mut last = Vec::new();
+    for stmt in stmts {
+        last = match stmt {
+            SqlStatement::Query(query) => execute_query(tx, *query)?,
+            SqlStatement::CreateTable(ct) => execute_create_table(tx, ct)?,
+            _ => return Err(SqlError::UnsupportedStatement),
+        };
     }
+    Ok(last)
+}
 
-    let SqlStatement::Query(query) = stmts.remove(0) else {
-        return Err(SqlError::UnsupportedStatement);
-    };
+fn execute_query<const N: usize>(
+    tx: &mut DbTransaction<'_, N>,
+    query: sqlparser::ast::Query,
+) -> Result<Vec<Row>, SqlError> {
+    use sqlparser::ast::{SetExpr, TableFactor};
     let SetExpr::Select(select) = *query.body else {
         return Err(SqlError::UnsupportedStatement);
     };
@@ -381,5 +403,89 @@ pub fn execute<const N: usize>(
             filter,
         };
         stmt.execute(locked_tx)
+    })
+}
+
+fn execute_create_table<const N: usize>(
+    tx: &mut DbTransaction<'_, N>,
+    ct: sqlparser::ast::CreateTable,
+) -> Result<Vec<Row>, SqlError> {
+    use sqlparser::ast::{ColumnOption, DataType};
+
+    let table_name = ct
+        .name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .ok_or(SqlError::UnsupportedStatement)?;
+
+    let mut columns = Vec::new();
+    let mut pk_index: Option<usize> = None;
+
+    for col_def in &ct.columns {
+        let column_type = match &col_def.data_type {
+            DataType::TinyInt(_)
+            | DataType::SmallInt(_)
+            | DataType::Int(_)
+            | DataType::Integer(_)
+            | DataType::BigInt(_) => ColumnType::Integer,
+            DataType::Float(_)
+            | DataType::Real
+            | DataType::Double(_)
+            | DataType::DoublePrecision => ColumnType::Float,
+            DataType::Bool | DataType::Boolean => ColumnType::Bool,
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_) => ColumnType::Text,
+            _ => return Err(SqlError::UnsupportedExpr),
+        };
+
+        let mut nullable = true;
+        for opt in &col_def.options {
+            match &opt.option {
+                ColumnOption::NotNull => nullable = false,
+                ColumnOption::PrimaryKey(_) => {
+                    nullable = false;
+                    pk_index = Some(columns.len());
+                }
+                _ => {}
+            }
+        }
+
+        columns.push(Column {
+            name: col_def.name.value.clone(),
+            column_type,
+            nullable,
+        });
+    }
+
+    // Also check table-level PRIMARY KEY constraint.
+    if pk_index.is_none() {
+        use sqlparser::ast::{Expr, TableConstraint};
+        for constraint in &ct.constraints {
+            if let TableConstraint::PrimaryKey(pk) = constraint {
+                if let Some(idx_col) = pk.columns.first() {
+                    if let Expr::Identifier(ident) = &idx_col.column.expr {
+                        pk_index = columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(&ident.value));
+                        if let Some(idx) = pk_index {
+                            columns[idx].nullable = false;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    let schema = Schema {
+        columns,
+        primary_key: 0, // overwritten by create_table
+        implicit_pk: false,
+    };
+
+    tx.with_lock(|mut locked_tx| {
+        locked_tx.create_table(&table_name, schema, pk_index)?;
+        Ok(vec![])
     })
 }
