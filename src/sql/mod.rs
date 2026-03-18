@@ -198,6 +198,8 @@ pub fn execute<const N: usize>(
             SqlStatement::CreateTable(ct) => execute_create_table(tx, ct)?,
             SqlStatement::Insert(insert) => execute_insert(tx, insert)?,
             SqlStatement::Update(update) => execute_update(tx, update)?,
+            SqlStatement::Delete(delete) => execute_delete(tx, delete)?,
+            SqlStatement::CreateIndex(ci) => execute_create_index(tx, ci)?,
             _ => return Err(SqlError::UnsupportedStatement),
         };
     }
@@ -469,6 +471,83 @@ fn execute_update<const N: usize>(
     })
 }
 
+fn execute_create_index<const N: usize>(
+    tx: &mut DbTransaction<'_, N>,
+    ci: sqlparser::ast::CreateIndex,
+) -> Result<Vec<Row>, SqlError> {
+    let table_name = ci
+        .table_name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .ok_or(SqlError::UnsupportedStatement)?;
+
+    if ci.columns.len() != 1 {
+        return Err(SqlError::UnsupportedStatement);
+    }
+    let col_expr = &ci.columns[0].column.expr;
+    let Expr::Identifier(ident) = col_expr else {
+        return Err(SqlError::UnsupportedExpr);
+    };
+    let col_name = &ident.value;
+
+    tx.with_lock(|mut locked_tx| {
+        locked_tx.create_index(&table_name, col_name)?;
+        Ok(vec![])
+    })
+}
+
+fn execute_delete<const N: usize>(
+    tx: &mut DbTransaction<'_, N>,
+    delete: sqlparser::ast::Delete,
+) -> Result<Vec<Row>, SqlError> {
+    use sqlparser::ast::{FromTable, TableFactor};
+
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+    };
+    if tables.len() != 1 || !tables[0].joins.is_empty() {
+        return Err(SqlError::UnsupportedStatement);
+    }
+    let TableFactor::Table { name, .. } = &tables[0].relation else {
+        return Err(SqlError::UnsupportedStatement);
+    };
+    let table_name = name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .ok_or(SqlError::UnsupportedStatement)?;
+
+    let filter = delete.selection;
+
+    tx.with_lock(|mut locked_tx| {
+        let schema = locked_tx.get_schema(&table_name)?;
+
+        let mut to_delete: Vec<Key> = Vec::new();
+        locked_tx.scan::<_, SqlError>(
+            &table_name,
+            (Bound::<Key>::Unbounded, Bound::<Key>::Unbounded),
+            |_tx, key, archived| {
+                if let Some(expr) = &filter {
+                    let row: Row = rkyv::deserialize::<Row, Error>(archived)
+                        .map_err(DatabaseError::Internal)?;
+                    if !eval_expr_bool(expr, &schema, &row)? {
+                        return Ok(false);
+                    }
+                }
+                to_delete.push(key);
+                Ok(false)
+            },
+        )?;
+        for key in &to_delete {
+            locked_tx.delete(&table_name, *key)?;
+        }
+        Ok(vec![])
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -572,6 +651,50 @@ mod tests {
         let rows = execute(&mut tx, "SELECT name FROM users").unwrap();
         assert_eq!(rows[0].values, vec![DbValue::Text("Unknown".into())]);
         assert_eq!(rows[1].values, vec![DbValue::Text("Unknown".into())]);
+
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn delete_rows() {
+        let (db, _temp) = open_db();
+        let mut tx = db.begin_transaction();
+
+        execute(
+            &mut tx,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
+        )
+        .unwrap();
+
+        execute(
+            &mut tx,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
+        )
+        .unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
+        )
+        .unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)",
+        )
+        .unwrap();
+
+        // Delete with WHERE clause
+        execute(&mut tx, "DELETE FROM users WHERE id = 1").unwrap();
+
+        let rows = execute(&mut tx, "SELECT name FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values, vec![DbValue::Text("Bob".into())]);
+        assert_eq!(rows[1].values, vec![DbValue::Text("Carol".into())]);
+
+        // Delete all remaining rows
+        execute(&mut tx, "DELETE FROM users").unwrap();
+
+        let rows = execute(&mut tx, "SELECT * FROM users").unwrap();
+        assert_eq!(rows.len(), 0);
 
         tx.commit().unwrap();
     }
