@@ -1,37 +1,17 @@
-use std::{borrow::Cow, ops::Bound};
+use std::ops::Bound;
 
 use rkyv::rancor::Error;
-use sqlparser::ast::{Expr, SelectItem, Value};
+use sqlparser::ast::{Expr, SelectItem};
 
 use crate::{
     Column, ColumnType, DatabaseError, DbTransaction, DbValue, Key, Row, Schema,
-    database::{ArchivedRow, LockedDbTransaction},
 };
 
-use expr::{eval_expr_bool, eval_value, eval_value_expr};
+use expr::{eval_expr_bool, eval_value_expr};
+use scan::{Scanner, find_best_scanner};
 
 pub mod expr;
-
-enum Scanner {
-    PkEqual {
-        table: String,
-        pk: Key,
-    },
-    PkRange {
-        table: String,
-        range: (Bound<Key>, Bound<Key>),
-    },
-    IndexEqual {
-        table: String,
-        index: String,
-        value: Vec<u8>,
-    },
-    IndexRange {
-        table: String,
-        index: String,
-        range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
-    },
-}
+mod scan;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SqlError {
@@ -45,71 +25,6 @@ pub enum SqlError {
     Parse(String),
     #[error("unsupported statement")]
     UnsupportedStatement,
-}
-
-impl Scanner {
-    fn scan<'a, F, E: From<DatabaseError>, const N: usize>(
-        &self,
-        mut locked_tx: LockedDbTransaction<'a, N>,
-        mut f: F,
-    ) -> Result<(), E>
-    where
-        F: for<'local> FnMut(
-            LockedDbTransaction<'local, N>,
-            Key,
-            &'local ArchivedRow,
-        ) -> Result<bool, E>,
-    {
-        match self {
-            Scanner::PkEqual { table, pk } => {
-                if let Some(value) = locked_tx.get_value(table, *pk)? {
-                    let value = match value {
-                        Cow::Borrowed(v) => v.to_vec(),
-                        Cow::Owned(v) => v,
-                    };
-                    let value = rkyv::access::<rkyv::Archived<Row>, Error>(&value)
-                        .map_err(|e| DatabaseError::Internal(e))?;
-                    f(locked_tx, *pk, value)?;
-                }
-            }
-            Scanner::PkRange { table, range } => {
-                locked_tx.scan(table.as_str(), *range, f)?;
-            }
-            Scanner::IndexEqual {
-                table,
-                index,
-                value,
-            } => {
-                let v = value.as_slice();
-                locked_tx.scan_by_index(
-                    table.as_str(),
-                    index.as_str(),
-                    v..=v,
-                    |tx, archived, key| f(tx, key, archived),
-                )?;
-            }
-            Scanner::IndexRange {
-                table,
-                index,
-                range,
-            } => {
-                fn map_bound(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
-                    match b {
-                        Bound::Included(v) => Bound::Included(v.as_slice()),
-                        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-                        Bound::Unbounded => Bound::Unbounded,
-                    }
-                }
-                locked_tx.scan_by_index(
-                    table.as_str(),
-                    index.as_str(),
-                    (map_bound(&range.0), map_bound(&range.1)),
-                    |tx, archived, key| f(tx, key, archived),
-                )?;
-            }
-        }
-        Ok(())
-    }
 }
 
 fn project_row(schema: &Schema, row: &Row, projections: &[SelectItem]) -> Result<Row, SqlError> {
@@ -140,44 +55,6 @@ fn project_row(schema: &Schema, row: &Row, projections: &[SelectItem]) -> Result
         }
     }
     Ok(Row { values })
-}
-
-/// Try to extract a simple `pk_col = integer` pattern for PkEqual scanner optimisation.
-fn try_pk_equal(table: &str, schema: &Schema, expr: &Expr) -> Option<Scanner> {
-    use sqlparser::ast::BinaryOperator;
-
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = expr
-    else {
-        return None;
-    };
-    let pk_name = &schema.columns[schema.primary_key].name;
-
-    let (ident, val_expr) = match (left.as_ref(), right.as_ref()) {
-        (Expr::Identifier(i), v) => (i, v),
-        (v, Expr::Identifier(i)) => (i, v),
-        _ => return None,
-    };
-
-    if !ident.value.eq_ignore_ascii_case(pk_name) {
-        return None;
-    }
-
-    let Expr::Value(v) = val_expr else {
-        return None;
-    };
-    let Value::Number(n, _) = &v.value else {
-        return None;
-    };
-
-    let pk: Key = n.parse().ok()?;
-    Some(Scanner::PkEqual {
-        table: table.to_string(),
-        pk,
-    })
 }
 
 pub fn execute<const N: usize>(
@@ -233,10 +110,11 @@ fn execute_query<const N: usize>(
 
     tx.with_lock(|mut locked_tx| {
         let schema = locked_tx.get_schema(&table_name)?;
+        let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
         let scanner = filter
             .as_ref()
-            .and_then(|f| try_pk_equal(&table_name, &schema, f))
+            .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
             .unwrap_or_else(|| Scanner::PkRange {
                 table: table_name.clone(),
                 range: (Bound::Unbounded, Bound::Unbounded),
