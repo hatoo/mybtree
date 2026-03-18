@@ -22,6 +22,13 @@ pub struct Btree<const N: usize> {
     pub available_key_cache: BTreeMap<NodePtr, Key>,
 }
 
+impl<const N: usize> Drop for Btree<N> {
+    fn drop(&mut self) {
+        // Ignore flush errors on drop
+        let _ = self.flush();
+    }
+}
+
 impl<const N: usize> Btree<N> {
     pub fn new(pager: Pager<N>) -> Self {
         Btree {

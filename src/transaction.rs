@@ -603,6 +603,10 @@ impl<'a, const N: usize> LockedTransaction<'a, N> {
             .deferred_free_index_trees
             .push(root)
     }
+
+    pub fn flush(&mut self) -> Result<(), std::io::Error> {
+        self.btree.flush()
+    }
 }
 
 impl<'a, const N: usize> Transaction<'a, N> {
