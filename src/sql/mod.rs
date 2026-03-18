@@ -4,7 +4,7 @@ use rkyv::rancor::Error;
 use sqlparser::ast::{Expr, SelectItem};
 
 use crate::{
-    Column, ColumnType, DatabaseError, DbTransaction, DbValue, Key, Row, Schema,
+    Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema,
 };
 
 use expr::{eval_expr_bool, eval_value_expr};
@@ -302,6 +302,7 @@ fn execute_update<const N: usize>(
 
     tx.with_lock(|mut locked_tx| {
         let schema = locked_tx.get_schema(&table_name)?;
+        let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
         // Resolve assignments to (column_index, expr) pairs.
         let mut assignments = Vec::new();
@@ -323,28 +324,28 @@ fn execute_update<const N: usize>(
             assignments.push((col_idx, &a.value));
         }
 
-        let mut to_update: Vec<(Key, Row)> = Vec::new();
-        locked_tx.scan::<_, SqlError>(
-            &table_name,
-            (Bound::<Key>::Unbounded, Bound::<Key>::Unbounded),
-            |_tx, key, archived| {
-                let mut row: Row = rkyv::deserialize::<Row, Error>(archived)
-                    .map_err(DatabaseError::Internal)?;
-                if let Some(expr) = &filter {
-                    if !eval_expr_bool(expr, &schema, &row)? {
-                        return Ok(false);
-                    }
+        let scanner = filter
+            .as_ref()
+            .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
+            .unwrap_or_else(|| Scanner::PkRange {
+                table: table_name.clone(),
+                range: (Bound::Unbounded, Bound::Unbounded),
+            });
+
+        scanner.scan::<_, SqlError, N>(locked_tx, |mut tx, key, archived| {
+            let mut row: Row = rkyv::deserialize::<Row, Error>(archived)
+                .map_err(DatabaseError::Internal)?;
+            if let Some(expr) = &filter {
+                if !eval_expr_bool(expr, &schema, &row)? {
+                    return Ok(false);
                 }
-                for &(col_idx, ref expr) in &assignments {
-                    row.values[col_idx] = eval_value_expr(expr)?;
-                }
-                to_update.push((key, row));
-                Ok(false)
-            },
-        )?;
-        for (key, row) in &to_update {
-            locked_tx.update(&table_name, *key, row)?;
-        }
+            }
+            for &(col_idx, ref expr) in &assignments {
+                row.values[col_idx] = eval_value_expr(expr)?;
+            }
+            tx.update(&table_name, key, &row)?;
+            Ok(false)
+        })?;
         Ok(vec![])
     })
 }
@@ -402,26 +403,27 @@ fn execute_delete<const N: usize>(
 
     tx.with_lock(|mut locked_tx| {
         let schema = locked_tx.get_schema(&table_name)?;
+        let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
-        let mut to_delete: Vec<Key> = Vec::new();
-        locked_tx.scan::<_, SqlError>(
-            &table_name,
-            (Bound::<Key>::Unbounded, Bound::<Key>::Unbounded),
-            |_tx, key, archived| {
-                if let Some(expr) = &filter {
-                    let row: Row = rkyv::deserialize::<Row, Error>(archived)
-                        .map_err(DatabaseError::Internal)?;
-                    if !eval_expr_bool(expr, &schema, &row)? {
-                        return Ok(false);
-                    }
+        let scanner = filter
+            .as_ref()
+            .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
+            .unwrap_or_else(|| Scanner::PkRange {
+                table: table_name.clone(),
+                range: (Bound::Unbounded, Bound::Unbounded),
+            });
+
+        scanner.scan::<_, SqlError, N>(locked_tx, |mut tx, key, archived| {
+            if let Some(expr) = &filter {
+                let row: Row = rkyv::deserialize::<Row, Error>(archived)
+                    .map_err(DatabaseError::Internal)?;
+                if !eval_expr_bool(expr, &schema, &row)? {
+                    return Ok(false);
                 }
-                to_delete.push(key);
-                Ok(false)
-            },
-        )?;
-        for key in &to_delete {
-            locked_tx.delete(&table_name, *key)?;
-        }
+            }
+            tx.delete(&table_name, key)?;
+            Ok(false)
+        })?;
         Ok(vec![])
     })
 }
