@@ -40,11 +40,6 @@ enum Statement {
         projections: Vec<SelectItem>,
         filter: Option<Expr>,
     },
-    CreateTable {
-        name: String,
-        schema: Schema,
-        pk_index: Option<usize>,
-    },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -132,14 +127,6 @@ impl Statement {
         mut locked_tx: LockedDbTransaction<'a, N>,
     ) -> Result<Vec<Row>, SqlError> {
         match self {
-            Statement::CreateTable {
-                name,
-                schema,
-                pk_index,
-            } => {
-                locked_tx.create_table(name, schema.clone(), *pk_index)?;
-                Ok(vec![])
-            }
             Statement::Select {
                 table,
                 scanner,
