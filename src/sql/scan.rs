@@ -32,6 +32,13 @@ pub(super) enum Scanner {
 }
 
 impl Scanner {
+    pub fn full(table: String) -> Self {
+        Scanner::PkRange {
+            table: table,
+            range: (Bound::Unbounded, Bound::Unbounded),
+        }
+    }
+
     pub(super) fn scan<'a, F, E: From<DatabaseError>, const N: usize>(
         &self,
         mut locked_tx: LockedDbTransaction<'a, N>,

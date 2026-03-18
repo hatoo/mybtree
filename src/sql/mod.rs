@@ -3,9 +3,7 @@ use std::ops::Bound;
 use rkyv::rancor::Error;
 use sqlparser::ast::{Expr, SelectItem};
 
-use crate::{
-    Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema,
-};
+use crate::{Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema};
 
 use expr::{eval_expr_bool, eval_value_expr};
 use scan::{Scanner, find_best_scanner};
@@ -115,15 +113,12 @@ fn execute_query<const N: usize>(
         let scanner = filter
             .as_ref()
             .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
-            .unwrap_or_else(|| Scanner::PkRange {
-                table: table_name.clone(),
-                range: (Bound::Unbounded, Bound::Unbounded),
-            });
+            .unwrap_or_else(|| Scanner::full(table_name.clone()));
 
         let mut rows = Vec::new();
         scanner.scan::<_, SqlError, N>(locked_tx, |_tx, _key, archived| {
-            let row: Row = rkyv::deserialize::<Row, Error>(archived)
-                .map_err(DatabaseError::Internal)?;
+            let row: Row =
+                rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
             if let Some(expr) = &filter {
                 if !eval_expr_bool(expr, &schema, &row)? {
                     return Ok(false);
@@ -327,14 +322,11 @@ fn execute_update<const N: usize>(
         let scanner = filter
             .as_ref()
             .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
-            .unwrap_or_else(|| Scanner::PkRange {
-                table: table_name.clone(),
-                range: (Bound::Unbounded, Bound::Unbounded),
-            });
+            .unwrap_or_else(|| Scanner::full(table_name.clone()));
 
         scanner.scan::<_, SqlError, N>(locked_tx, |mut tx, key, archived| {
-            let mut row: Row = rkyv::deserialize::<Row, Error>(archived)
-                .map_err(DatabaseError::Internal)?;
+            let mut row: Row =
+                rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
             if let Some(expr) = &filter {
                 if !eval_expr_bool(expr, &schema, &row)? {
                     return Ok(false);
@@ -408,15 +400,12 @@ fn execute_delete<const N: usize>(
         let scanner = filter
             .as_ref()
             .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
-            .unwrap_or_else(|| Scanner::PkRange {
-                table: table_name.clone(),
-                range: (Bound::Unbounded, Bound::Unbounded),
-            });
+            .unwrap_or_else(|| Scanner::full(table_name.clone()));
 
         scanner.scan::<_, SqlError, N>(locked_tx, |mut tx, key, archived| {
             if let Some(expr) = &filter {
-                let row: Row = rkyv::deserialize::<Row, Error>(archived)
-                    .map_err(DatabaseError::Internal)?;
+                let row: Row =
+                    rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
                 if !eval_expr_bool(expr, &schema, &row)? {
                     return Ok(false);
                 }
