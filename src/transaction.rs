@@ -673,6 +673,20 @@ impl<'a, const N: usize> Transaction<'a, N> {
     }
 }
 
+impl<'a, const N: usize> Drop for Transaction<'a, N> {
+    fn drop(&mut self) {
+        let mut inner = self.store.lock().unwrap();
+        if let Some(op) = inner.active_transactions.remove(&self.tx_id) {
+            for page in op.deferred_init_trees {
+                let _ = inner.btree.pager.free_page(page);
+            }
+            for page in op.deferred_init_indexes {
+                let _ = inner.btree.pager.free_page(page);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

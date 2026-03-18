@@ -33,15 +33,6 @@ enum Scanner {
     },
 }
 
-enum Statement {
-    Select {
-        table: String,
-        scanner: Scanner,
-        projections: Vec<SelectItem>,
-        filter: Option<Expr>,
-    },
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum SqlError {
     #[error("Database error: {0}")]
@@ -118,37 +109,6 @@ impl Scanner {
             }
         }
         Ok(())
-    }
-}
-
-impl Statement {
-    fn execute<'a, const N: usize>(
-        &self,
-        mut locked_tx: LockedDbTransaction<'a, N>,
-    ) -> Result<Vec<Row>, SqlError> {
-        match self {
-            Statement::Select {
-                table,
-                scanner,
-                projections,
-                filter,
-            } => {
-                let schema = locked_tx.get_schema(table)?;
-                let mut rows = Vec::new();
-                scanner.scan::<_, SqlError, N>(locked_tx, |_tx, _key, archived| {
-                    let row: Row = rkyv::deserialize::<Row, Error>(archived)
-                        .map_err(DatabaseError::Internal)?;
-                    if let Some(expr) = filter {
-                        if !eval_expr_bool(expr, &schema, &row)? {
-                            return Ok(false);
-                        }
-                    }
-                    rows.push(project_row(&schema, &row, projections)?);
-                    Ok(false)
-                })?;
-                Ok(rows)
-            }
-        }
     }
 }
 
@@ -237,6 +197,7 @@ pub fn execute<const N: usize>(
             SqlStatement::Query(query) => execute_query(tx, *query)?,
             SqlStatement::CreateTable(ct) => execute_create_table(tx, ct)?,
             SqlStatement::Insert(insert) => execute_insert(tx, insert)?,
+            SqlStatement::Update(update) => execute_update(tx, update)?,
             _ => return Err(SqlError::UnsupportedStatement),
         };
     }
@@ -279,13 +240,19 @@ fn execute_query<const N: usize>(
                 range: (Bound::Unbounded, Bound::Unbounded),
             });
 
-        let stmt = Statement::Select {
-            table: table_name,
-            scanner,
-            projections,
-            filter,
-        };
-        stmt.execute(locked_tx)
+        let mut rows = Vec::new();
+        scanner.scan::<_, SqlError, N>(locked_tx, |_tx, _key, archived| {
+            let row: Row = rkyv::deserialize::<Row, Error>(archived)
+                .map_err(DatabaseError::Internal)?;
+            if let Some(expr) = &filter {
+                if !eval_expr_bool(expr, &schema, &row)? {
+                    return Ok(false);
+                }
+            }
+            rows.push(project_row(&schema, &row, &projections)?);
+            Ok(false)
+        })?;
+        Ok(rows)
     })
 }
 
@@ -432,6 +399,76 @@ fn execute_insert<const N: usize>(
     })
 }
 
+fn execute_update<const N: usize>(
+    tx: &mut DbTransaction<'_, N>,
+    update: sqlparser::ast::Update,
+) -> Result<Vec<Row>, SqlError> {
+    use sqlparser::ast::{AssignmentTarget, TableFactor};
+
+    if !update.table.joins.is_empty() {
+        return Err(SqlError::UnsupportedStatement);
+    }
+    let TableFactor::Table { name, .. } = &update.table.relation else {
+        return Err(SqlError::UnsupportedStatement);
+    };
+    let table_name = name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .ok_or(SqlError::UnsupportedStatement)?;
+
+    let filter = update.selection;
+
+    tx.with_lock(|mut locked_tx| {
+        let schema = locked_tx.get_schema(&table_name)?;
+
+        // Resolve assignments to (column_index, expr) pairs.
+        let mut assignments = Vec::new();
+        for a in &update.assignments {
+            let col_name = match &a.target {
+                AssignmentTarget::ColumnName(obj) => obj
+                    .0
+                    .last()
+                    .and_then(|p| p.as_ident())
+                    .map(|i| &i.value)
+                    .ok_or(SqlError::UnsupportedExpr)?,
+                AssignmentTarget::Tuple(_) => return Err(SqlError::UnsupportedExpr),
+            };
+            let col_idx = schema
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+            assignments.push((col_idx, &a.value));
+        }
+
+        let mut to_update: Vec<(Key, Row)> = Vec::new();
+        locked_tx.scan::<_, SqlError>(
+            &table_name,
+            (Bound::<Key>::Unbounded, Bound::<Key>::Unbounded),
+            |_tx, key, archived| {
+                let mut row: Row = rkyv::deserialize::<Row, Error>(archived)
+                    .map_err(DatabaseError::Internal)?;
+                if let Some(expr) = &filter {
+                    if !eval_expr_bool(expr, &schema, &row)? {
+                        return Ok(false);
+                    }
+                }
+                for &(col_idx, ref expr) in &assignments {
+                    row.values[col_idx] = eval_value_expr(expr)?;
+                }
+                to_update.push((key, row));
+                Ok(false)
+            },
+        )?;
+        for (key, row) in &to_update {
+            locked_tx.update(&table_name, *key, row)?;
+        }
+        Ok(vec![])
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -490,6 +527,51 @@ mod tests {
             rows[1].values,
             vec![DbValue::Text("Bob".into()), DbValue::Integer(25)]
         );
+
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn update_rows() {
+        let (db, _temp) = open_db();
+        let mut tx = db.begin_transaction();
+
+        execute(
+            &mut tx,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
+        )
+        .unwrap();
+
+        execute(
+            &mut tx,
+            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
+        )
+        .unwrap();
+        execute(
+            &mut tx,
+            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
+        )
+        .unwrap();
+
+        // Update with WHERE clause
+        execute(&mut tx, "UPDATE users SET age = 31 WHERE id = 1").unwrap();
+
+        let rows = execute(&mut tx, "SELECT name, age FROM users").unwrap();
+        assert_eq!(
+            rows[0].values,
+            vec![DbValue::Text("Alice".into()), DbValue::Integer(31)]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![DbValue::Text("Bob".into()), DbValue::Integer(25)]
+        );
+
+        // Update all rows
+        execute(&mut tx, "UPDATE users SET name = 'Unknown'").unwrap();
+
+        let rows = execute(&mut tx, "SELECT name FROM users").unwrap();
+        assert_eq!(rows[0].values, vec![DbValue::Text("Unknown".into())]);
+        assert_eq!(rows[1].values, vec![DbValue::Text("Unknown".into())]);
 
         tx.commit().unwrap();
     }

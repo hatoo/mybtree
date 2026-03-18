@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::io;
 use std::ops::{Bound, RangeBounds};
 
@@ -17,11 +19,15 @@ pub enum TreeError {
 
 pub struct Btree<const N: usize> {
     pub pager: Pager<N>,
+    pub available_key_cache: BTreeMap<NodePtr, Key>,
 }
 
 impl<const N: usize> Btree<N> {
     pub fn new(pager: Pager<N>) -> Self {
-        Btree { pager }
+        Btree {
+            pager,
+            available_key_cache: BTreeMap::new(),
+        }
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -787,27 +793,45 @@ impl<const N: usize> Btree<N> {
     }
 
     pub fn available_key(&mut self, root: NodePtr) -> Result<Key, TreeError> {
-        let page = self.pager.owned_node(root)?;
-        match page.page_type() {
+        let page = self.pager.read_node(root)?;
+        let key = match page.page_type() {
             PageType::Leaf => {
-                let leaf: LeafPage<N> = page.try_into().unwrap();
+                let leaf: &LeafPage<N> = page.try_into().unwrap();
                 if leaf.len() > 0 {
-                    Ok(leaf.key(leaf.len() - 1).saturating_add(1))
+                    leaf.key(leaf.len() - 1).saturating_add(1)
                 } else {
-                    Ok(0)
+                    0
                 }
             }
             PageType::Internal => {
-                let internal: InternalPage<N> = page.try_into().unwrap();
+                let internal: &InternalPage<N> = page.try_into().unwrap();
                 if internal.len() > 0 {
-                    Ok(internal.key(internal.len() - 1).saturating_add(1))
+                    internal.key(internal.len() - 1).saturating_add(1)
                 } else {
-                    Ok(0)
+                    0
                 }
             }
-            _ => Err(TreeError::UnexpectedPageType {
-                expected: "Leaf or Internal",
-            }),
+            _ => {
+                return Err(TreeError::UnexpectedPageType {
+                    expected: "Leaf or Internal",
+                });
+            }
+        };
+
+        match self.available_key_cache.entry(root) {
+            Entry::Occupied(mut e) => {
+                let cached_key = *e.get();
+                if cached_key >= key {
+                    Ok(cached_key + 1)
+                } else {
+                    e.insert(key);
+                    Ok(key)
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(key);
+                Ok(key)
+            }
         }
     }
 
