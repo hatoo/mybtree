@@ -4,7 +4,7 @@ use sqlparser::ast::{Expr, SelectItem};
 use crate::database::LockedDbTransaction;
 use crate::{DatabaseError, DbTransaction, DbValue, Row};
 
-use super::expr::{eval_expr_bool, eval_value_expr};
+use super::expr::eval_expr_bool;
 use super::scan::Scanner;
 use super::table_source::TableSource;
 use super::{ResultSet, SqlError};
