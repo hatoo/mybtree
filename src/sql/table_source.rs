@@ -45,6 +45,11 @@ impl<'a> TableSource<'a> {
         self
     }
 
+    /// Set parent scope in place.
+    pub fn set_parent(&mut self, parent: &'a TableSource<'a>) {
+        self.parent = Some(parent);
+    }
+
     /// Resolve an unqualified column name to its value.
     /// Falls back to parent scope if not found locally.
     pub fn resolve(&self, col_name: &str) -> Result<DbValue, SqlError> {
@@ -89,16 +94,26 @@ impl<'a> TableSource<'a> {
     }
 
     /// List all visible columns as (name, value) pairs, respecting implicit PK hiding.
+    /// Includes parent columns (for JOINs) — parent columns come first.
     pub fn all_columns(&self) -> Vec<(String, DbValue)> {
+        let mut cols = if let Some(parent) = self.parent {
+            parent.all_columns()
+        } else {
+            Vec::new()
+        };
         match &self.columns {
-            Columns::Physical { schema, row } => schema
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !(schema.implicit_pk && *i == schema.primary_key))
-                .map(|(i, col)| (col.name.clone(), row.values[i].clone()))
-                .collect(),
-            Columns::Named(pairs) => pairs.to_vec(),
+            Columns::Physical { schema, row } => {
+                cols.extend(
+                    schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !(schema.implicit_pk && *i == schema.primary_key))
+                        .map(|(i, col)| (col.name.clone(), row.values[i].clone())),
+                );
+            }
+            Columns::Named(pairs) => cols.extend_from_slice(pairs),
         }
+        cols
     }
 }

@@ -1,5 +1,5 @@
 use rkyv::rancor::Error;
-use sqlparser::ast::{Expr, SelectItem};
+use sqlparser::ast::{Expr, JoinConstraint, JoinOperator, SelectItem, TableFactor};
 
 use crate::database::LockedDbTransaction;
 use crate::{DatabaseError, DbTransaction, DbValue, Row};
@@ -79,19 +79,119 @@ pub(super) fn scan_query_locked<const N: usize, F>(
 where
     F: FnMut(&mut LockedDbTransaction<'_, N>, &[(String, DbValue)]) -> Result<bool, SqlError>,
 {
-    use sqlparser::ast::{SetExpr, TableFactor};
+    use sqlparser::ast::SetExpr;
     let SetExpr::Select(select) = *query.body else {
         return Err(SqlError::UnsupportedStatement);
     };
 
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+    if select.from.len() != 1 {
         return Err(SqlError::UnsupportedStatement);
     }
 
     let projections = select.projection;
     let filter = select.selection;
+    let from = &select.from[0];
 
-    match &select.from[0].relation {
+    // Extract join ON conditions and right-side table factors.
+    let mut joins: Vec<(&TableFactor, Option<&Expr>)> = Vec::new();
+    for join in &from.joins {
+        let on_expr = match &join.join_operator {
+            JoinOperator::Inner(JoinConstraint::On(expr))
+            | JoinOperator::Join(JoinConstraint::On(expr)) => Some(expr),
+            JoinOperator::Inner(JoinConstraint::None)
+            | JoinOperator::Join(JoinConstraint::None)
+            | JoinOperator::CrossJoin(_) => None,
+            _ => return Err(SqlError::UnsupportedStatement),
+        };
+        joins.push((&join.relation, on_expr));
+    }
+
+    // Scan the base relation, then for each row, nest into joins.
+    scan_relation::<N>(
+        locked_tx,
+        &from.relation,
+        outer_src,
+        &filter,
+        |tx, base_src| {
+            if joins.is_empty() {
+                // No joins — apply WHERE and project.
+                if let Some(expr) = &filter {
+                    if !eval_expr_bool(expr, &base_src, tx)? {
+                        return Ok(false);
+                    }
+                }
+                let projected = project_row(&base_src, &projections)?;
+                return f(tx, &projected);
+            }
+
+            // Process joins by nesting.
+            scan_joins::<N, _>(tx, &joins, 0, &base_src, &filter, &projections, &mut f)
+        },
+    )
+}
+
+/// Recursively process joins. For each join level, scan the right table
+/// and chain it as a child of the accumulated source.
+fn scan_joins<const N: usize, F>(
+    locked_tx: &mut LockedDbTransaction<'_, N>,
+    joins: &[(&TableFactor, Option<&Expr>)],
+    idx: usize,
+    left_src: &TableSource<'_>,
+    filter: &Option<Expr>,
+    projections: &[SelectItem],
+    f: &mut F,
+) -> Result<bool, SqlError>
+where
+    F: FnMut(&mut LockedDbTransaction<'_, N>, &[(String, DbValue)]) -> Result<bool, SqlError>,
+{
+    let (relation, on_expr) = &joins[idx];
+    let last = idx + 1 == joins.len();
+
+    let mut stopped = false;
+    let on_expr = *on_expr;
+
+    scan_relation::<N>(locked_tx, relation, Some(left_src), &None, |tx, right_src| {
+        // Chain right on top of left for column resolution.
+        let joined_src = right_src.with_parent(left_src);
+
+        // Evaluate ON condition.
+        if let Some(on) = on_expr {
+            if !eval_expr_bool(on, &joined_src, tx)? {
+                return Ok(false);
+            }
+        }
+
+        let result = if last {
+            // Last join — apply WHERE and project.
+            if let Some(expr) = filter {
+                if !eval_expr_bool(expr, &joined_src, tx)? {
+                    return Ok(false);
+                }
+            }
+            let projected = project_row(&joined_src, projections)?;
+            f(tx, &projected)?
+        } else {
+            // More joins to process.
+            scan_joins::<N, _>(tx, joins, idx + 1, &joined_src, filter, projections, f)?
+        };
+        if result {
+            stopped = true;
+        }
+        Ok(result)
+    })?;
+    Ok(stopped)
+}
+
+/// Scan a single table factor (physical table or derived subquery),
+/// calling `f` for each row with a `TableSource` that has `parent` set.
+fn scan_relation<'a, const N: usize>(
+    locked_tx: &mut LockedDbTransaction<'_, N>,
+    relation: &TableFactor,
+    parent: Option<&'a TableSource<'a>>,
+    scanner_filter: &Option<Expr>,
+    mut f: impl FnMut(&mut LockedDbTransaction<'_, N>, TableSource<'_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    match relation {
         TableFactor::Table { name, alias, .. } => {
             let table_name = name
                 .0
@@ -107,23 +207,17 @@ where
             let schema = locked_tx.get_schema(&table_name)?;
             let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
-            let scanner = Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
+            let scanner =
+                Scanner::from_filter(&table_name, &schema, &indexed_columns, scanner_filter);
 
             scanner.scan::<_, SqlError, N>(locked_tx, |tx, _key, archived| {
                 let row: Row =
                     rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
-                let src = TableSource::from_table(&qualifier, &schema, &row);
-                let src = match outer_src {
-                    Some(outer) => src.with_parent(outer),
-                    None => src,
-                };
-                if let Some(expr) = &filter {
-                    if !eval_expr_bool(expr, &src, tx)? {
-                        return Ok(false);
-                    }
+                let mut src = TableSource::from_table(&qualifier, &schema, &row);
+                if let Some(p) = parent {
+                    src.set_parent(p);
                 }
-                let projected = project_row(&src, &projections)?;
-                f(tx, &projected)
+                f(tx, src)
             })?;
             Ok(())
         }
@@ -139,20 +233,13 @@ where
                 &mut LockedDbTransaction<'_, N>,
                 &[(String, DbValue)],
             ) -> Result<bool, SqlError> = &mut |tx, sub_row| {
-                let src = TableSource::from_result_row(&alias, sub_row);
-                let src = match outer_src {
-                    Some(outer) => src.with_parent(outer),
-                    None => src,
-                };
-                if let Some(expr) = &filter {
-                    if !eval_expr_bool(expr, &src, tx)? {
-                        return Ok(false);
-                    }
+                let mut src = TableSource::from_result_row(&alias, sub_row);
+                if let Some(p) = parent {
+                    src.set_parent(p);
                 }
-                let projected = project_row(&src, &projections)?;
-                f(tx, &projected)
+                f(tx, src)
             };
-            scan_query_locked::<N, _>(locked_tx, *subquery.clone(), outer_src, inner)?;
+            scan_query_locked::<N, _>(locked_tx, *subquery.clone(), parent, inner)?;
             Ok(())
         }
         _ => Err(SqlError::UnsupportedStatement),

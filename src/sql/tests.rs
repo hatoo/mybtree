@@ -674,3 +674,124 @@ fn any_some_all() {
     .unwrap();
     assert_eq!(rs.rows.len(), 3);
 }
+
+#[test]
+fn inner_join() {
+    let (db, _temp) = open_db();
+    execute(
+        &db,
+        &mut None,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+    )
+    .unwrap();
+    execute(
+        &db,
+        &mut None,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, item TEXT NOT NULL)",
+    )
+    .unwrap();
+    execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+    execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
+    execute(&db, &mut None, "INSERT INTO orders (id, user_id, item) VALUES (1, 1, 'Book')").unwrap();
+    execute(&db, &mut None, "INSERT INTO orders (id, user_id, item) VALUES (2, 1, 'Pen')").unwrap();
+
+    // INNER JOIN — only Alice has orders
+    let rs = execute(
+        &db,
+        &mut None,
+        "SELECT u.name, o.item FROM users AS u INNER JOIN orders AS o ON o.user_id = u.id",
+    )
+    .unwrap();
+    assert_eq!(rs.rows.len(), 2);
+    assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+    assert_eq!(rs.rows[0][1], ("item".into(), DbValue::Text("Book".into())));
+    assert_eq!(rs.rows[1][0], ("name".into(), DbValue::Text("Alice".into())));
+    assert_eq!(rs.rows[1][1], ("item".into(), DbValue::Text("Pen".into())));
+
+    // JOIN (without INNER keyword) works the same
+    let rs = execute(
+        &db,
+        &mut None,
+        "SELECT u.name, o.item FROM users AS u JOIN orders AS o ON o.user_id = u.id",
+    )
+    .unwrap();
+    assert_eq!(rs.rows.len(), 2);
+
+    // SELECT * returns columns from both tables
+    let rs = execute(
+        &db,
+        &mut None,
+        "SELECT * FROM users AS u INNER JOIN orders AS o ON o.user_id = u.id WHERE u.id = 1",
+    )
+    .unwrap();
+    assert_eq!(rs.rows.len(), 2);
+    assert!(rs.rows[0].len() >= 4);
+}
+
+#[test]
+fn inner_join_no_match() {
+    let (db, _temp) = open_db();
+    execute(
+        &db,
+        &mut None,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+    )
+    .unwrap();
+    execute(
+        &db,
+        &mut None,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)",
+    )
+    .unwrap();
+    execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+
+    let rs = execute(
+        &db,
+        &mut None,
+        "SELECT u.name FROM users AS u INNER JOIN orders AS o ON o.user_id = u.id",
+    )
+    .unwrap();
+    assert_eq!(rs.rows.len(), 0);
+}
+
+#[test]
+fn multi_join() {
+    let (db, _temp) = open_db();
+    execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+    execute(&db, &mut None, "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)").unwrap();
+    execute(&db, &mut None, "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, name TEXT NOT NULL)").unwrap();
+    execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+    execute(&db, &mut None, "INSERT INTO orders (id, user_id) VALUES (1, 1)").unwrap();
+    execute(&db, &mut None, "INSERT INTO items (id, order_id, name) VALUES (1, 1, 'Book')").unwrap();
+
+    let rs = execute(
+        &db,
+        &mut None,
+        "SELECT u.name, i.name FROM users AS u \
+         INNER JOIN orders AS o ON o.user_id = u.id \
+         INNER JOIN items AS i ON i.order_id = o.id",
+    )
+    .unwrap();
+    assert_eq!(rs.rows.len(), 1);
+    assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+    assert_eq!(rs.rows[0][1], ("name".into(), DbValue::Text("Book".into())));
+}
+
+#[test]
+fn cross_join() {
+    let (db, _temp) = open_db();
+    execute(&db, &mut None, "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER NOT NULL)").unwrap();
+    execute(&db, &mut None, "CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER NOT NULL)").unwrap();
+    execute(&db, &mut None, "INSERT INTO a (id, x) VALUES (1, 10)").unwrap();
+    execute(&db, &mut None, "INSERT INTO a (id, x) VALUES (2, 20)").unwrap();
+    execute(&db, &mut None, "INSERT INTO b (id, y) VALUES (1, 100)").unwrap();
+    execute(&db, &mut None, "INSERT INTO b (id, y) VALUES (2, 200)").unwrap();
+
+    let rs = execute(
+        &db,
+        &mut None,
+        "SELECT a.x, b.y FROM a CROSS JOIN b",
+    )
+    .unwrap();
+    assert_eq!(rs.rows.len(), 4);
+}
