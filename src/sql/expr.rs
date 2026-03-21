@@ -41,9 +41,10 @@ pub(super) fn eval_value_expr(expr: &Expr) -> Result<DbValue, SqlError> {
     }
 }
 
-pub(super) fn eval_expr_value(
+pub(super) fn eval_expr_value<const N: usize>(
     expr: &Expr,
     src: &TableSource<'_>,
+    locked_tx: &mut LockedDbTransaction<'_, N>,
 ) -> Result<DbValue, SqlError> {
     match expr {
         Expr::Identifier(ident) => src.resolve(&ident.value),
@@ -56,6 +57,21 @@ pub(super) fn eval_expr_value(
             }
         }
         Expr::Value(v) => eval_value(&v.value),
+        Expr::Subquery(subquery) => {
+            let mut val = DbValue::Null;
+            super::scan_query_locked::<N>(
+                locked_tx,
+                *subquery.clone(),
+                Some(src),
+                &mut |row| {
+                    if let Some((_, v)) = row.first() {
+                        val = v.clone();
+                    }
+                    Ok(true) // stop after first row
+                },
+            )?;
+            Ok(val)
+        }
         _ => Err(SqlError::UnsupportedExpr),
     }
 }
@@ -69,6 +85,24 @@ pub(super) fn compare_db_values(a: &DbValue, b: &DbValue) -> Option<Ordering> {
         (DbValue::Text(x), DbValue::Text(y)) => Some(x.cmp(y)),
         (DbValue::Bool(x), DbValue::Bool(y)) => Some(x.cmp(y)),
         _ => None,
+    }
+}
+
+fn compare_with_op(lv: &DbValue, rv: &DbValue, op: &BinaryOperator) -> Result<bool, SqlError> {
+    match op {
+        BinaryOperator::Eq => Ok(lv == rv),
+        BinaryOperator::NotEq => Ok(lv != rv),
+        BinaryOperator::Lt => Ok(compare_db_values(lv, rv) == Some(Ordering::Less)),
+        BinaryOperator::LtEq => Ok(matches!(
+            compare_db_values(lv, rv),
+            Some(Ordering::Less | Ordering::Equal)
+        )),
+        BinaryOperator::Gt => Ok(compare_db_values(lv, rv) == Some(Ordering::Greater)),
+        BinaryOperator::GtEq => Ok(matches!(
+            compare_db_values(lv, rv),
+            Some(Ordering::Greater | Ordering::Equal)
+        )),
+        _ => Err(SqlError::UnsupportedExpr),
     }
 }
 
@@ -87,43 +121,11 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 Ok(eval_expr_bool(left, src, locked_tx)?
                     || eval_expr_bool(right, src, locked_tx)?)
             }
-            BinaryOperator::Eq => {
-                let lv = eval_expr_value(left, src)?;
-                let rv = eval_expr_value(right, src)?;
-                Ok(lv == rv)
+            _ => {
+                let lv = eval_expr_value(left, src, locked_tx)?;
+                let rv = eval_expr_value(right, src, locked_tx)?;
+                compare_with_op(&lv, &rv, op)
             }
-            BinaryOperator::NotEq => {
-                let lv = eval_expr_value(left, src)?;
-                let rv = eval_expr_value(right, src)?;
-                Ok(lv != rv)
-            }
-            BinaryOperator::Lt => {
-                let lv = eval_expr_value(left, src)?;
-                let rv = eval_expr_value(right, src)?;
-                Ok(compare_db_values(&lv, &rv) == Some(Ordering::Less))
-            }
-            BinaryOperator::LtEq => {
-                let lv = eval_expr_value(left, src)?;
-                let rv = eval_expr_value(right, src)?;
-                Ok(matches!(
-                    compare_db_values(&lv, &rv),
-                    Some(Ordering::Less | Ordering::Equal)
-                ))
-            }
-            BinaryOperator::Gt => {
-                let lv = eval_expr_value(left, src)?;
-                let rv = eval_expr_value(right, src)?;
-                Ok(compare_db_values(&lv, &rv) == Some(Ordering::Greater))
-            }
-            BinaryOperator::GtEq => {
-                let lv = eval_expr_value(left, src)?;
-                let rv = eval_expr_value(right, src)?;
-                Ok(matches!(
-                    compare_db_values(&lv, &rv),
-                    Some(Ordering::Greater | Ordering::Equal)
-                ))
-            }
-            _ => Err(SqlError::UnsupportedExpr),
         },
         Expr::Exists { subquery, negated } => {
             let mut found = false;
@@ -133,7 +135,7 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 Some(src),
                 &mut |_row| {
                     found = true;
-                    Ok(true) // stop after first row
+                    Ok(true)
                 },
             )?;
             Ok(found ^ negated)
@@ -143,7 +145,7 @@ pub(super) fn eval_expr_bool<const N: usize>(
             subquery,
             negated,
         } => {
-            let lv = eval_expr_value(expr, src)?;
+            let lv = eval_expr_value(expr, src, locked_tx)?;
             let mut found = false;
             super::scan_query_locked::<N>(
                 locked_tx,
@@ -152,7 +154,7 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 &mut |row| {
                     if row.first().is_some_and(|(_, v)| *v == lv) {
                         found = true;
-                        Ok(true) // stop on match
+                        Ok(true)
                     } else {
                         Ok(false)
                     }
@@ -160,12 +162,65 @@ pub(super) fn eval_expr_bool<const N: usize>(
             )?;
             Ok(found ^ negated)
         }
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => {
+            let lv = eval_expr_value(left, src, locked_tx)?;
+            let Expr::Subquery(subquery) = right.as_ref() else {
+                return Err(SqlError::UnsupportedExpr);
+            };
+            let mut matched = false;
+            super::scan_query_locked::<N>(
+                locked_tx,
+                *subquery.clone(),
+                Some(src),
+                &mut |row| {
+                    if let Some((_, rv)) = row.first() {
+                        if compare_with_op(&lv, rv, compare_op)? {
+                            matched = true;
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                },
+            )?;
+            Ok(matched)
+        }
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => {
+            let lv = eval_expr_value(left, src, locked_tx)?;
+            let Expr::Subquery(subquery) = right.as_ref() else {
+                return Err(SqlError::UnsupportedExpr);
+            };
+            let mut all_match = true;
+            super::scan_query_locked::<N>(
+                locked_tx,
+                *subquery.clone(),
+                Some(src),
+                &mut |row| {
+                    if let Some((_, rv)) = row.first() {
+                        if !compare_with_op(&lv, rv, compare_op)? {
+                            all_match = false;
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                },
+            )?;
+            Ok(all_match)
+        }
         Expr::IsNull(e) => {
-            let v = eval_expr_value(e, src)?;
+            let v = eval_expr_value(e, src, locked_tx)?;
             Ok(v == DbValue::Null)
         }
         Expr::IsNotNull(e) => {
-            let v = eval_expr_value(e, src)?;
+            let v = eval_expr_value(e, src, locked_tx)?;
             Ok(v != DbValue::Null)
         }
         Expr::Nested(e) => eval_expr_bool(e, src, locked_tx),

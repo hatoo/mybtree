@@ -856,4 +856,62 @@ mod tests {
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Bob".into())));
     }
+
+    #[test]
+    fn scalar_subquery() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)").unwrap();
+
+        // Scalar subquery in WHERE
+        let rs = execute(
+            &db, &mut None,
+            "SELECT name FROM users WHERE age = (SELECT age FROM users WHERE id = 1)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+    }
+
+    #[test]
+    fn any_some_all() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, age) VALUES (1, 20)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, age) VALUES (2, 30)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, age) VALUES (3, 40)").unwrap();
+
+        // ANY: age > ANY(SELECT age ...) where subquery returns [20, 30]
+        // id=2 (30>20), id=3 (40>20)
+        let rs = execute(
+            &db, &mut None,
+            "SELECT id FROM users WHERE age > ANY(SELECT age FROM users WHERE id <= 2)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0][0], ("id".into(), DbValue::Integer(2)));
+        assert_eq!(rs.rows[1][0], ("id".into(), DbValue::Integer(3)));
+
+        // SOME is synonym for ANY
+        let rs = execute(
+            &db, &mut None,
+            "SELECT id FROM users WHERE age > SOME(SELECT age FROM users WHERE id <= 2)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 2);
+
+        // ALL: age > ALL(SELECT age ...) where subquery returns [20, 30]
+        // only id=3 (40>20 AND 40>30)
+        let rs = execute(
+            &db, &mut None,
+            "SELECT id FROM users WHERE age > ALL(SELECT age FROM users WHERE id <= 2)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("id".into(), DbValue::Integer(3)));
+
+        // ALL with empty subquery → true (vacuous truth)
+        let rs = execute(
+            &db, &mut None,
+            "SELECT id FROM users WHERE age > ALL(SELECT age FROM users WHERE id = 999)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 3);
+    }
 }
