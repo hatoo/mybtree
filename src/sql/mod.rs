@@ -151,6 +151,22 @@ pub(super) fn execute_query_locked<const N: usize>(
     query: sqlparser::ast::Query,
     outer_src: Option<&TableSource<'_>>,
 ) -> Result<ResultSet, SqlError> {
+    let mut rows = Vec::new();
+    scan_query_locked::<N>(locked_tx, query, outer_src, &mut |row| {
+        rows.push(row.to_vec());
+        Ok(false)
+    })?;
+    Ok(ResultSet { rows })
+}
+
+/// Stream query results row by row through a callback.
+/// The callback returns `Ok(true)` to stop early, `Ok(false)` to continue.
+pub(super) fn scan_query_locked<const N: usize>(
+    locked_tx: &mut LockedDbTransaction<'_, N>,
+    query: sqlparser::ast::Query,
+    outer_src: Option<&TableSource<'_>>,
+    f: &mut dyn FnMut(&[(String, DbValue)]) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
     use sqlparser::ast::{SetExpr, TableFactor};
     let SetExpr::Select(select) = *query.body else {
         return Err(SqlError::UnsupportedStatement);
@@ -182,9 +198,7 @@ pub(super) fn execute_query_locked<const N: usize>(
             let scanner =
                 Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
 
-            let mut rows = Vec::new();
             scanner.scan::<_, SqlError, N>(locked_tx, |tx, _key, archived| {
-
                 let row: Row = rkyv::deserialize::<Row, Error>(archived)
                     .map_err(DatabaseError::Internal)?;
                 let src = TableSource::from_table(&qualifier, &schema, &row);
@@ -197,10 +211,10 @@ pub(super) fn execute_query_locked<const N: usize>(
                         return Ok(false);
                     }
                 }
-                rows.push(project_row(&src, &projections)?);
-                Ok(false)
+                let projected = project_row(&src, &projections)?;
+                f(&projected)
             })?;
-            Ok(ResultSet { rows })
+            Ok(())
         }
         TableFactor::Derived {
             subquery, alias, ..
@@ -213,7 +227,6 @@ pub(super) fn execute_query_locked<const N: usize>(
             let sub_result =
                 execute_query_locked(locked_tx, *subquery.clone(), outer_src)?;
 
-            let mut rows = Vec::new();
             for sub_row in &sub_result.rows {
                 let src = TableSource::from_result_row(&alias, sub_row);
                 let src = match outer_src {
@@ -225,9 +238,12 @@ pub(super) fn execute_query_locked<const N: usize>(
                         continue;
                     }
                 }
-                rows.push(project_row(&src, &projections)?);
+                let projected = project_row(&src, &projections)?;
+                if f(&projected)? {
+                    break;
+                }
             }
-            Ok(ResultSet { rows })
+            Ok(())
         }
         _ => Err(SqlError::UnsupportedStatement),
     }

@@ -126,9 +126,17 @@ pub(super) fn eval_expr_bool<const N: usize>(
             _ => Err(SqlError::UnsupportedExpr),
         },
         Expr::Exists { subquery, negated } => {
-            let rs = super::execute_query_locked(locked_tx, *subquery.clone(), Some(src))?;
-            let exists = !rs.rows.is_empty();
-            Ok(exists ^ negated)
+            let mut found = false;
+            super::scan_query_locked::<N>(
+                locked_tx,
+                *subquery.clone(),
+                Some(src),
+                &mut |_row| {
+                    found = true;
+                    Ok(true) // stop after first row
+                },
+            )?;
+            Ok(found ^ negated)
         }
         Expr::InSubquery {
             expr,
@@ -136,11 +144,20 @@ pub(super) fn eval_expr_bool<const N: usize>(
             negated,
         } => {
             let lv = eval_expr_value(expr, src)?;
-            let rs = super::execute_query_locked(locked_tx, *subquery.clone(), Some(src))?;
-            let found = rs
-                .rows
-                .iter()
-                .any(|row| row.first().is_some_and(|(_, v)| *v == lv));
+            let mut found = false;
+            super::scan_query_locked::<N>(
+                locked_tx,
+                *subquery.clone(),
+                Some(src),
+                &mut |row| {
+                    if row.first().is_some_and(|(_, v)| *v == lv) {
+                        found = true;
+                        Ok(true) // stop on match
+                    } else {
+                        Ok(false)
+                    }
+                },
+            )?;
             Ok(found ^ negated)
         }
         Expr::IsNull(e) => {
