@@ -1,6 +1,7 @@
 use rkyv::rancor::Error;
 use sqlparser::ast::{Expr, SelectItem};
 
+use crate::database::LockedDbTransaction;
 use crate::{Column, ColumnType, Database, DatabaseError, DbTransaction, DbValue, Row, Schema};
 use sqlparser::ast::Statement as SqlStatement;
 
@@ -142,6 +143,14 @@ fn execute_query<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     query: sqlparser::ast::Query,
 ) -> Result<ResultSet, SqlError> {
+    tx.with_lock(|mut locked_tx| execute_query_locked(&mut locked_tx, query, None))
+}
+
+pub(super) fn execute_query_locked<const N: usize>(
+    locked_tx: &mut LockedDbTransaction<'_, N>,
+    query: sqlparser::ast::Query,
+    outer_src: Option<&TableSource<'_>>,
+) -> Result<ResultSet, SqlError> {
     use sqlparser::ast::{SetExpr, TableFactor};
     let SetExpr::Select(select) = *query.body else {
         return Err(SqlError::UnsupportedStatement);
@@ -167,28 +176,31 @@ fn execute_query<const N: usize>(
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| table_name.clone());
 
-            tx.with_lock(|mut locked_tx| {
-                let schema = locked_tx.get_schema(&table_name)?;
-                let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
+            let schema = locked_tx.get_schema(&table_name)?;
+            let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
-                let scanner =
-                    Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
+            let scanner =
+                Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
 
-                let mut rows = Vec::new();
-                scanner.scan::<_, SqlError, N>(locked_tx, |_tx, _key, archived| {
-                    let row: Row = rkyv::deserialize::<Row, Error>(archived)
-                        .map_err(DatabaseError::Internal)?;
-                    let src = TableSource::from_table(&qualifier, &schema, &row);
-                    if let Some(expr) = &filter {
-                        if !eval_expr_bool(expr, &src)? {
-                            return Ok(false);
-                        }
+            let mut rows = Vec::new();
+            scanner.scan::<_, SqlError, N>(locked_tx, |tx, _key, archived| {
+
+                let row: Row = rkyv::deserialize::<Row, Error>(archived)
+                    .map_err(DatabaseError::Internal)?;
+                let src = TableSource::from_table(&qualifier, &schema, &row);
+                let src = match outer_src {
+                    Some(outer) => src.with_parent(outer),
+                    None => src,
+                };
+                if let Some(expr) = &filter {
+                    if !eval_expr_bool(expr, &src, tx)? {
+                        return Ok(false);
                     }
-                    rows.push(project_row(&src, &projections)?);
-                    Ok(false)
-                })?;
-                Ok(ResultSet { rows })
-            })
+                }
+                rows.push(project_row(&src, &projections)?);
+                Ok(false)
+            })?;
+            Ok(ResultSet { rows })
         }
         TableFactor::Derived {
             subquery, alias, ..
@@ -198,13 +210,18 @@ fn execute_query<const N: usize>(
                 .map(|a| a.name.value.clone())
                 .ok_or(SqlError::UnsupportedStatement)?;
 
-            let sub_result = execute_query(tx, *subquery.clone())?;
+            let sub_result =
+                execute_query_locked(locked_tx, *subquery.clone(), outer_src)?;
 
             let mut rows = Vec::new();
             for sub_row in &sub_result.rows {
                 let src = TableSource::from_result_row(&alias, sub_row);
+                let src = match outer_src {
+                    Some(outer) => src.with_parent(outer),
+                    None => src,
+                };
                 if let Some(expr) = &filter {
-                    if !eval_expr_bool(expr, &src)? {
+                    if !eval_expr_bool(expr, &src, locked_tx)? {
                         continue;
                     }
                 }
@@ -406,12 +423,12 @@ fn execute_update<const N: usize>(
 
         let scanner = Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
 
-        scanner.scan::<_, SqlError, N>(locked_tx, |mut tx, key, archived| {
+        scanner.scan::<_, SqlError, N>(&mut locked_tx, |tx, key, archived| {
             let mut row: Row =
                 rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
             if let Some(expr) = &filter {
                 let src = TableSource::from_table(&table_name, &schema, &row);
-                if !eval_expr_bool(expr, &src)? {
+                if !eval_expr_bool(expr, &src, tx)? {
                     return Ok(false);
                 }
             }
@@ -482,12 +499,12 @@ fn execute_delete<const N: usize>(
 
         let scanner = Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
 
-        scanner.scan::<_, SqlError, N>(locked_tx, |mut tx, key, archived| {
+        scanner.scan::<_, SqlError, N>(&mut locked_tx, |tx, key, archived| {
             if let Some(expr) = &filter {
                 let row: Row =
                     rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
                 let src = TableSource::from_table(&table_name, &schema, &row);
-                if !eval_expr_bool(expr, &src)? {
+                if !eval_expr_bool(expr, &src, tx)? {
                     return Ok(false);
                 }
             }
@@ -746,5 +763,55 @@ mod tests {
         ).unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+    }
+
+    #[test]
+    fn exists_uncorrelated() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        execute(&db, &mut None, "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+        execute(&db, &mut None, "INSERT INTO orders (id, user_id) VALUES (1, 1)").unwrap();
+
+        // EXISTS with non-empty subquery → all rows returned
+        let rs = execute(
+            &db, &mut None,
+            "SELECT name FROM users WHERE EXISTS (SELECT id FROM orders)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+
+        // NOT EXISTS with non-empty subquery → no rows
+        let rs = execute(
+            &db, &mut None,
+            "SELECT name FROM users WHERE NOT EXISTS (SELECT id FROM orders)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 0);
+    }
+
+    #[test]
+    fn exists_correlated() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        execute(&db, &mut None, "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
+        execute(&db, &mut None, "INSERT INTO orders (id, user_id) VALUES (1, 1)").unwrap();
+
+        // Correlated EXISTS — only Alice has orders
+        let rs = execute(
+            &db, &mut None,
+            "SELECT u.name FROM users AS u WHERE EXISTS (SELECT o.id FROM orders AS o WHERE o.user_id = u.id)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+
+        // NOT EXISTS — only Bob has no orders
+        let rs = execute(
+            &db, &mut None,
+            "SELECT u.name FROM users AS u WHERE NOT EXISTS (SELECT o.id FROM orders AS o WHERE o.user_id = u.id)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Bob".into())));
     }
 }

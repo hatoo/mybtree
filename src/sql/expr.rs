@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use sqlparser::ast::{BinaryOperator, Expr, Value};
 
 use crate::DbValue;
+use crate::database::LockedDbTransaction;
 
 use super::SqlError;
 use super::table_source::TableSource;
@@ -71,14 +72,20 @@ pub(super) fn compare_db_values(a: &DbValue, b: &DbValue) -> Option<Ordering> {
     }
 }
 
-pub(super) fn eval_expr_bool(expr: &Expr, src: &TableSource<'_>) -> Result<bool, SqlError> {
+pub(super) fn eval_expr_bool<const N: usize>(
+    expr: &Expr,
+    src: &TableSource<'_>,
+    locked_tx: &mut LockedDbTransaction<'_, N>,
+) -> Result<bool, SqlError> {
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
-                Ok(eval_expr_bool(left, src)? && eval_expr_bool(right, src)?)
+                Ok(eval_expr_bool(left, src, locked_tx)?
+                    && eval_expr_bool(right, src, locked_tx)?)
             }
             BinaryOperator::Or => {
-                Ok(eval_expr_bool(left, src)? || eval_expr_bool(right, src)?)
+                Ok(eval_expr_bool(left, src, locked_tx)?
+                    || eval_expr_bool(right, src, locked_tx)?)
             }
             BinaryOperator::Eq => {
                 let lv = eval_expr_value(left, src)?;
@@ -118,6 +125,11 @@ pub(super) fn eval_expr_bool(expr: &Expr, src: &TableSource<'_>) -> Result<bool,
             }
             _ => Err(SqlError::UnsupportedExpr),
         },
+        Expr::Exists { subquery, negated } => {
+            let rs = super::execute_query_locked(locked_tx, *subquery.clone(), Some(src))?;
+            let exists = !rs.rows.is_empty();
+            Ok(exists ^ negated)
+        }
         Expr::IsNull(e) => {
             let v = eval_expr_value(e, src)?;
             Ok(v == DbValue::Null)
@@ -126,7 +138,7 @@ pub(super) fn eval_expr_bool(expr: &Expr, src: &TableSource<'_>) -> Result<bool,
             let v = eval_expr_value(e, src)?;
             Ok(v != DbValue::Null)
         }
-        Expr::Nested(e) => eval_expr_bool(e, src),
+        Expr::Nested(e) => eval_expr_bool(e, src, locked_tx),
         _ => Err(SqlError::UnsupportedExpr),
     }
 }

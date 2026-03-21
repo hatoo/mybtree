@@ -194,7 +194,7 @@ pub struct DbTransaction<'a, const N: usize> {
 }
 
 pub struct LockedDbTransaction<'a, const N: usize> {
-    tx: LockedTransaction<'a, N>,
+    pub(crate) tx: LockedTransaction<'a, N>,
 }
 
 impl<'a, const N: usize> LockedDbTransaction<'a, N> {

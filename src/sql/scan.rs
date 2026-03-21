@@ -51,16 +51,16 @@ impl Scanner {
             .unwrap_or_else(|| Scanner::full(table.to_string()))
     }
 
-    pub(super) fn scan<'a, F, E: From<DatabaseError>, const N: usize>(
+    pub(super) fn scan<F, E: From<DatabaseError>, const N: usize>(
         &self,
-        mut locked_tx: LockedDbTransaction<'a, N>,
+        locked_tx: &mut LockedDbTransaction<'_, N>,
         mut f: F,
     ) -> Result<(), E>
     where
-        F: for<'local> FnMut(
-            LockedDbTransaction<'local, N>,
+        F: FnMut(
+            &mut LockedDbTransaction<'_, N>,
             Key,
-            &'local ArchivedRow,
+            &ArchivedRow,
         ) -> Result<bool, E>,
     {
         match self {
@@ -76,7 +76,9 @@ impl Scanner {
                 }
             }
             Scanner::PkRange { table, range } => {
-                locked_tx.scan(table.as_str(), *range, f)?;
+                locked_tx.scan(table.as_str(), *range, |mut tx, key, archived| {
+                    f(&mut tx, key, archived)
+                })?;
             }
             Scanner::IndexEqual {
                 table,
@@ -88,7 +90,7 @@ impl Scanner {
                     table.as_str(),
                     index.as_str(),
                     v..=v,
-                    |tx, archived, key| f(tx, key, archived),
+                    |mut tx, archived, key| f(&mut tx, key, archived),
                 )?;
             }
             Scanner::IndexRange {
@@ -107,7 +109,7 @@ impl Scanner {
                     table.as_str(),
                     index.as_str(),
                     (map_bound(&range.0), map_bound(&range.1)),
-                    |tx, archived, key| f(tx, key, archived),
+                    |mut tx, archived, key| f(&mut tx, key, archived),
                 )?;
             }
         }
