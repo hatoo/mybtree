@@ -814,4 +814,30 @@ mod tests {
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Bob".into())));
     }
+
+    #[test]
+    fn in_subquery() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        execute(&db, &mut None, "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
+        execute(&db, &mut None, "INSERT INTO orders (id, user_id) VALUES (1, 1)").unwrap();
+
+        // IN subquery
+        let rs = execute(
+            &db, &mut None,
+            "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+
+        // NOT IN subquery
+        let rs = execute(
+            &db, &mut None,
+            "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Bob".into())));
+    }
 }

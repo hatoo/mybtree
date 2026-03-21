@@ -130,6 +130,19 @@ pub(super) fn eval_expr_bool<const N: usize>(
             let exists = !rs.rows.is_empty();
             Ok(exists ^ negated)
         }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let lv = eval_expr_value(expr, src)?;
+            let rs = super::execute_query_locked(locked_tx, *subquery.clone(), Some(src))?;
+            let found = rs
+                .rows
+                .iter()
+                .any(|row| row.first().is_some_and(|(_, v)| *v == lv));
+            Ok(found ^ negated)
+        }
         Expr::IsNull(e) => {
             let v = eval_expr_value(e, src)?;
             Ok(v == DbValue::Null)
