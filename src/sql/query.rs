@@ -107,12 +107,11 @@ where
             let schema = locked_tx.get_schema(&table_name)?;
             let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
-            let scanner =
-                Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
+            let scanner = Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
 
             scanner.scan::<_, SqlError, N>(locked_tx, |tx, _key, archived| {
-                let row: Row = rkyv::deserialize::<Row, Error>(archived)
-                    .map_err(DatabaseError::Internal)?;
+                let row: Row =
+                    rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
                 let src = TableSource::from_table(&qualifier, &schema, &row);
                 let src = match outer_src {
                     Some(outer) => src.with_parent(outer),
@@ -136,24 +135,24 @@ where
                 .map(|a| a.name.value.clone())
                 .ok_or(SqlError::UnsupportedStatement)?;
 
-            let inner: &mut dyn FnMut(&mut LockedDbTransaction<'_, N>, &[(String, DbValue)]) -> Result<bool, SqlError> =
-                &mut |tx, sub_row| {
-                    let src = TableSource::from_result_row(&alias, sub_row);
-                    let src = match outer_src {
-                        Some(outer) => src.with_parent(outer),
-                        None => src,
-                    };
-                    if let Some(expr) = &filter {
-                        if !eval_expr_bool(expr, &src, tx)? {
-                            return Ok(false);
-                        }
-                    }
-                    let projected = project_row(&src, &projections)?;
-                    f(tx, &projected)
+            let inner: &mut dyn FnMut(
+                &mut LockedDbTransaction<'_, N>,
+                &[(String, DbValue)],
+            ) -> Result<bool, SqlError> = &mut |tx, sub_row| {
+                let src = TableSource::from_result_row(&alias, sub_row);
+                let src = match outer_src {
+                    Some(outer) => src.with_parent(outer),
+                    None => src,
                 };
-            scan_query_locked::<N, _>(
-                locked_tx, *subquery.clone(), outer_src, inner,
-            )?;
+                if let Some(expr) = &filter {
+                    if !eval_expr_bool(expr, &src, tx)? {
+                        return Ok(false);
+                    }
+                }
+                let projected = project_row(&src, &projections)?;
+                f(tx, &projected)
+            };
+            scan_query_locked::<N, _>(locked_tx, *subquery.clone(), outer_src, inner)?;
             Ok(())
         }
         _ => Err(SqlError::UnsupportedStatement),

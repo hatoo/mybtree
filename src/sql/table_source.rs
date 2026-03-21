@@ -15,10 +15,7 @@ pub(crate) struct TableSource<'a> {
 
 enum Columns<'a> {
     /// Physical table: column definitions + positional values.
-    Physical {
-        schema: &'a Schema,
-        row: &'a Row,
-    },
+    Physical { schema: &'a Schema, row: &'a Row },
     /// Subquery or derived table: named pairs.
     Named(&'a [(String, DbValue)]),
 }
@@ -104,5 +101,4 @@ impl<'a> TableSource<'a> {
             Columns::Named(pairs) => pairs.to_vec(),
         }
     }
-
 }

@@ -114,12 +114,10 @@ pub(super) fn eval_expr_bool<const N: usize>(
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
-                Ok(eval_expr_bool(left, src, locked_tx)?
-                    && eval_expr_bool(right, src, locked_tx)?)
+                Ok(eval_expr_bool(left, src, locked_tx)? && eval_expr_bool(right, src, locked_tx)?)
             }
             BinaryOperator::Or => {
-                Ok(eval_expr_bool(left, src, locked_tx)?
-                    || eval_expr_bool(right, src, locked_tx)?)
+                Ok(eval_expr_bool(left, src, locked_tx)? || eval_expr_bool(right, src, locked_tx)?)
             }
             _ => {
                 let lv = eval_expr_value(left, src, locked_tx)?;

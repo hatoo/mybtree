@@ -10,9 +10,9 @@ mod execute;
 pub mod expr;
 mod query;
 mod scan;
+pub(crate) mod table_source;
 #[cfg(test)]
 mod tests;
-pub(crate) mod table_source;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SqlError {

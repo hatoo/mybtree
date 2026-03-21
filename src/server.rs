@@ -73,7 +73,9 @@ struct Cli {
 }
 
 fn file_is_empty(path: &str) -> bool {
-    std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true)
+    std::fs::metadata(path)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true)
 }
 
 #[tokio::main]

@@ -57,11 +57,7 @@ impl Scanner {
         mut f: F,
     ) -> Result<(), E>
     where
-        F: FnMut(
-            &mut LockedDbTransaction<'_, N>,
-            Key,
-            &ArchivedRow,
-        ) -> Result<bool, E>,
+        F: FnMut(&mut LockedDbTransaction<'_, N>, Key, &ArchivedRow) -> Result<bool, E>,
     {
         match self {
             Scanner::PkEqual { table, pk } => {
