@@ -6,9 +6,11 @@ use sqlparser::ast::Statement as SqlStatement;
 
 use expr::{eval_expr_bool, eval_value_expr};
 use scan::Scanner;
+use table_source::TableSource;
 
 pub mod expr;
 mod scan;
+pub(crate) mod table_source;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SqlError {
@@ -40,42 +42,36 @@ impl ResultSet {
 }
 
 fn project_row(
-    schema: &Schema,
-    row: &Row,
+    src: &TableSource<'_>,
     projections: &[SelectItem],
 ) -> Result<Vec<(String, DbValue)>, SqlError> {
     let mut values = Vec::new();
     for item in projections {
         match item {
             SelectItem::Wildcard(_) => {
-                for (i, col) in schema.columns.iter().enumerate() {
-                    if schema.implicit_pk && i == schema.primary_key {
-                        continue;
-                    }
-                    values.push((col.name.clone(), row.values[i].clone()));
-                }
+                values.extend(src.all_columns());
             }
             SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                let col_idx = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
-                    .ok_or_else(|| SqlError::ColumnNotFound(ident.value.clone()))?;
-                values.push((
-                    schema.columns[col_idx].name.clone(),
-                    row.values[col_idx].clone(),
-                ));
+                let val = src.resolve(&ident.value)?;
+                values.push((ident.value.clone(), val));
+            }
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
+                let val = src.resolve_qualified(&parts[0].value, &parts[1].value)?;
+                values.push((parts[1].value.clone(), val));
             }
             SelectItem::ExprWithAlias {
                 expr: Expr::Identifier(ident),
                 alias,
             } => {
-                let col_idx = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
-                    .ok_or_else(|| SqlError::ColumnNotFound(ident.value.clone()))?;
-                values.push((alias.value.clone(), row.values[col_idx].clone()));
+                let val = src.resolve(&ident.value)?;
+                values.push((alias.value.clone(), val));
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::CompoundIdentifier(parts),
+                alias,
+            } if parts.len() == 2 => {
+                let val = src.resolve_qualified(&parts[0].value, &parts[1].value)?;
+                values.push((alias.value.clone(), val));
             }
             _ => return Err(SqlError::UnsupportedExpr),
         }
@@ -154,39 +150,70 @@ fn execute_query<const N: usize>(
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
         return Err(SqlError::UnsupportedStatement);
     }
-    let TableFactor::Table { name, .. } = &select.from[0].relation else {
-        return Err(SqlError::UnsupportedStatement);
-    };
-    let table_name = name
-        .0
-        .last()
-        .and_then(|p| p.as_ident())
-        .map(|i| i.value.clone())
-        .ok_or(SqlError::UnsupportedStatement)?;
 
     let projections = select.projection;
     let filter = select.selection;
 
-    tx.with_lock(|mut locked_tx| {
-        let schema = locked_tx.get_schema(&table_name)?;
-        let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
+    match &select.from[0].relation {
+        TableFactor::Table { name, alias, .. } => {
+            let table_name = name
+                .0
+                .last()
+                .and_then(|p| p.as_ident())
+                .map(|i| i.value.clone())
+                .ok_or(SqlError::UnsupportedStatement)?;
+            let qualifier = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| table_name.clone());
 
-        let scanner = Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
+            tx.with_lock(|mut locked_tx| {
+                let schema = locked_tx.get_schema(&table_name)?;
+                let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
-        let mut rows = Vec::new();
-        scanner.scan::<_, SqlError, N>(locked_tx, |_tx, _key, archived| {
-            let row: Row =
-                rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
-            if let Some(expr) = &filter {
-                if !eval_expr_bool(expr, &schema, &row)? {
-                    return Ok(false);
+                let scanner =
+                    Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
+
+                let mut rows = Vec::new();
+                scanner.scan::<_, SqlError, N>(locked_tx, |_tx, _key, archived| {
+                    let row: Row = rkyv::deserialize::<Row, Error>(archived)
+                        .map_err(DatabaseError::Internal)?;
+                    let src = TableSource::from_table(&qualifier, &schema, &row);
+                    if let Some(expr) = &filter {
+                        if !eval_expr_bool(expr, &src)? {
+                            return Ok(false);
+                        }
+                    }
+                    rows.push(project_row(&src, &projections)?);
+                    Ok(false)
+                })?;
+                Ok(ResultSet { rows })
+            })
+        }
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let alias = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .ok_or(SqlError::UnsupportedStatement)?;
+
+            let sub_result = execute_query(tx, *subquery.clone())?;
+
+            let mut rows = Vec::new();
+            for sub_row in &sub_result.rows {
+                let src = TableSource::from_result_row(&alias, sub_row);
+                if let Some(expr) = &filter {
+                    if !eval_expr_bool(expr, &src)? {
+                        continue;
+                    }
                 }
+                rows.push(project_row(&src, &projections)?);
             }
-            rows.push(project_row(&schema, &row, &projections)?);
-            Ok(false)
-        })?;
-        Ok(ResultSet { rows })
-    })
+            Ok(ResultSet { rows })
+        }
+        _ => Err(SqlError::UnsupportedStatement),
+    }
 }
 
 fn execute_create_table<const N: usize>(
@@ -383,7 +410,8 @@ fn execute_update<const N: usize>(
             let mut row: Row =
                 rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
             if let Some(expr) = &filter {
-                if !eval_expr_bool(expr, &schema, &row)? {
+                let src = TableSource::from_table(&table_name, &schema, &row);
+                if !eval_expr_bool(expr, &src)? {
                     return Ok(false);
                 }
             }
@@ -458,7 +486,8 @@ fn execute_delete<const N: usize>(
             if let Some(expr) = &filter {
                 let row: Row =
                     rkyv::deserialize::<Row, Error>(archived).map_err(DatabaseError::Internal)?;
-                if !eval_expr_bool(expr, &schema, &row)? {
+                let src = TableSource::from_table(&table_name, &schema, &row);
+                if !eval_expr_bool(expr, &src)? {
                     return Ok(false);
                 }
             }
@@ -654,6 +683,62 @@ mod tests {
         assert!(tx.is_none());
 
         let rs = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+    }
+
+    #[test]
+    fn table_alias() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+
+        // Qualified column with table alias
+        let rs = execute(&db, &mut None, "SELECT u.name FROM users AS u").unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+
+        // Qualified column with alias in WHERE
+        let rs = execute(&db, &mut None, "SELECT u.name FROM users AS u WHERE u.id = 1").unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+
+        // Qualified column with alias + AS in projection
+        let rs = execute(&db, &mut None, "SELECT u.name AS user_name FROM users AS u").unwrap();
+        assert_eq!(rs.rows[0][0], ("user_name".into(), DbValue::Text("Alice".into())));
+    }
+
+    #[test]
+    fn subquery() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)").unwrap();
+
+        // Subquery with alias
+        let rs = execute(
+            &db, &mut None,
+            "SELECT t.name FROM (SELECT name, age FROM users WHERE age > 28) AS t",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+        assert_eq!(rs.rows[1][0], ("name".into(), DbValue::Text("Carol".into())));
+
+        // Subquery with filter on outer query
+        let rs = execute(
+            &db, &mut None,
+            "SELECT t.name FROM (SELECT name, age FROM users) AS t WHERE t.age > 28",
+        ).unwrap();
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+        assert_eq!(rs.rows[1][0], ("name".into(), DbValue::Text("Carol".into())));
+
+        // Subquery with wildcard
+        let rs = execute(
+            &db, &mut None,
+            "SELECT * FROM (SELECT name FROM users WHERE id = 1) AS t",
+        ).unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
     }
