@@ -60,7 +60,7 @@ pub(super) fn execute_query_locked<const N: usize>(
     outer_src: Option<&TableSource<'_>>,
 ) -> Result<ResultSet, SqlError> {
     let mut rows = Vec::new();
-    scan_query_locked::<N>(locked_tx, query, outer_src, &mut |row| {
+    scan_query_locked::<N>(locked_tx, query, outer_src, &mut |_tx, row| {
         rows.push(row.to_vec());
         Ok(false)
     })?;
@@ -68,12 +68,13 @@ pub(super) fn execute_query_locked<const N: usize>(
 }
 
 /// Stream query results row by row through a callback.
-/// The callback returns `Ok(true)` to stop early, `Ok(false)` to continue.
+/// The callback receives `&mut LockedDbTransaction` and the projected row.
+/// Returns `Ok(true)` to stop early, `Ok(false)` to continue.
 pub(super) fn scan_query_locked<const N: usize>(
     locked_tx: &mut LockedDbTransaction<'_, N>,
     query: sqlparser::ast::Query,
     outer_src: Option<&TableSource<'_>>,
-    f: &mut dyn FnMut(&[(String, DbValue)]) -> Result<bool, SqlError>,
+    f: &mut dyn FnMut(&mut LockedDbTransaction<'_, N>, &[(String, DbValue)]) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     use sqlparser::ast::{SetExpr, TableFactor};
     let SetExpr::Select(select) = *query.body else {
@@ -120,7 +121,7 @@ pub(super) fn scan_query_locked<const N: usize>(
                     }
                 }
                 let projected = project_row(&src, &projections)?;
-                f(&projected)
+                f(tx, &projected)
             })?;
             Ok(())
         }
@@ -132,25 +133,20 @@ pub(super) fn scan_query_locked<const N: usize>(
                 .map(|a| a.name.value.clone())
                 .ok_or(SqlError::UnsupportedStatement)?;
 
-            let sub_result =
-                execute_query_locked(locked_tx, *subquery.clone(), outer_src)?;
-
-            for sub_row in &sub_result.rows {
+            scan_query_locked::<N>(locked_tx, *subquery.clone(), outer_src, &mut |tx, sub_row| {
                 let src = TableSource::from_result_row(&alias, sub_row);
                 let src = match outer_src {
                     Some(outer) => src.with_parent(outer),
                     None => src,
                 };
                 if let Some(expr) = &filter {
-                    if !eval_expr_bool(expr, &src, locked_tx)? {
-                        continue;
+                    if !eval_expr_bool(expr, &src, tx)? {
+                        return Ok(false);
                     }
                 }
                 let projected = project_row(&src, &projections)?;
-                if f(&projected)? {
-                    break;
-                }
-            }
+                f(tx, &projected)
+            })?;
             Ok(())
         }
         _ => Err(SqlError::UnsupportedStatement),

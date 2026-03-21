@@ -63,7 +63,7 @@ pub(super) fn eval_expr_value<const N: usize>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |row| {
+                &mut |_tx, row| {
                     if let Some((_, v)) = row.first() {
                         val = v.clone();
                     }
@@ -133,7 +133,7 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |_row| {
+                &mut |_tx, _row| {
                     found = true;
                     Ok(true)
                 },
@@ -151,7 +151,7 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |row| {
+                &mut |_tx, row| {
                     if row.first().is_some_and(|(_, v)| *v == lv) {
                         found = true;
                         Ok(true)
@@ -177,7 +177,7 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |row| {
+                &mut |_tx, row| {
                     if let Some((_, rv)) = row.first() {
                         if compare_with_op(&lv, rv, compare_op)? {
                             matched = true;
@@ -203,7 +203,7 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |row| {
+                &mut |_tx, row| {
                     if let Some((_, rv)) = row.first() {
                         if !compare_with_op(&lv, rv, compare_op)? {
                             all_match = false;
