@@ -59,11 +59,11 @@ pub(super) fn eval_expr_value<const N: usize>(
         Expr::Value(v) => eval_value(&v.value),
         Expr::Subquery(subquery) => {
             let mut val = DbValue::Null;
-            super::query::scan_query_locked::<N>(
+            super::query::scan_query_locked::<N, _>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |_tx, row| {
+                |_tx, row| {
                     if let Some((_, v)) = row.first() {
                         val = v.clone();
                     }
@@ -129,11 +129,11 @@ pub(super) fn eval_expr_bool<const N: usize>(
         },
         Expr::Exists { subquery, negated } => {
             let mut found = false;
-            super::query::scan_query_locked::<N>(
+            super::query::scan_query_locked::<N, _>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |_tx, _row| {
+                |_tx, _row| {
                     found = true;
                     Ok(true)
                 },
@@ -147,11 +147,11 @@ pub(super) fn eval_expr_bool<const N: usize>(
         } => {
             let lv = eval_expr_value(expr, src, locked_tx)?;
             let mut found = false;
-            super::query::scan_query_locked::<N>(
+            super::query::scan_query_locked::<N, _>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |_tx, row| {
+                |_tx, row| {
                     if row.first().is_some_and(|(_, v)| *v == lv) {
                         found = true;
                         Ok(true)
@@ -173,11 +173,11 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 return Err(SqlError::UnsupportedExpr);
             };
             let mut matched = false;
-            super::query::scan_query_locked::<N>(
+            super::query::scan_query_locked::<N, _>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |_tx, row| {
+                |_tx, row| {
                     if let Some((_, rv)) = row.first() {
                         if compare_with_op(&lv, rv, compare_op)? {
                             matched = true;
@@ -199,11 +199,11 @@ pub(super) fn eval_expr_bool<const N: usize>(
                 return Err(SqlError::UnsupportedExpr);
             };
             let mut all_match = true;
-            super::query::scan_query_locked::<N>(
+            super::query::scan_query_locked::<N, _>(
                 locked_tx,
                 *subquery.clone(),
                 Some(src),
-                &mut |_tx, row| {
+                |_tx, row| {
                     if let Some((_, rv)) = row.first() {
                         if !compare_with_op(&lv, rv, compare_op)? {
                             all_match = false;
