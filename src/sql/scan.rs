@@ -39,6 +39,18 @@ impl Scanner {
         }
     }
 
+    pub fn from_filter(
+        table: &str,
+        schema: &Schema,
+        indexed_columns: &[String],
+        filter: &Option<Expr>,
+    ) -> Self {
+        filter
+            .as_ref()
+            .and_then(|f| find_best_scanner(table, schema, indexed_columns, f))
+            .unwrap_or_else(|| Scanner::full(table.to_string()))
+    }
+
     pub(super) fn scan<'a, F, E: From<DatabaseError>, const N: usize>(
         &self,
         mut locked_tx: LockedDbTransaction<'a, N>,

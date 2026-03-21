@@ -4,7 +4,7 @@ use sqlparser::ast::{Expr, SelectItem};
 use crate::{Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema};
 
 use expr::{eval_expr_bool, eval_value_expr};
-use scan::{Scanner, find_best_scanner};
+use scan::Scanner;
 
 pub mod expr;
 mod scan;
@@ -108,10 +108,7 @@ fn execute_query<const N: usize>(
         let schema = locked_tx.get_schema(&table_name)?;
         let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
-        let scanner = filter
-            .as_ref()
-            .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
-            .unwrap_or_else(|| Scanner::full(table_name.clone()));
+        let scanner = Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
 
         let mut rows = Vec::new();
         scanner.scan::<_, SqlError, N>(locked_tx, |_tx, _key, archived| {
@@ -317,10 +314,7 @@ fn execute_update<const N: usize>(
             assignments.push((col_idx, &a.value));
         }
 
-        let scanner = filter
-            .as_ref()
-            .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
-            .unwrap_or_else(|| Scanner::full(table_name.clone()));
+        let scanner = Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
 
         scanner.scan::<_, SqlError, N>(locked_tx, |mut tx, key, archived| {
             let mut row: Row =
@@ -395,10 +389,7 @@ fn execute_delete<const N: usize>(
         let schema = locked_tx.get_schema(&table_name)?;
         let indexed_columns = locked_tx.get_indexed_columns(&table_name)?;
 
-        let scanner = filter
-            .as_ref()
-            .and_then(|f| find_best_scanner(&table_name, &schema, &indexed_columns, f))
-            .unwrap_or_else(|| Scanner::full(table_name.clone()));
+        let scanner = Scanner::from_filter(&table_name, &schema, &indexed_columns, &filter);
 
         scanner.scan::<_, SqlError, N>(locked_tx, |mut tx, key, archived| {
             if let Some(expr) = &filter {
