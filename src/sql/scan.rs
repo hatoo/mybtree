@@ -39,6 +39,15 @@ impl Scanner {
         }
     }
 
+    fn rank(&self) -> u8 {
+        match self {
+            Scanner::PkEqual { .. } => 4,
+            Scanner::PkRange { .. } => 3,
+            Scanner::IndexEqual { .. } => 2,
+            Scanner::IndexRange { .. } => 1,
+        }
+    }
+
     pub fn from_filter(
         table: &str,
         schema: &Schema,
@@ -204,14 +213,6 @@ pub(super) fn find_best_scanner(
             let l = find_best_scanner(table, schema, indexed_columns, left);
             let r = find_best_scanner(table, schema, indexed_columns, right);
             // Pick the more specific scanner (PkEqual > PkRange > IndexEqual > IndexRange).
-            fn rank(s: &Scanner) -> u8 {
-                match s {
-                    Scanner::PkEqual { .. } => 4,
-                    Scanner::PkRange { .. } => 3,
-                    Scanner::IndexEqual { .. } => 2,
-                    Scanner::IndexRange { .. } => 1,
-                }
-            }
             match (l, r) {
                 (Some(a), Some(b)) => {
                     // Try to merge two PkRange scanners on the same table.
@@ -258,7 +259,7 @@ pub(super) fn find_best_scanner(
                         }
                     }
                     // Otherwise pick the higher-priority one.
-                    if rank(&a) >= rank(&b) {
+                    if a.rank() >= b.rank() {
                         Some(a)
                     } else {
                         Some(b)
