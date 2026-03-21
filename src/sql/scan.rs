@@ -115,6 +115,15 @@ impl Scanner {
     }
 }
 
+/// Get the column name from an Identifier or CompoundIdentifier (last part).
+fn column_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(i) => Some(&i.value),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.as_str()),
+        _ => None,
+    }
+}
+
 /// Extract a `col op literal` or `literal op col` pair from a binary expression.
 /// Returns `(column_name, operator_from_column_perspective, literal_value)`.
 fn extract_col_op_value<'a>(
@@ -124,10 +133,13 @@ fn extract_col_op_value<'a>(
 ) -> Option<(&'a str, sqlparser::ast::BinaryOperator, &'a Value)> {
     use sqlparser::ast::BinaryOperator;
 
-    let (ident, val_expr, effective_op) = match (left, right) {
-        (Expr::Identifier(i), Expr::Value(v)) => (i, v, op.clone()),
-        (Expr::Value(v), Expr::Identifier(i)) => {
-            // Flip comparison direction: `5 < id` → `id > 5`
+    let (col_name, val_expr, effective_op) = match (column_name(left), column_name(right)) {
+        (Some(name), None) => {
+            let Expr::Value(v) = right else { return None };
+            (name, v, op.clone())
+        }
+        (None, Some(name)) => {
+            let Expr::Value(v) = left else { return None };
             let flipped = match op {
                 BinaryOperator::Eq => BinaryOperator::Eq,
                 BinaryOperator::Lt => BinaryOperator::Gt,
@@ -136,12 +148,12 @@ fn extract_col_op_value<'a>(
                 BinaryOperator::GtEq => BinaryOperator::LtEq,
                 _ => return None,
             };
-            (i, v, flipped)
+            (name, v, flipped)
         }
         _ => return None,
     };
 
-    Some((&ident.value, effective_op, &val_expr.value))
+    Some((col_name, effective_op, &val_expr.value))
 }
 
 /// Try to parse a literal value as a primary-key (`Key = i64`).

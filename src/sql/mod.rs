@@ -706,6 +706,11 @@ mod tests {
         // Qualified column with alias + AS in projection
         let rs = execute(&db, &mut None, "SELECT u.name AS user_name FROM users AS u").unwrap();
         assert_eq!(rs.rows[0][0], ("user_name".into(), DbValue::Text("Alice".into())));
+
+        // PK range scan with alias
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
+        let rs = execute(&db, &mut None, "SELECT u.name FROM users AS u WHERE u.id >= 1").unwrap();
+        assert_eq!(rs.rows.len(), 2);
     }
 
     #[test]
