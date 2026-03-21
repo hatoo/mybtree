@@ -1,12 +1,11 @@
-use mybtree::{Database, DbValue, Pager, Row};
+use mybtree::{Database, DbValue, Pager};
 use std::fs;
 use tempfile::NamedTempFile;
 
-/// Helper to format a Row for display
-fn format_row(row: &Row) -> String {
-    row.values
-        .iter()
-        .map(|v| match v {
+/// Helper to format a result row for display
+fn format_row(row: &[(String, DbValue)]) -> String {
+    row.iter()
+        .map(|(_, v)| match v {
             DbValue::Null => "NULL".to_string(),
             DbValue::Integer(i) => i.to_string(),
             DbValue::Float(f) => f.to_string(),
@@ -78,12 +77,12 @@ fn execute_sql_file(sql_path: &str) -> String {
         output.push_str(&format!("-- {}\n", stmt.replace('\n', " ")));
 
         match mybtree::sql::execute(&db, &mut tx, stmt) {
-            Ok(rows) => {
-                if rows.is_empty() {
+            Ok(rs) => {
+                if rs.rows.is_empty() {
                     output.push_str("-- OK (no results)\n");
                 } else {
-                    for row in rows {
-                        output.push_str(&format!("-- {}\n", format_row(&row)));
+                    for row in &rs.rows {
+                        output.push_str(&format!("-- {}\n", format_row(row)));
                     }
                 }
             }

@@ -79,10 +79,10 @@ fn execute_and_print<'a>(
         return Ok(());
     }
 
-    let rows = mybtree::sql::execute(db, tx, input)?;
+    let rs = mybtree::sql::execute(db, tx, input)?;
 
-    for row in &rows {
-        let line: Vec<String> = row.values.iter().map(format_value).collect();
+    for row in &rs.rows {
+        let line: Vec<String> = row.iter().map(|(_, v)| format_value(v)).collect();
         println!("{}", line.join("\t"));
     }
 

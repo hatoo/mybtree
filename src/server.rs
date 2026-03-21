@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use clap::Parser;
-use mybtree::{Database, DbTransaction, DbValue, Pager, Row};
+use mybtree::{Database, DbTransaction, DbValue, Pager};
 use serde::{Deserialize, Serialize};
 
 const PAGE_SIZE: usize = 4096;
@@ -18,38 +18,19 @@ struct SqlRequest {
 }
 
 #[derive(Serialize)]
-#[serde(untagged)]
-enum JsonValue {
-    Integer(i64),
-    Float(f64),
-    Bool(bool),
-    Text(String),
-    Null,
-}
-
-impl From<&DbValue> for JsonValue {
-    fn from(v: &DbValue) -> Self {
-        match v {
-            DbValue::Integer(i) => JsonValue::Integer(*i),
-            DbValue::Float(f) => JsonValue::Float(*f),
-            DbValue::Bool(b) => JsonValue::Bool(*b),
-            DbValue::Text(s) => JsonValue::Text(s.clone()),
-            DbValue::Null => JsonValue::Null,
-        }
-    }
-}
-
-#[derive(Serialize)]
 struct SqlResponse {
-    rows: Vec<Vec<JsonValue>>,
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
-fn rows_to_response(rows: Vec<Row>) -> SqlResponse {
-    SqlResponse {
-        rows: rows
-            .iter()
-            .map(|r| r.values.iter().map(JsonValue::from).collect())
-            .collect(),
+fn to_json_value(v: &DbValue) -> serde_json::Value {
+    match v {
+        DbValue::Integer(i) => serde_json::Value::Number((*i).into()),
+        DbValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        DbValue::Bool(b) => serde_json::Value::Bool(*b),
+        DbValue::Text(s) => serde_json::Value::String(s.clone()),
+        DbValue::Null => serde_json::Value::Null,
     }
 }
 
@@ -63,7 +44,18 @@ async fn execute_sql(
     };
 
     match result {
-        Ok(rows) => Ok(Json(rows_to_response(rows))),
+        Ok(rs) => {
+            let rows = rs
+                .rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|(name, val)| (name.clone(), to_json_value(val)))
+                        .collect()
+                })
+                .collect();
+            Ok(Json(SqlResponse { rows }))
+        }
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
 }

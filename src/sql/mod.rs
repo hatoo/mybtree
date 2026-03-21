@@ -28,48 +28,73 @@ pub enum SqlError {
     TransactionAlreadyActive,
 }
 
-fn project_row(schema: &Schema, row: &Row, projections: &[SelectItem]) -> Result<Row, SqlError> {
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultSet {
+    pub rows: Vec<Vec<(String, DbValue)>>,
+}
+
+impl ResultSet {
+    pub fn empty() -> Self {
+        Self { rows: Vec::new() }
+    }
+}
+
+fn project_row(
+    schema: &Schema,
+    row: &Row,
+    projections: &[SelectItem],
+) -> Result<Vec<(String, DbValue)>, SqlError> {
     let mut values = Vec::new();
     for item in projections {
         match item {
             SelectItem::Wildcard(_) => {
-                for (i, _col) in schema.columns.iter().enumerate() {
+                for (i, col) in schema.columns.iter().enumerate() {
                     if schema.implicit_pk && i == schema.primary_key {
                         continue;
                     }
-                    values.push(row.values[i].clone());
+                    values.push((col.name.clone(), row.values[i].clone()));
                 }
             }
-            SelectItem::UnnamedExpr(Expr::Identifier(ident))
-            | SelectItem::ExprWithAlias {
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                let col_idx = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                    .ok_or_else(|| SqlError::ColumnNotFound(ident.value.clone()))?;
+                values.push((
+                    schema.columns[col_idx].name.clone(),
+                    row.values[col_idx].clone(),
+                ));
+            }
+            SelectItem::ExprWithAlias {
                 expr: Expr::Identifier(ident),
-                ..
+                alias,
             } => {
                 let col_idx = schema
                     .columns
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
                     .ok_or_else(|| SqlError::ColumnNotFound(ident.value.clone()))?;
-                values.push(row.values[col_idx].clone());
+                values.push((alias.value.clone(), row.values[col_idx].clone()));
             }
             _ => return Err(SqlError::UnsupportedExpr),
         }
     }
-    Ok(Row { values })
+    Ok(values)
 }
 
 pub fn execute<'a, const N: usize>(
     db: &'a Database<N>,
     tx: &mut Option<DbTransaction<'a, N>>,
     sql: &str,
-) -> Result<Vec<Row>, SqlError> {
+) -> Result<ResultSet, SqlError> {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
     let stmts =
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
-    let mut last = Vec::new();
+    let mut last = ResultSet::empty();
     for stmt in stmts {
         let result = match stmt {
             SqlStatement::StartTransaction { .. } => {
@@ -77,17 +102,17 @@ pub fn execute<'a, const N: usize>(
                     return Err(SqlError::TransactionAlreadyActive);
                 }
                 *tx = Some(db.begin_transaction());
-                vec![]
+                ResultSet::empty()
             }
             SqlStatement::Commit { .. } => {
                 let t = tx.take().ok_or(SqlError::NoActiveTransaction)?;
                 t.commit()?;
-                vec![]
+                ResultSet::empty()
             }
             SqlStatement::Rollback { .. } => {
                 let t = tx.take().ok_or(SqlError::NoActiveTransaction)?;
                 drop(t);
-                vec![]
+                ResultSet::empty()
             }
             other => {
                 let auto = tx.is_none();
@@ -110,7 +135,7 @@ pub fn execute<'a, const N: usize>(
                 result
             }
         };
-        if !result.is_empty() {
+        if !result.rows.is_empty() {
             last = result;
         }
     }
@@ -120,7 +145,7 @@ pub fn execute<'a, const N: usize>(
 fn execute_query<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     query: sqlparser::ast::Query,
-) -> Result<Vec<Row>, SqlError> {
+) -> Result<ResultSet, SqlError> {
     use sqlparser::ast::{SetExpr, TableFactor};
     let SetExpr::Select(select) = *query.body else {
         return Err(SqlError::UnsupportedStatement);
@@ -160,14 +185,14 @@ fn execute_query<const N: usize>(
             rows.push(project_row(&schema, &row, &projections)?);
             Ok(false)
         })?;
-        Ok(rows)
+        Ok(ResultSet { rows })
     })
 }
 
 fn execute_create_table<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     ct: sqlparser::ast::CreateTable,
-) -> Result<Vec<Row>, SqlError> {
+) -> Result<ResultSet, SqlError> {
     use sqlparser::ast::{ColumnOption, DataType};
 
     let table_name = ct
@@ -244,14 +269,14 @@ fn execute_create_table<const N: usize>(
 
     tx.with_lock(|mut locked_tx| {
         locked_tx.create_table(&table_name, schema, pk_index)?;
-        Ok(vec![])
+        Ok(ResultSet::empty())
     })
 }
 
 fn execute_insert<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     insert: sqlparser::ast::Insert,
-) -> Result<Vec<Row>, SqlError> {
+) -> Result<ResultSet, SqlError> {
     use sqlparser::ast::{SetExpr, TableObject};
 
     let TableObject::TableName(obj_name) = insert.table else {
@@ -303,14 +328,14 @@ fn execute_insert<const N: usize>(
             locked_tx.insert(&table_name, &Row { values })?;
         }
 
-        Ok(vec![])
+        Ok(ResultSet::empty())
     })
 }
 
 fn execute_update<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     update: sqlparser::ast::Update,
-) -> Result<Vec<Row>, SqlError> {
+) -> Result<ResultSet, SqlError> {
     use sqlparser::ast::{AssignmentTarget, TableFactor};
 
     if !update.table.joins.is_empty() {
@@ -368,14 +393,14 @@ fn execute_update<const N: usize>(
             tx.update(&table_name, key, &row)?;
             Ok(false)
         })?;
-        Ok(vec![])
+        Ok(ResultSet::empty())
     })
 }
 
 fn execute_create_index<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     ci: sqlparser::ast::CreateIndex,
-) -> Result<Vec<Row>, SqlError> {
+) -> Result<ResultSet, SqlError> {
     let table_name = ci
         .table_name
         .0
@@ -395,14 +420,14 @@ fn execute_create_index<const N: usize>(
 
     tx.with_lock(|mut locked_tx| {
         locked_tx.create_index(&table_name, col_name)?;
-        Ok(vec![])
+        Ok(ResultSet::empty())
     })
 }
 
 fn execute_delete<const N: usize>(
     tx: &mut DbTransaction<'_, N>,
     delete: sqlparser::ast::Delete,
-) -> Result<Vec<Row>, SqlError> {
+) -> Result<ResultSet, SqlError> {
     use sqlparser::ast::{FromTable, TableFactor};
 
     let tables = match &delete.from {
@@ -440,7 +465,7 @@ fn execute_delete<const N: usize>(
             tx.delete(&table_name, key)?;
             Ok(false)
         })?;
-        Ok(vec![])
+        Ok(ResultSet::empty())
     })
 }
 
@@ -452,7 +477,7 @@ mod tests {
 
     use crate::{Database, DbValue, Pager};
 
-    use super::execute;
+    use super::{ResultSet, execute};
 
     fn open_db() -> (Database<4096>, NamedTempFile) {
         let temp = NamedTempFile::new().unwrap();
@@ -466,118 +491,92 @@ mod tests {
         (db, temp)
     }
 
+    /// Helper to extract just the values from a ResultSet for easy assertion.
+    fn values(rs: &ResultSet) -> Vec<Vec<DbValue>> {
+        rs.rows.iter().map(|r| r.iter().map(|(_, v)| v.clone()).collect()).collect()
+    }
+
     #[test]
     fn create_insert_select() {
         let (db, _temp) = open_db();
 
-        execute(
-            &db, &mut None,
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
-        )
-        .unwrap();
-        execute(
-            &db, &mut None,
-            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
-        )
-        .unwrap();
-        execute(
-            &db, &mut None,
-            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
-        )
-        .unwrap();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)").unwrap();
 
-        let rows = execute(&db, &mut None, "SELECT name, age FROM users").unwrap();
+        let rs = execute(&db, &mut None, "SELECT name, age FROM users").unwrap();
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
+        assert_eq!(rs.rows[0][1], ("age".into(), DbValue::Integer(30)));
         assert_eq!(
-            rows[0].values,
-            vec![DbValue::Text("Alice".into()), DbValue::Integer(30)]
+            values(&rs),
+            vec![
+                vec![DbValue::Text("Alice".into()), DbValue::Integer(30)],
+                vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
+            ]
         );
-        assert_eq!(
-            rows[1].values,
-            vec![DbValue::Text("Bob".into()), DbValue::Integer(25)]
-        );
+    }
+
+    #[test]
+    fn select_with_alias() {
+        let (db, _temp) = open_db();
+
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+
+        let rs = execute(&db, &mut None, "SELECT name AS user_name FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("user_name".into(), DbValue::Text("Alice".into())));
     }
 
     #[test]
     fn update_rows() {
         let (db, _temp) = open_db();
 
-        execute(
-            &db, &mut None,
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
-        )
-        .unwrap();
-        execute(
-            &db, &mut None,
-            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
-        )
-        .unwrap();
-        execute(
-            &db, &mut None,
-            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
-        )
-        .unwrap();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)").unwrap();
 
-        // Update with WHERE clause
         execute(&db, &mut None, "UPDATE users SET age = 31 WHERE id = 1").unwrap();
 
-        let rows = execute(&db, &mut None, "SELECT name, age FROM users").unwrap();
+        let rs = execute(&db, &mut None, "SELECT name, age FROM users").unwrap();
         assert_eq!(
-            rows[0].values,
-            vec![DbValue::Text("Alice".into()), DbValue::Integer(31)]
-        );
-        assert_eq!(
-            rows[1].values,
-            vec![DbValue::Text("Bob".into()), DbValue::Integer(25)]
+            values(&rs),
+            vec![
+                vec![DbValue::Text("Alice".into()), DbValue::Integer(31)],
+                vec![DbValue::Text("Bob".into()), DbValue::Integer(25)],
+            ]
         );
 
-        // Update all rows
         execute(&db, &mut None, "UPDATE users SET name = 'Unknown'").unwrap();
 
-        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
-        assert_eq!(rows[0].values, vec![DbValue::Text("Unknown".into())]);
-        assert_eq!(rows[1].values, vec![DbValue::Text("Unknown".into())]);
+        let rs = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(
+            values(&rs),
+            vec![vec![DbValue::Text("Unknown".into())], vec![DbValue::Text("Unknown".into())]]
+        );
     }
 
     #[test]
     fn delete_rows() {
         let (db, _temp) = open_db();
 
-        execute(
-            &db, &mut None,
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
-        )
-        .unwrap();
-        execute(
-            &db, &mut None,
-            "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
-        )
-        .unwrap();
-        execute(
-            &db, &mut None,
-            "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
-        )
-        .unwrap();
-        execute(
-            &db, &mut None,
-            "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)",
-        )
-        .unwrap();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)").unwrap();
 
-        // Delete with WHERE clause
         execute(&db, &mut None, "DELETE FROM users WHERE id = 1").unwrap();
 
-        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values, vec![DbValue::Text("Bob".into())]);
-        assert_eq!(rows[1].values, vec![DbValue::Text("Carol".into())]);
+        let rs = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(values(&rs), vec![vec![DbValue::Text("Bob".into())], vec![DbValue::Text("Carol".into())]]);
 
-        // Delete all remaining rows
         execute(&db, &mut None, "DELETE FROM users").unwrap();
 
-        let rows = execute(&db, &mut None, "SELECT * FROM users").unwrap();
-        assert_eq!(rows.len(), 0);
+        let rs = execute(&db, &mut None, "SELECT * FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 0);
     }
 
     #[test]
@@ -593,9 +592,9 @@ mod tests {
         )
         .unwrap();
 
-        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values, vec![DbValue::Text("Alice".into())]);
+        let rs = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
     }
 
     #[test]
@@ -609,7 +608,6 @@ mod tests {
         )
         .unwrap();
 
-        // Insert in a new transaction, then rollback.
         execute(
             &db, &mut None,
             "BEGIN;
@@ -618,10 +616,9 @@ mod tests {
         )
         .unwrap();
 
-        // Only Alice should remain.
-        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values, vec![DbValue::Text("Alice".into())]);
+        let rs = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
     }
 
     #[test]
@@ -630,19 +627,18 @@ mod tests {
         execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
         execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
 
-        // BEGIN in one call, read in another, then decide to commit.
         let mut tx = None;
         execute(&db, &mut tx, "BEGIN").unwrap();
         execute(&db, &mut tx, "INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
 
-        let rows = execute(&db, &mut tx, "SELECT name FROM users").unwrap();
-        assert_eq!(rows.len(), 2);
+        let rs = execute(&db, &mut tx, "SELECT name FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 2);
 
         execute(&db, &mut tx, "COMMIT").unwrap();
         assert!(tx.is_none());
 
-        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
-        assert_eq!(rows.len(), 2);
+        let rs = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 2);
     }
 
     #[test]
@@ -651,15 +647,14 @@ mod tests {
         execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
         execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
 
-        // BEGIN, insert, then rollback in separate calls.
         let mut tx = None;
         execute(&db, &mut tx, "BEGIN").unwrap();
         execute(&db, &mut tx, "INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
         execute(&db, &mut tx, "ROLLBACK").unwrap();
         assert!(tx.is_none());
 
-        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values, vec![DbValue::Text("Alice".into())]);
+        let rs = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], ("name".into(), DbValue::Text("Alice".into())));
     }
 }
