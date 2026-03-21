@@ -58,8 +58,9 @@ fn project_row(schema: &Schema, row: &Row, projections: &[SelectItem]) -> Result
     Ok(Row { values })
 }
 
-pub fn execute<const N: usize>(
-    db: &Database<N>,
+pub fn execute<'a, const N: usize>(
+    db: &'a Database<N>,
+    tx: &mut Option<DbTransaction<'a, N>>,
     sql: &str,
 ) -> Result<Vec<Row>, SqlError> {
     use sqlparser::dialect::GenericDialect;
@@ -68,8 +69,6 @@ pub fn execute<const N: usize>(
     let stmts =
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
-    let mut tx: Option<DbTransaction<'_, N>> = None;
-    let mut explicit_tx = false;
     let mut last = Vec::new();
     for stmt in stmts {
         let result = match stmt {
@@ -77,26 +76,23 @@ pub fn execute<const N: usize>(
                 if tx.is_some() {
                     return Err(SqlError::TransactionAlreadyActive);
                 }
-                tx = Some(db.begin_transaction());
-                explicit_tx = true;
+                *tx = Some(db.begin_transaction());
                 vec![]
             }
             SqlStatement::Commit { .. } => {
                 let t = tx.take().ok_or(SqlError::NoActiveTransaction)?;
                 t.commit()?;
-                explicit_tx = false;
                 vec![]
             }
             SqlStatement::Rollback { .. } => {
                 let t = tx.take().ok_or(SqlError::NoActiveTransaction)?;
                 drop(t);
-                explicit_tx = false;
                 vec![]
             }
             other => {
                 let auto = tx.is_none();
                 if auto {
-                    tx = Some(db.begin_transaction());
+                    *tx = Some(db.begin_transaction());
                 }
                 let t = tx.as_mut().unwrap();
                 let result = match other {
@@ -116,12 +112,6 @@ pub fn execute<const N: usize>(
         };
         if !result.is_empty() {
             last = result;
-        }
-    }
-    // If an explicit BEGIN was issued without COMMIT/ROLLBACK, roll back.
-    if explicit_tx {
-        if let Some(t) = tx.take() {
-            drop(t);
         }
     }
     Ok(last)
@@ -481,22 +471,22 @@ mod tests {
         let (db, _temp) = open_db();
 
         execute(
-            &db,
+            &db, &mut None,
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
         execute(
-            &db,
+            &db, &mut None,
             "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
         )
         .unwrap();
         execute(
-            &db,
+            &db, &mut None,
             "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
         )
         .unwrap();
 
-        let rows = execute(&db, "SELECT name, age FROM users").unwrap();
+        let rows = execute(&db, &mut None, "SELECT name, age FROM users").unwrap();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -514,25 +504,25 @@ mod tests {
         let (db, _temp) = open_db();
 
         execute(
-            &db,
+            &db, &mut None,
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
         execute(
-            &db,
+            &db, &mut None,
             "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
         )
         .unwrap();
         execute(
-            &db,
+            &db, &mut None,
             "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
         )
         .unwrap();
 
         // Update with WHERE clause
-        execute(&db, "UPDATE users SET age = 31 WHERE id = 1").unwrap();
+        execute(&db, &mut None, "UPDATE users SET age = 31 WHERE id = 1").unwrap();
 
-        let rows = execute(&db, "SELECT name, age FROM users").unwrap();
+        let rows = execute(&db, &mut None, "SELECT name, age FROM users").unwrap();
         assert_eq!(
             rows[0].values,
             vec![DbValue::Text("Alice".into()), DbValue::Integer(31)]
@@ -543,9 +533,9 @@ mod tests {
         );
 
         // Update all rows
-        execute(&db, "UPDATE users SET name = 'Unknown'").unwrap();
+        execute(&db, &mut None, "UPDATE users SET name = 'Unknown'").unwrap();
 
-        let rows = execute(&db, "SELECT name FROM users").unwrap();
+        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
         assert_eq!(rows[0].values, vec![DbValue::Text("Unknown".into())]);
         assert_eq!(rows[1].values, vec![DbValue::Text("Unknown".into())]);
     }
@@ -555,38 +545,38 @@ mod tests {
         let (db, _temp) = open_db();
 
         execute(
-            &db,
+            &db, &mut None,
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
         execute(
-            &db,
+            &db, &mut None,
             "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
         )
         .unwrap();
         execute(
-            &db,
+            &db, &mut None,
             "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
         )
         .unwrap();
         execute(
-            &db,
+            &db, &mut None,
             "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)",
         )
         .unwrap();
 
         // Delete with WHERE clause
-        execute(&db, "DELETE FROM users WHERE id = 1").unwrap();
+        execute(&db, &mut None, "DELETE FROM users WHERE id = 1").unwrap();
 
-        let rows = execute(&db, "SELECT name FROM users").unwrap();
+        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values, vec![DbValue::Text("Bob".into())]);
         assert_eq!(rows[1].values, vec![DbValue::Text("Carol".into())]);
 
         // Delete all remaining rows
-        execute(&db, "DELETE FROM users").unwrap();
+        execute(&db, &mut None, "DELETE FROM users").unwrap();
 
-        let rows = execute(&db, "SELECT * FROM users").unwrap();
+        let rows = execute(&db, &mut None, "SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 0);
     }
 
@@ -595,7 +585,7 @@ mod tests {
         let (db, _temp) = open_db();
 
         execute(
-            &db,
+            &db, &mut None,
             "BEGIN;
              CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
              INSERT INTO users (id, name) VALUES (1, 'Alice');
@@ -603,7 +593,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = execute(&db, "SELECT name FROM users").unwrap();
+        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values, vec![DbValue::Text("Alice".into())]);
     }
@@ -613,7 +603,7 @@ mod tests {
         let (db, _temp) = open_db();
 
         execute(
-            &db,
+            &db, &mut None,
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
              INSERT INTO users (id, name) VALUES (1, 'Alice')",
         )
@@ -621,7 +611,7 @@ mod tests {
 
         // Insert in a new transaction, then rollback.
         execute(
-            &db,
+            &db, &mut None,
             "BEGIN;
              INSERT INTO users (id, name) VALUES (2, 'Bob');
              ROLLBACK",
@@ -629,7 +619,46 @@ mod tests {
         .unwrap();
 
         // Only Alice should remain.
-        let rows = execute(&db, "SELECT name FROM users").unwrap();
+        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::Text("Alice".into())]);
+    }
+
+    #[test]
+    fn partial_transaction_across_calls() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+
+        // BEGIN in one call, read in another, then decide to commit.
+        let mut tx = None;
+        execute(&db, &mut tx, "BEGIN").unwrap();
+        execute(&db, &mut tx, "INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
+
+        let rows = execute(&db, &mut tx, "SELECT name FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        execute(&db, &mut tx, "COMMIT").unwrap();
+        assert!(tx.is_none());
+
+        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn partial_transaction_rollback_across_calls() {
+        let (db, _temp) = open_db();
+        execute(&db, &mut None, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        execute(&db, &mut None, "INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+
+        // BEGIN, insert, then rollback in separate calls.
+        let mut tx = None;
+        execute(&db, &mut tx, "BEGIN").unwrap();
+        execute(&db, &mut tx, "INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
+        execute(&db, &mut tx, "ROLLBACK").unwrap();
+        assert!(tx.is_none());
+
+        let rows = execute(&db, &mut None, "SELECT name FROM users").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values, vec![DbValue::Text("Alice".into())]);
     }

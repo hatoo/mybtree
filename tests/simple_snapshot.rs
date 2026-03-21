@@ -71,12 +71,13 @@ fn execute_sql_file(sql_path: &str) -> String {
     // Split and execute statements
     let statements = split_statements(&sql_content);
     let mut output = String::new();
+    let mut tx = None;
 
     for (idx, stmt) in statements.iter().enumerate() {
         output.push_str(&format!("-- Statement {}\n", idx + 1));
         output.push_str(&format!("-- {}\n", stmt.replace('\n', " ")));
 
-        match mybtree::sql::execute(&db, stmt) {
+        match mybtree::sql::execute(&db, &mut tx, stmt) {
             Ok(rows) => {
                 if rows.is_empty() {
                     output.push_str("-- OK (no results)\n");

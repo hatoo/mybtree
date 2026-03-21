@@ -66,16 +66,20 @@ fn open_db(path: Option<&PathBuf>, tmp: bool) -> anyhow::Result<Database<PAGE_SI
     }
 }
 
-fn execute_and_print(db: &Database<PAGE_SIZE>, input: &str) -> anyhow::Result<()> {
+fn execute_and_print<'a>(
+    db: &'a Database<PAGE_SIZE>,
+    tx: &mut Option<mybtree::DbTransaction<'a, PAGE_SIZE>>,
+    input: &str,
+) -> anyhow::Result<()> {
     if input == ".tables" {
-        let mut tx = db.begin_transaction();
-        for name in tx.with_lock(|mut l| l.list_tables())? {
+        let mut t = db.begin_transaction();
+        for name in t.with_lock(|mut l| l.list_tables())? {
             println!("{name}");
         }
         return Ok(());
     }
 
-    let rows = mybtree::sql::execute(db, input)?;
+    let rows = mybtree::sql::execute(db, tx, input)?;
 
     for row in &rows {
         let line: Vec<String> = row.values.iter().map(format_value).collect();
@@ -92,6 +96,7 @@ fn repl(db: &Database<PAGE_SIZE>) -> anyhow::Result<()> {
         DefaultPromptSegment::Empty,
     );
 
+    let mut tx = None;
     loop {
         match line_editor.read_line(&prompt) {
             Ok(Signal::Success(line)) => {
@@ -99,7 +104,7 @@ fn repl(db: &Database<PAGE_SIZE>) -> anyhow::Result<()> {
                 if sql.is_empty() {
                     continue;
                 }
-                if let Err(e) = execute_and_print(db, sql) {
+                if let Err(e) = execute_and_print(db, &mut tx, sql) {
                     eprintln!("error: {e}");
                 }
             }
@@ -118,6 +123,7 @@ fn repl(db: &Database<PAGE_SIZE>) -> anyhow::Result<()> {
 
 fn execute_sql_file(db: &Database<PAGE_SIZE>, path: &str) -> anyhow::Result<()> {
     let content = fs::read_to_string(path)?;
+    let mut tx = None;
 
     // Split by semicolons and execute each statement
     for statement in content.split(';') {
@@ -130,7 +136,7 @@ fn execute_sql_file(db: &Database<PAGE_SIZE>, path: &str) -> anyhow::Result<()> 
         let cleaned = lines.join(" ").trim().to_string();
 
         if !cleaned.is_empty() {
-            execute_and_print(db, &cleaned)?;
+            execute_and_print(db, &mut tx, &cleaned)?;
         }
     }
 
@@ -162,7 +168,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if PathBuf::from(&sql).exists() && sql.ends_with(".sql") {
                 execute_sql_file(&db, &sql)?;
             } else {
-                execute_and_print(&db, &sql)?;
+                execute_and_print(&db, &mut None, &sql)?;
             }
             Ok(())
         }
