@@ -113,45 +113,49 @@ impl Scanner {
     }
 }
 
-/// Get the column name from an Identifier or CompoundIdentifier (last part).
-fn column_name(expr: &Expr) -> Option<&str> {
+/// Get the optional qualifier and column name from an Identifier or CompoundIdentifier.
+fn column_ref(expr: &Expr) -> Option<(Option<&str>, &str)> {
     match expr {
-        Expr::Identifier(i) => Some(&i.value),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.as_str()),
+        Expr::Identifier(i) => Some((None, &i.value)),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some((Some(&parts[0].value), &parts[1].value))
+        }
+        Expr::CompoundIdentifier(parts) => parts.last().map(|i| (None, i.value.as_str())),
         _ => None,
     }
 }
 
 /// Extract a `col op literal` or `literal op col` pair from a binary expression.
-/// Returns `(column_name, operator_from_column_perspective, literal_value)`.
+/// Returns `(qualifier, column_name, operator_from_column_perspective, literal_value)`.
 fn extract_col_op_value<'a>(
     left: &'a Expr,
     op: &sqlparser::ast::BinaryOperator,
     right: &'a Expr,
-) -> Option<(&'a str, sqlparser::ast::BinaryOperator, &'a Value)> {
+) -> Option<(Option<&'a str>, &'a str, sqlparser::ast::BinaryOperator, &'a Value)> {
     use sqlparser::ast::BinaryOperator;
 
-    let (col_name, val_expr, effective_op) = match (column_name(left), column_name(right)) {
-        (Some(name), None) => {
-            let Expr::Value(v) = right else { return None };
-            (name, v, op.clone())
-        }
-        (None, Some(name)) => {
-            let Expr::Value(v) = left else { return None };
-            let flipped = match op {
-                BinaryOperator::Eq => BinaryOperator::Eq,
-                BinaryOperator::Lt => BinaryOperator::Gt,
-                BinaryOperator::LtEq => BinaryOperator::GtEq,
-                BinaryOperator::Gt => BinaryOperator::Lt,
-                BinaryOperator::GtEq => BinaryOperator::LtEq,
-                _ => return None,
-            };
-            (name, v, flipped)
-        }
-        _ => return None,
-    };
+    let (qualifier, col_name, val_expr, effective_op) =
+        match (column_ref(left), column_ref(right)) {
+            (Some((q, name)), None) => {
+                let Expr::Value(v) = right else { return None };
+                (q, name, v, op.clone())
+            }
+            (None, Some((q, name))) => {
+                let Expr::Value(v) = left else { return None };
+                let flipped = match op {
+                    BinaryOperator::Eq => BinaryOperator::Eq,
+                    BinaryOperator::Lt => BinaryOperator::Gt,
+                    BinaryOperator::LtEq => BinaryOperator::GtEq,
+                    BinaryOperator::Gt => BinaryOperator::Lt,
+                    BinaryOperator::GtEq => BinaryOperator::LtEq,
+                    _ => return None,
+                };
+                (q, name, v, flipped)
+            }
+            _ => return None,
+        };
 
-    Some((col_name, effective_op, &val_expr.value))
+    Some((qualifier, col_name, effective_op, &val_expr.value))
 }
 
 /// Try to parse a literal value as a primary-key (`Key = i64`).
@@ -270,7 +274,15 @@ pub(super) fn find_best_scanner(
 
         // ── Single comparison ───────────────────────────────────────
         Expr::BinaryOp { left, op, right } => {
-            let (col_name, effective_op, lit) = extract_col_op_value(left, op, right)?;
+            let (qualifier, col_name, effective_op, lit) =
+                extract_col_op_value(left, op, right)?;
+
+            // If the column is qualified, reject if it doesn't match this table.
+            if let Some(q) = qualifier {
+                if !q.eq_ignore_ascii_case(table) {
+                    return None;
+                }
+            }
 
             let pk_name = &schema.columns[schema.primary_key].name;
 
