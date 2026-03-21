@@ -73,12 +73,10 @@ fn execute_sql_file(sql_path: &str) -> String {
     let mut output = String::new();
 
     for (idx, stmt) in statements.iter().enumerate() {
-        let mut tx = db.begin_transaction();
-
         output.push_str(&format!("-- Statement {}\n", idx + 1));
         output.push_str(&format!("-- {}\n", stmt.replace('\n', " ")));
 
-        match mybtree::sql::execute(&mut tx, stmt) {
+        match mybtree::sql::execute(&db, stmt) {
             Ok(rows) => {
                 if rows.is_empty() {
                     output.push_str("-- OK (no results)\n");
@@ -93,7 +91,6 @@ fn execute_sql_file(sql_path: &str) -> String {
             }
         }
 
-        tx.commit().ok();
         output.push('\n');
     }
 

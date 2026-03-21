@@ -75,9 +75,7 @@ fn execute_and_print(db: &Database<PAGE_SIZE>, input: &str) -> anyhow::Result<()
         return Ok(());
     }
 
-    let mut tx = db.begin_transaction();
-    let rows = mybtree::sql::execute(&mut tx, input)?;
-    tx.commit()?;
+    let rows = mybtree::sql::execute(db, input)?;
 
     for row in &rows {
         let line: Vec<String> = row.values.iter().map(format_value).collect();

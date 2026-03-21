@@ -1,7 +1,8 @@
 use rkyv::rancor::Error;
 use sqlparser::ast::{Expr, SelectItem};
 
-use crate::{Column, ColumnType, DatabaseError, DbTransaction, DbValue, Row, Schema};
+use crate::{Column, ColumnType, Database, DatabaseError, DbTransaction, DbValue, Row, Schema};
+use sqlparser::ast::Statement as SqlStatement;
 
 use expr::{eval_expr_bool, eval_value_expr};
 use scan::Scanner;
@@ -21,6 +22,10 @@ pub enum SqlError {
     Parse(String),
     #[error("unsupported statement")]
     UnsupportedStatement,
+    #[error("no active transaction")]
+    NoActiveTransaction,
+    #[error("transaction already active")]
+    TransactionAlreadyActive,
 }
 
 fn project_row(schema: &Schema, row: &Row, projections: &[SelectItem]) -> Result<Row, SqlError> {
@@ -54,27 +59,70 @@ fn project_row(schema: &Schema, row: &Row, projections: &[SelectItem]) -> Result
 }
 
 pub fn execute<const N: usize>(
-    tx: &mut DbTransaction<'_, N>,
+    db: &Database<N>,
     sql: &str,
 ) -> Result<Vec<Row>, SqlError> {
-    use sqlparser::ast::Statement as SqlStatement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
     let stmts =
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
+    let mut tx: Option<DbTransaction<'_, N>> = None;
+    let mut explicit_tx = false;
     let mut last = Vec::new();
     for stmt in stmts {
-        last = match stmt {
-            SqlStatement::Query(query) => execute_query(tx, *query)?,
-            SqlStatement::CreateTable(ct) => execute_create_table(tx, ct)?,
-            SqlStatement::Insert(insert) => execute_insert(tx, insert)?,
-            SqlStatement::Update(update) => execute_update(tx, update)?,
-            SqlStatement::Delete(delete) => execute_delete(tx, delete)?,
-            SqlStatement::CreateIndex(ci) => execute_create_index(tx, ci)?,
-            _ => return Err(SqlError::UnsupportedStatement),
+        let result = match stmt {
+            SqlStatement::StartTransaction { .. } => {
+                if tx.is_some() {
+                    return Err(SqlError::TransactionAlreadyActive);
+                }
+                tx = Some(db.begin_transaction());
+                explicit_tx = true;
+                vec![]
+            }
+            SqlStatement::Commit { .. } => {
+                let t = tx.take().ok_or(SqlError::NoActiveTransaction)?;
+                t.commit()?;
+                explicit_tx = false;
+                vec![]
+            }
+            SqlStatement::Rollback { .. } => {
+                let t = tx.take().ok_or(SqlError::NoActiveTransaction)?;
+                drop(t);
+                explicit_tx = false;
+                vec![]
+            }
+            other => {
+                let auto = tx.is_none();
+                if auto {
+                    tx = Some(db.begin_transaction());
+                }
+                let t = tx.as_mut().unwrap();
+                let result = match other {
+                    SqlStatement::Query(query) => execute_query(t, *query)?,
+                    SqlStatement::CreateTable(ct) => execute_create_table(t, ct)?,
+                    SqlStatement::Insert(insert) => execute_insert(t, insert)?,
+                    SqlStatement::Update(update) => execute_update(t, update)?,
+                    SqlStatement::Delete(delete) => execute_delete(t, delete)?,
+                    SqlStatement::CreateIndex(ci) => execute_create_index(t, ci)?,
+                    _ => return Err(SqlError::UnsupportedStatement),
+                };
+                if auto {
+                    tx.take().unwrap().commit()?;
+                }
+                result
+            }
         };
+        if !result.is_empty() {
+            last = result;
+        }
+    }
+    // If an explicit BEGIN was issued without COMMIT/ROLLBACK, roll back.
+    if explicit_tx {
+        if let Some(t) = tx.take() {
+            drop(t);
+        }
     }
     Ok(last)
 }
@@ -431,29 +479,24 @@ mod tests {
     #[test]
     fn create_insert_select() {
         let (db, _temp) = open_db();
-        let mut tx = db.begin_transaction();
 
         execute(
-            &mut tx,
+            &db,
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
-
         execute(
-            &mut tx,
+            &db,
             "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
         )
         .unwrap();
         execute(
-            &mut tx,
+            &db,
             "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
         )
         .unwrap();
-        tx.commit().unwrap();
 
-        let mut tx = db.begin_transaction();
-
-        let rows = execute(&mut tx, "SELECT name, age FROM users").unwrap();
+        let rows = execute(&db, "SELECT name, age FROM users").unwrap();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -464,36 +507,32 @@ mod tests {
             rows[1].values,
             vec![DbValue::Text("Bob".into()), DbValue::Integer(25)]
         );
-
-        tx.commit().unwrap();
     }
 
     #[test]
     fn update_rows() {
         let (db, _temp) = open_db();
-        let mut tx = db.begin_transaction();
 
         execute(
-            &mut tx,
+            &db,
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
-
         execute(
-            &mut tx,
+            &db,
             "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
         )
         .unwrap();
         execute(
-            &mut tx,
+            &db,
             "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
         )
         .unwrap();
 
         // Update with WHERE clause
-        execute(&mut tx, "UPDATE users SET age = 31 WHERE id = 1").unwrap();
+        execute(&db, "UPDATE users SET age = 31 WHERE id = 1").unwrap();
 
-        let rows = execute(&mut tx, "SELECT name, age FROM users").unwrap();
+        let rows = execute(&db, "SELECT name, age FROM users").unwrap();
         assert_eq!(
             rows[0].values,
             vec![DbValue::Text("Alice".into()), DbValue::Integer(31)]
@@ -504,56 +543,94 @@ mod tests {
         );
 
         // Update all rows
-        execute(&mut tx, "UPDATE users SET name = 'Unknown'").unwrap();
+        execute(&db, "UPDATE users SET name = 'Unknown'").unwrap();
 
-        let rows = execute(&mut tx, "SELECT name FROM users").unwrap();
+        let rows = execute(&db, "SELECT name FROM users").unwrap();
         assert_eq!(rows[0].values, vec![DbValue::Text("Unknown".into())]);
         assert_eq!(rows[1].values, vec![DbValue::Text("Unknown".into())]);
-
-        tx.commit().unwrap();
     }
 
     #[test]
     fn delete_rows() {
         let (db, _temp) = open_db();
-        let mut tx = db.begin_transaction();
 
         execute(
-            &mut tx,
+            &db,
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)",
         )
         .unwrap();
-
         execute(
-            &mut tx,
+            &db,
             "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)",
         )
         .unwrap();
         execute(
-            &mut tx,
+            &db,
             "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)",
         )
         .unwrap();
         execute(
-            &mut tx,
+            &db,
             "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)",
         )
         .unwrap();
 
         // Delete with WHERE clause
-        execute(&mut tx, "DELETE FROM users WHERE id = 1").unwrap();
+        execute(&db, "DELETE FROM users WHERE id = 1").unwrap();
 
-        let rows = execute(&mut tx, "SELECT name FROM users").unwrap();
+        let rows = execute(&db, "SELECT name FROM users").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values, vec![DbValue::Text("Bob".into())]);
         assert_eq!(rows[1].values, vec![DbValue::Text("Carol".into())]);
 
         // Delete all remaining rows
-        execute(&mut tx, "DELETE FROM users").unwrap();
+        execute(&db, "DELETE FROM users").unwrap();
 
-        let rows = execute(&mut tx, "SELECT * FROM users").unwrap();
+        let rows = execute(&db, "SELECT * FROM users").unwrap();
         assert_eq!(rows.len(), 0);
+    }
 
-        tx.commit().unwrap();
+    #[test]
+    fn begin_commit() {
+        let (db, _temp) = open_db();
+
+        execute(
+            &db,
+            "BEGIN;
+             CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO users (id, name) VALUES (1, 'Alice');
+             COMMIT",
+        )
+        .unwrap();
+
+        let rows = execute(&db, "SELECT name FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::Text("Alice".into())]);
+    }
+
+    #[test]
+    fn rollback() {
+        let (db, _temp) = open_db();
+
+        execute(
+            &db,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO users (id, name) VALUES (1, 'Alice')",
+        )
+        .unwrap();
+
+        // Insert in a new transaction, then rollback.
+        execute(
+            &db,
+            "BEGIN;
+             INSERT INTO users (id, name) VALUES (2, 'Bob');
+             ROLLBACK",
+        )
+        .unwrap();
+
+        // Only Alice should remain.
+        let rows = execute(&db, "SELECT name FROM users").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![DbValue::Text("Alice".into())]);
     }
 }
